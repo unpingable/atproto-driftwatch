@@ -1,0 +1,10 @@
+{"a":"About 200 people were affected.","b":"200 people were affected.","expect":"same"}
+{"a":"1.2k people were affected.","b":"1200 people were affected.","expect":"same"}
+{"a":"According to source X, 200 people were affected.","b":"200 people were affected, according to source X.","expect":"same"}
+{"a":"In Seattle, 200 people were affected.","b":"200 people were affected in Seattle.","expect":"same"}
+{"a":"200 people were affected in Texas.","b":"200 people were affected in Florida.","expect":"different"}
+{"a":"200 people were affected.","b":"200 people were evacuated.","expect":"different"}
+{"a":"$200 in damages were reported.","b":"200 dollars in damages were reported.","expect":"same"}
+{"a":"200 mph winds were reported.","b":"200-mph winds were reported.","expect":"same"}
+{"a":"1.234,56 people were affected.","b":"1,234.56 people were affected.","expect":"same"}
+{"a":"200 people were affected.","b":"20 people were affected.","expect":"different"}

@@ -1,0 +1,5 @@
+{"uri": "uri:demo:1", "cid": "cid1", "text": "According to source X, 2025-02-01 is when event H happened.", "createdAt": "2025-01-31T10:00:00", "authorDid": "did:demo:alice"}
+{"uri": "uri:demo:2", "cid": "cid2", "text": "2025-02-01 it happened. Definitely confirmed.", "createdAt": "2025-01-31T11:00:00", "authorDid": "did:demo:alice", "replyParentUri": "uri:demo:1", "replyRootUri": "uri:demo:1"}
+{"uri": "uri:demo:3", "cid": "cid3", "text": "I heard this is true", "createdAt": "2025-01-31T12:00:00", "authorDid": "did:demo:alice", "replyParentUri": "uri:demo:2", "replyRootUri": "uri:demo:1"}
+{"uri": "uri:demo:4", "cid": "cid4", "text": "\"New study says 1000 cases\" - but no link", "createdAt": "2025-01-31T12:05:00", "authorDid": "did:demo:bob"}
+{"uri": "uri:demo:5", "cid": "cid5", "text": "This is a repeat claim: event H occurred", "createdAt": "2025-01-31T13:00:00", "authorDid": "did:demo:alice", "replyParentUri": "uri:demo:1", "replyRootUri": "uri:demo:1"}

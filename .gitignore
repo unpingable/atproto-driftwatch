@@ -1,0 +1,13 @@
+__pycache__/
+.venv/
+.env
+data/
+*.db
+*.sqlite
+*.pyc
+.coverage
+.pytest_cache/
+.vscode/
+.claude/
+out/
+src/data/

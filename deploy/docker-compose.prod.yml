@@ -1,0 +1,18 @@
+services:
+  driftwatch:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.prod
+    container_name: driftwatch
+    env_file: .env
+    ports:
+      - "127.0.0.1:8422:8000"
+    volumes:
+      - ./data:/app/data
+      - ./out:/app/out
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+    restart: unless-stopped

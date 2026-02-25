@@ -1,0 +1,17 @@
+{"text": "According to source X, 200 people were affected.", "label": "src_attrib"}
+{"text": "200 people were affected.", "label": "plain"}
+{"text": "'200 people were affected' (source X)", "label": "quote_paren"}
+{"text": "About 200 were impacted as reported by source X.", "label": "paraphrase"}
+{"text": "Confirmed: 200 people were affected.", "label": "assertive"}
+{"text": "200 ppl affected (screenshot)", "label": "screenshot"}
+{"text": "200 people were affected — see https://example.com/report?id=123&utm=1", "label": "link_tracking"}
+{"text": "Per @sourceX, 200 were affected.", "label": "handle_attrib"}
+{"text": "Some source says 200 people were affected.", "label": "hedged"}
+{"text": "200 people were affected in the region.", "label": "location_added"}
+{"text": "200 people were affected in Texas.", "label": "location_specific"}
+{"text": "In Texas, 200 people were affected.", "label": "location_fronted"}
+{"text": "About 200 people were affected on Jan 3.", "label": "date_added"}
+{"text": "200 people were affected on 2025-01-03.", "label": "date_iso"}
+{"text": "200 people were affected (reported by AP).", "label": "attribution_org"}
+{"text": "200 people were affected — per AP.", "label": "attribution_org_short"}
+{"text": "200 people were affected (~1.5%).", "label": "percent_inline"}

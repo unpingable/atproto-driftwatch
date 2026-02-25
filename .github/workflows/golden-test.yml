@@ -1,0 +1,44 @@
+name: Golden Test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  golden-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run full test suite
+        env:
+          PYTHONPATH: src
+          DB_BACKEND: sqlite
+        run: |
+          pytest -q
+
+  stability-budget:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      - name: Run fingerprint stability budget test
+        env:
+          PYTHONPATH: src
+          DB_BACKEND: sqlite
+        run: |
+          pytest -q tests/test_fingerprint_stability_budget.py -q

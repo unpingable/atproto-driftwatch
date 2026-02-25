@@ -1,0 +1,1 @@
+{"subject_uri":"uri:gold:ai:2","label":"assertiveness_increase_possible","reasons":["assertiveness/confidence increased without new evidence"],"score":0.7,"evidence":[{"prior":"uri:gold:ai:1","post":"uri:gold:ai:2"}]}

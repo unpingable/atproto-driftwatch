@@ -1,0 +1,71 @@
+version: '3.8'
+
+services:
+  api:
+    build: .
+    image: labeler-api:local
+    container_name: labeler_api
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      - FIREHOSE_AUTO_START=0
+      - FIREHOSE_LABEL_INGEST=0
+      - LABELER_ENDPOINT=http://sim_labeler:8081/xrpc/com.atproto.label.queryLabels
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:8000/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  worker:
+    build: .
+    image: labeler-worker:local
+    container_name: labeler_worker
+    env_file: .env
+    environment:
+      - FIREHOSE_LABEL_INGEST=1
+      - FIREHOSE_LABEL_INGEST_INTERVAL=5
+      - LABELER_ENDPOINT=http://sim_labeler:8081/xrpc/com.atproto.label.queryLabels
+    volumes:
+      - ./data:/app/data
+    command: ["python", "-m", "labeler.worker"]
+    restart: on-failure
+
+  sim_labeler:
+    build: .
+    image: labeler-sim:local
+    container_name: labeler_sim
+    environment:
+      - SIM_LABELER_RATE_LIMIT_COUNT=2
+      - SIM_LABELER_RETRY_AFTER=2
+    command: ["python", "-m", "labeler.sim_labeler"]
+    ports:
+      - "8081:8081"
+
+  replay:
+    build: .
+    image: labeler-replay:local
+    container_name: labeler_replay
+    depends_on:
+      - api
+      - worker
+    volumes:
+      - ./data:/app/data
+      - ./fixtures:/app/fixtures
+      - ./out:/app/out
+    command: ["python", "-m", "labeler.demo_replay"]
+
+  demo-runner:
+    build: .
+    image: labeler-demo-runner:local
+    container_name: labeler_demo_runner
+    depends_on:
+      - api
+    volumes:
+      - ./fixtures:/app/fixtures
+      - ./out:/app/out
+    command: ["python", "-m", "labeler.drift.cli", "run", "--input", "/app/fixtures/posts.jsonl", "--out", "/app/out/labels.jsonl"]
+    restart: "no"

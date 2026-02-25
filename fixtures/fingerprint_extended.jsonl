@@ -1,0 +1,44 @@
+{"text":"According to source X, 200 people were affected.", "group":"affected200","label":"src_attrib"}
+{"text":"200 people were affected.", "group":"affected200","label":"plain"}
+{"text":"'200 people were affected' (source X)", "group":"affected200","label":"quote_paren"}
+{"text":"About 200 were impacted as reported by source X.", "group":"affected200","label":"paraphrase"}
+{"text":"Confirmed: 200 people were affected.", "group":"affected200","label":"assertive"}
+{"text":"200 ppl affected (screenshot)", "group":"affected200","label":"screenshot"}
+{"text":"200 people were affected — see https://example.com/report?id=123&utm=1", "group":"affected200","label":"link_tracking"}
+{"text":"Per @sourceX, 200 were affected.", "group":"affected200","label":"handle_attrib"}
+{"text":"Some source says 200 people were affected.", "group":"affected200","label":"hedged"}
+{"text":"200 people were affected in the region.", "group":"affected200","label":"location_added"}
+
+{"text":"20 people were affected.", "group":"affected20","label":"plain20"}
+{"text":"Approximately 1,234 people were affected.", "group":"affected1234","label":"comma_thousands"}
+{"text":"~1.2k people were affected.", "group":"affected1234","label":"k_suffix"}
+{"text":"USD 1,234 were impacted.", "group":"affected1234","label":"usd"}
+{"text":"1.234,56 people affected (eu locale)", "group":"affected_eu","label":"eu_number"}
+{"text":"About 1,234.56 people were affected.", "group":"affected_us","label":"us_number"}
+
+{"text":"200 people were evacuated.", "group":"evacuated200","label":"evacuated"}
+
+{"text":"1.5% of residents were affected.", "group":"percent1_5","label":"percent_text"}
+{"text":"1.5 percent of residents were affected.", "group":"percent1_5","label":"percent_word"}
+
+{"text":"Report: 200 people impacted. See image.", "group":"affected200","label":"image_ref"}
+
+{"text":"Screenshot: 200 were affected (image)", "group":"affected200","label":"screenshot2"}
+{"text":"In Texas, 200 people were affected.", "group":"affected200","label":"location_state_front"}
+{"text":"200 people were affected in Texas.", "group":"affected200","label":"location_state_tail"}
+{"text":"200 people were affected on Jan 3.", "group":"affected200_date","label":"date_jan3"}
+{"text":"200 people were affected on January 3.", "group":"affected200_date","label":"date_jan3_long"}
+{"text":"200 people were affected on 2025-01-03.", "group":"affected200_date_iso","label":"date_iso"}
+
+{"text":"$200 in damages were reported.", "group":"usd200_damages","label":"usd_symbol"}
+{"text":"USD 200 in damages were reported.", "group":"usd200_damages","label":"usd_prefix"}
+{"text":"200 dollars in damages were reported.", "group":"usd200_damages","label":"usd_word"}
+
+{"text":"1.5% of residents were affected (~about).", "group":"percent1_5","label":"percent_approx"}
+{"text":"15% of residents were affected.", "group":"percent15","label":"percent15"}
+
+{"text":"1.234,56 people were affected (EU locale).", "group":"affected_eu","label":"eu_number2"}
+{"text":"1,234.56 people were affected (US locale).", "group":"affected_us","label":"us_number2"}
+
+{"text":"200 mph winds were reported.", "group":"winds200","label":"mph_space"}
+{"text":"200-mph winds were reported.", "group":"winds200","label":"mph_hyphen"}

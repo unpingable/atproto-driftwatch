@@ -1,0 +1,9 @@
+{"evidence":[{"post":"uri:demo:1"}],"label":"quote_mismatch","reasons":["quote or attribution present but no link/facet found"],"score":0.55,"subject_uri":"uri:demo:1"}
+{"evidence":[{"post":"uri:demo:1","prior":"uri:demo:5"}],"label":"repeat_claim_no_new_evidence","reasons":["claim repeated without new evidence"],"score":0.6,"subject_uri":"uri:demo:1"}
+{"evidence":[{"date_mentioned":"2025-02-01","post":"uri:demo:1"}],"label":"time_inconsistency","reasons":["mentioned date appears in future compared to createdAt"],"score":0.4,"subject_uri":"uri:demo:1"}
+{"evidence":[{"post":"uri:demo:2","prior":"uri:demo:1"}],"label":"provenance_laundering_possible","reasons":["attribution removed compared to prior post"],"score":0.9,"subject_uri":"uri:demo:2"}
+{"evidence":[{"post":"uri:demo:2","prior":"uri:demo:1"}],"label":"repeat_claim_no_new_evidence","reasons":["claim repeated without new evidence"],"score":0.6,"subject_uri":"uri:demo:2"}
+{"evidence":[{"date_mentioned":"2025-02-01","post":"uri:demo:2"}],"label":"time_inconsistency","reasons":["mentioned date appears in future compared to createdAt"],"score":0.4,"subject_uri":"uri:demo:2"}
+{"evidence":[{"post":"uri:demo:4"}],"label":"quote_mismatch","reasons":["quote or attribution present but no link/facet found"],"score":0.55,"subject_uri":"uri:demo:4"}
+{"evidence":[{"post":"uri:demo:5","prior":"uri:demo:1"}],"label":"provenance_laundering_possible","reasons":["attribution removed compared to prior post"],"score":0.9,"subject_uri":"uri:demo:5"}
+{"evidence":[{"post":"uri:demo:5","prior":"uri:demo:1"}],"label":"repeat_claim_no_new_evidence","reasons":["claim repeated without new evidence"],"score":0.6,"subject_uri":"uri:demo:5"}
