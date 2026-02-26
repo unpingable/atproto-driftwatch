@@ -43,6 +43,14 @@ def init_db():
         except Exception:
             pass
 
+    # SQLite performance: WAL + normal sync
+    if os.getenv("DB_BACKEND", "sqlite").lower() == "sqlite":
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except Exception:
+            pass
+
     # events table: append-only store of raw events (store JSON as TEXT for compatibility)
     conn.execute(
         """
@@ -131,7 +139,7 @@ def init_db():
     except Exception:
         pass
 
-    # re-check requests queue for threads that need re-evaluation
+    # Legacy recheck_requests table (kept for DB compat; no longer used)
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS recheck_requests (
@@ -140,6 +148,33 @@ def init_db():
         )
         """
     )
+
+    # Fingerprint-keyed recheck queue (debounced: one entry per claim fingerprint)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS recheck_queue (
+            claim_fingerprint TEXT PRIMARY KEY,
+            scheduled_at TIMESTAMP
+        )
+        """
+    )
+
+    # DB-enforced queue cap on recheck_queue
+    conn.execute("""
+        CREATE TRIGGER IF NOT EXISTS recheck_queue_fp_cap
+        AFTER INSERT ON recheck_queue
+        BEGIN
+          DELETE FROM recheck_queue
+          WHERE rowid IN (
+            SELECT rowid FROM recheck_queue
+            ORDER BY scheduled_at ASC
+            LIMIT (
+              SELECT CASE WHEN COUNT(*)>10000 THEN COUNT(*)-10000 ELSE 0 END
+              FROM recheck_queue
+            )
+          );
+        END;
+    """)
 
     # claim-group recheck requests (authorDid + fingerprint)
     conn.execute(
@@ -198,6 +233,8 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_claim_history_fp ON claim_history(claim_fingerprint, createdAt)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_ctime ON edges(ctime)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_label_decisions_created ON label_decisions(created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_recheck_scheduled ON recheck_requests(scheduled_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_recheck_queue_scheduled ON recheck_queue(scheduled_at)")
     except Exception:
         pass
 
@@ -225,12 +262,7 @@ def insert_event(event_uri: str, ctime: Union[str, int, float, datetime.datetime
             (event_uri, ctime_dt.isoformat(), author, raw_json),
         )
         conn.commit()
-        # schedule recheck for thread root (only for replies — standalone posts
-        # will be rechecked when someone replies to them)
-        thread_root = raw.get("replyRootUri") or raw.get("replyParentUri")
-        if thread_root:
-            _add_recheck(conn, thread_root)
-        # add claim history entry if this looks like a claim post (complexity-gated)
+        # add claim history entry and enqueue fingerprint for recheck (complexity-gated)
         try:
             from .claims import add_claim_history, evidence_hash_from_raw, passes_complexity_gate, classify_evidence
             text = raw.get("text")
@@ -240,7 +272,8 @@ def insert_event(event_uri: str, ctime: Union[str, int, float, datetime.datetime
             if text and passes_complexity_gate(text, ext_links, embeds, facets):
                 evidence_hash = evidence_hash_from_raw(raw)
                 ev_class = classify_evidence(ext_links, embeds, facets)
-                add_claim_history(author, text, ctime_dt.isoformat(), event_uri, raw.get("cid"), None, None, evidence_hash, ev_class)
+                fp = add_claim_history(author, text, ctime_dt.isoformat(), event_uri, raw.get("cid"), None, None, evidence_hash, ev_class)
+                _add_recheck(conn, fp)
         except Exception:
             pass
         conn.close()
@@ -261,11 +294,7 @@ def insert_event(event_uri: str, ctime: Union[str, int, float, datetime.datetime
             (raw_json, ctime_dt.isoformat(), author, event_uri),
         )
         conn.commit()
-        # schedule recheck for thread root (only for replies)
-        thread_root = raw.get("replyRootUri") or raw.get("replyParentUri")
-        if thread_root:
-            _add_recheck(conn, thread_root)
-        # on update, also append new claim history version if text changed (complexity-gated)
+        # on update, append new claim history version and enqueue fingerprint (complexity-gated)
         try:
             from .claims import add_claim_history, evidence_hash_from_raw, passes_complexity_gate, classify_evidence
             text = raw.get("text")
@@ -275,7 +304,8 @@ def insert_event(event_uri: str, ctime: Union[str, int, float, datetime.datetime
             if text and passes_complexity_gate(text, ext_links, embeds, facets):
                 evidence_hash = evidence_hash_from_raw(raw)
                 ev_class = classify_evidence(ext_links, embeds, facets)
-                add_claim_history(author, text, ctime_dt.isoformat(), event_uri, raw.get("cid"), None, None, evidence_hash, ev_class)
+                fp = add_claim_history(author, text, ctime_dt.isoformat(), event_uri, raw.get("cid"), None, None, evidence_hash, ev_class)
+                _add_recheck(conn, fp)
         except Exception:
             pass
         conn.close()
@@ -289,49 +319,34 @@ def insert_event(event_uri: str, ctime: Union[str, int, float, datetime.datetime
 RECHECK_QUEUE_MAX = int(os.getenv("RECHECK_QUEUE_MAX", "10000"))
 
 
-def _add_recheck(conn, root_uri: str):
+def _add_recheck(conn, claim_fingerprint: str):
+    """Enqueue a claim fingerprint for recheck.
+
+    Uses INSERT OR IGNORE so duplicate fingerprints are naturally debounced —
+    the queue holds at most one entry per fingerprint at any time.
+    """
     now = timeutil.now_utc().isoformat()
-    # Best-effort: enqueue in Redis-backed queue if available; otherwise persist in DB queue
+    # Best-effort: enqueue in Redis-backed queue if available
     try:
         from .recheck_queue import get_queue
         q = get_queue(conn)
-        q.enqueue(root_uri)
+        q.enqueue(claim_fingerprint)
         return
     except Exception:
-        # fallback to DB-backed upsert
         pass
 
-    # fallback DB upsert (SQLite-compatible - INSERT OR IGNORE)
+    # Fallback: DB-backed INSERT OR IGNORE (debounce via UNIQUE PK)
     try:
         conn.execute(
-            "INSERT OR IGNORE INTO recheck_requests (root_uri, scheduled_at) VALUES (?, ?)",
-            (root_uri, now),
+            "INSERT OR IGNORE INTO recheck_queue (claim_fingerprint, scheduled_at) VALUES (?, ?)",
+            (claim_fingerprint, now),
         )
     except Exception:
-        # generic fallback for DBs that don't support INSERT OR IGNORE
-        cur = conn.execute("SELECT 1 FROM recheck_requests WHERE root_uri = ?", (root_uri,)).fetchall()
+        cur = conn.execute("SELECT 1 FROM recheck_queue WHERE claim_fingerprint = ?", (claim_fingerprint,)).fetchall()
         if not cur:
-            conn.execute("INSERT INTO recheck_requests (root_uri, scheduled_at) VALUES (?, ?)", (root_uri, now))
+            conn.execute("INSERT INTO recheck_queue (claim_fingerprint, scheduled_at) VALUES (?, ?)", (claim_fingerprint, now))
 
-    conn.execute(
-        "UPDATE recheck_requests SET scheduled_at = ? WHERE root_uri = ?",
-        (now, root_uri),
-    )
-
-    # Backpressure: drop oldest entries if queue exceeds cap
-    if RECHECK_QUEUE_MAX > 0:
-        try:
-            count = conn.execute("SELECT COUNT(*) FROM recheck_requests").fetchone()[0]
-            if count > RECHECK_QUEUE_MAX:
-                excess = count - RECHECK_QUEUE_MAX
-                conn.execute(
-                    "DELETE FROM recheck_requests WHERE root_uri IN "
-                    "(SELECT root_uri FROM recheck_requests ORDER BY scheduled_at ASC LIMIT ?)",
-                    (excess,),
-                )
-        except Exception:
-            pass
-
+    # Cap enforcement is handled by the recheck_queue_fp_cap trigger
     conn.commit()
 
 

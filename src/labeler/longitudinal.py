@@ -3,11 +3,7 @@ import json
 import logging
 from typing import List
 
-from .db import get_conn, get_conn as _get_conn
-from .db import get_conn as get_conn_fn
 from .db import get_conn
-from .db import get_conn as gc
-from .db import get_conn as _gc
 
 LOG = logging.getLogger("labeler.longitudinal")
 
@@ -70,6 +66,45 @@ def _load_posts_for_root(conn, root_uri: str) -> List[Post]:
     return posts
 
 
+def _load_posts_for_fingerprint(conn, claim_fingerprint: str) -> List[Post]:
+    """Load all posts that share a claim fingerprint (across all authors)."""
+    rows = conn.execute(
+        "SELECT post_uri, createdAt FROM claim_history WHERE claim_fingerprint = ? ORDER BY createdAt ASC",
+        (claim_fingerprint,),
+    ).fetchall()
+    posts = []
+    seen = set()
+    for post_uri, _created in rows:
+        if post_uri in seen:
+            continue
+        seen.add(post_uri)
+        try:
+            ev_rows = conn.execute("SELECT raw, ctime FROM events WHERE event_uri = ?", (post_uri,)).fetchall()
+        except Exception:
+            ev_rows = []
+        if not ev_rows:
+            continue
+        raw_json, ctime = ev_rows[0]
+        try:
+            data = json.loads(raw_json)
+        except Exception:
+            continue
+        p = Post(
+            uri=data.get("uri") or post_uri,
+            cid=data.get("cid"),
+            text=data.get("text", ""),
+            createdAt=timeutil.to_utc_iso(data.get("createdAt") or ctime),
+            authorDid=data.get("authorDid", ""),
+            replyParentUri=data.get("replyParentUri"),
+            replyRootUri=data.get("replyRootUri"),
+            facets=data.get("facets", []),
+            embeds=data.get("embeds", []),
+            externalLinks=data.get("externalLinks", []),
+        )
+        posts.append(p)
+    return posts
+
+
 def _load_posts_for_claim_group(conn, authorDid: str, claim_fingerprint: str) -> List[Post]:
     rows = conn.execute(
         "SELECT post_uri, createdAt FROM claim_history WHERE authorDid = ? AND claim_fingerprint = ? ORDER BY createdAt ASC",
@@ -122,21 +157,21 @@ def _decision_inputs_for_post(text: str) -> dict:
 
 
 def recheck_once(limit: int = 100) -> int:
-    """Process up to `limit` recheck requests and re-evaluate threads.
+    """Process up to `limit` recheck requests and re-evaluate claim fingerprints.
 
-    Returns the number of roots processed.
+    Returns the number of fingerprints processed.
     """
     conn = get_conn()
     # try queue-backed dequeue first (Redis preferred)
     try:
         from .recheck_queue import get_queue
         q = get_queue(conn)
-        roots = q.dequeue(limit)
+        fingerprints = q.dequeue(limit)
     except Exception:
-        rows = conn.execute("SELECT root_uri FROM recheck_requests ORDER BY scheduled_at ASC LIMIT ?", (limit,)).fetchall()
-        roots = [r[0] for r in rows]
+        rows = conn.execute("SELECT claim_fingerprint FROM recheck_queue ORDER BY scheduled_at ASC LIMIT ?", (limit,)).fetchall()
+        fingerprints = [r[0] for r in rows]
 
-    if not roots:
+    if not fingerprints:
         conn.close()
         return 0
 
@@ -149,9 +184,9 @@ def recheck_once(limit: int = 100) -> int:
     claim_recheck_enabled = os.getenv("ENABLE_CLAIM_RECHECK", "0") == "1"
     claim_recheck_limit = int(os.getenv("CLAIM_RECHECK_MAX_PER_RUN", "25"))
     from . import metrics as metrics_module
-    for root in roots:
+    for fp in fingerprints:
         try:
-            posts = _load_posts_for_root(conn, root)
+            posts = _load_posts_for_fingerprint(conn, fp)
             # collect labels produced by rules per subject
             labels_by_subject = {}
             for p in posts:
@@ -161,9 +196,7 @@ def recheck_once(limit: int = 100) -> int:
                 if claim_recheck_enabled:
                     if any(l.rule_id == "repeat_claim_no_new_evidence" for l in labs):
                         try:
-                            from .claims import fingerprint_text
                             from .db import enqueue_claim_recheck
-                            fp = fingerprint_text(p.text)
                             enqueue_claim_recheck(p.authorDid, fp)
                         except Exception:
                             pass
@@ -200,7 +233,7 @@ def recheck_once(limit: int = 100) -> int:
                         "time": timeutil.now_utc().isoformat(),
                         "labeler": DRIFT_LABELER_DID,
                         "rule_id": l.rule_id or "unknown",
-                        "scheduler": "thread_root",
+                        "scheduler": "fingerprint",
                     }
                     inserted = insert_label(subj, DRIFT_LABELER_DID, label_obj)
                     if inserted:
@@ -233,7 +266,7 @@ def recheck_once(limit: int = 100) -> int:
                                 )
                             except Exception:
                                 pass
-                            decision_trace = json.dumps({"reasons": l.reasons, "evidence": l.evidence, "scheduler": "thread_root"}, sort_keys=True)
+                            decision_trace = json.dumps({"reasons": l.reasons, "evidence": l.evidence, "scheduler": "fingerprint"}, sort_keys=True)
                             insert_label_decision(
                                 subject_uri=subj,
                                 root_uri=p.replyRootUri or p.uri,
@@ -253,11 +286,11 @@ def recheck_once(limit: int = 100) -> int:
                             metrics_module.RECHECK_QUARANTINE_TRIPPED.inc()
 
         except Exception:
-            LOG.exception("recheck failed for root %s", root)
+            LOG.exception("recheck failed for fingerprint %s", fp)
         finally:
-            # if using DB fallback, remove the recheck request
+            # remove the processed fingerprint from the queue
             try:
-                conn.execute("DELETE FROM recheck_requests WHERE root_uri = ?", (root,))
+                conn.execute("DELETE FROM recheck_queue WHERE claim_fingerprint = ?", (fp,))
                 conn.commit()
             except Exception:
                 pass
@@ -371,11 +404,14 @@ def recheck_once(limit: int = 100) -> int:
 async def run_periodic(stop_event=None, interval: int = None):
     import asyncio
     interval = interval or int(os.getenv("RECHECK_INTERVAL", "60"))
+    batch = int(os.getenv("RECHECK_BATCH_SIZE", "10"))
     stop_event = stop_event or asyncio.Event()
-    LOG.info("starting recheck loop interval=%s", interval)
+    LOG.info("starting recheck loop interval=%s batch=%s", interval, batch)
+    loop = asyncio.get_event_loop()
     while not stop_event.is_set():
         try:
-            recheck_once()
+            # Run in executor to avoid blocking the event loop (and killing websocket keepalives)
+            await loop.run_in_executor(None, recheck_once, batch)
         except Exception:
             LOG.exception("error during recheck loop")
         try:

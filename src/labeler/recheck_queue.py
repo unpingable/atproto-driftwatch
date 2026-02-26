@@ -11,42 +11,46 @@ class LocalFallbackQueue:
     def __init__(self, conn):
         self.conn = conn
 
-    def enqueue(self, root_uri: str):
+    def enqueue(self, claim_fingerprint: str):
         now = timeutil.now_utc().isoformat()
-        # upsert in DB table (portable across sqlite/duckdb)
-        cur = self.conn.execute(
-            "SELECT 1 FROM recheck_requests WHERE root_uri = ?",
-            (root_uri,),
-        ).fetchall()
-        if cur:
+        # INSERT OR IGNORE — UNIQUE PK on claim_fingerprint provides debounce
+        try:
             self.conn.execute(
-                "UPDATE recheck_requests SET scheduled_at = ? WHERE root_uri = ?",
-                (now, root_uri),
+                "INSERT OR IGNORE INTO recheck_queue (claim_fingerprint, scheduled_at) VALUES (?, ?)",
+                (claim_fingerprint, now),
             )
-        else:
-            self.conn.execute(
-                "INSERT INTO recheck_requests VALUES (?, ?)",
-                (root_uri, now),
-            )
+        except Exception:
+            cur = self.conn.execute(
+                "SELECT 1 FROM recheck_queue WHERE claim_fingerprint = ?",
+                (claim_fingerprint,),
+            ).fetchall()
+            if not cur:
+                self.conn.execute(
+                    "INSERT INTO recheck_queue (claim_fingerprint, scheduled_at) VALUES (?, ?)",
+                    (claim_fingerprint, now),
+                )
         self.conn.commit()
         try:
-            rows = self.conn.execute("SELECT COUNT(*) FROM recheck_requests").fetchall()
+            rows = self.conn.execute("SELECT COUNT(*) FROM recheck_queue").fetchall()
             metrics.RECHECK_QUEUE_DEPTH.set(rows[0][0] if rows else 0)
         except Exception:
             pass
 
     def dequeue(self, limit: int = 100) -> List[str]:
-        rows = self.conn.execute("SELECT root_uri FROM recheck_requests ORDER BY scheduled_at ASC LIMIT ?", (limit,)).fetchall()
-        roots = [r[0] for r in rows]
-        for r in roots:
-            self.conn.execute("DELETE FROM recheck_requests WHERE root_uri = ?", (r,))
+        rows = self.conn.execute(
+            "SELECT claim_fingerprint FROM recheck_queue ORDER BY scheduled_at ASC LIMIT ?",
+            (limit,),
+        ).fetchall()
+        fps = [r[0] for r in rows]
+        for fp in fps:
+            self.conn.execute("DELETE FROM recheck_queue WHERE claim_fingerprint = ?", (fp,))
         self.conn.commit()
         try:
-            rows = self.conn.execute("SELECT COUNT(*) FROM recheck_requests").fetchall()
+            rows = self.conn.execute("SELECT COUNT(*) FROM recheck_queue").fetchall()
             metrics.RECHECK_QUEUE_DEPTH.set(rows[0][0] if rows else 0)
         except Exception:
             pass
-        return roots
+        return fps
 
 
 class RedisQueue:
@@ -55,24 +59,23 @@ class RedisQueue:
         self.r = redis.Redis.from_url(REDIS_URL)
         self.key = "recheck:queue"
 
-    def enqueue(self, root_uri: str):
-        # use sorted set with timestamp score
-        self.r.zadd(self.key, {root_uri: time.time()})
+    def enqueue(self, claim_fingerprint: str):
+        # sorted set: duplicate fingerprints naturally deduplicate (zadd updates score)
+        self.r.zadd(self.key, {claim_fingerprint: time.time()})
         try:
             metrics.RECHECK_QUEUE_DEPTH.set(self.r.zcard(self.key))
         except Exception:
             pass
 
     def dequeue(self, limit: int = 100) -> List[str]:
-        # attempt to pop up to `limit` smallest-score members using ZPOPMIN if available
         try:
             items = self.r.zpopmin(self.key, limit)
-            roots = [m.decode() if isinstance(m, bytes) else m for m, _ in items]
+            fps = [m.decode() if isinstance(m, bytes) else m for m, _ in items]
             try:
                 metrics.RECHECK_QUEUE_DEPTH.set(self.r.zcard(self.key))
             except Exception:
                 pass
-            return roots
+            return fps
         except Exception:
             # fallback: range + remove
             items = self.r.zrange(self.key, 0, limit - 1)

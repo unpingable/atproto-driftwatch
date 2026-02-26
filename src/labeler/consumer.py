@@ -145,6 +145,36 @@ class ATProtoConsumer:
         self._stop = False
         self._event_count = 0
         self._last_cursor: Optional[str] = None
+        self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
+
+    def _process_event(self, ev: dict):
+        """Synchronous DB work — called from background drain task."""
+        event_uri = ev["uri"]
+        author = ev["authorDid"]
+        ctime = ev["createdAt"]
+        insert_event(event_uri, ctime, author, ev)
+        edges = extract_edges_from_event(ev)
+        insert_edges(edges)
+
+    async def _drain_queue(self):
+        """Background task that drains the event queue without blocking the WS read loop."""
+        loop = asyncio.get_event_loop()
+        while not self._stop:
+            try:
+                ev = await self._event_queue.get()
+            except asyncio.CancelledError:
+                break
+            try:
+                await loop.run_in_executor(None, self._process_event, ev)
+            except Exception:
+                LOG.exception("failed to process event")
+            self._event_count += 1
+            if self._event_count % CURSOR_SAVE_INTERVAL == 0:
+                if self._last_cursor:
+                    await loop.run_in_executor(None, upsert_cursor, CONSUMER_NAME, self._last_cursor)
+                if self._event_count % (CURSOR_SAVE_INTERVAL * 10) == 0:
+                    LOG.info("ingested %d events, cursor=%s, queue_backlog=%d",
+                             self._event_count, self._last_cursor, self._event_queue.qsize())
 
     async def _handle_message(self, raw: str):
         try:
@@ -163,23 +193,8 @@ class ATProtoConsumer:
         if ev is None:
             return
 
-        event_uri = ev["uri"]
-        author = ev["authorDid"]
-        ctime = ev["createdAt"]
-
-        insert_event(event_uri, ctime, author, ev)
-
-        edges = extract_edges_from_event(ev)
-        insert_edges(edges)
-
-        self._event_count += 1
-
-        # Persist cursor periodically
-        if self._event_count % CURSOR_SAVE_INTERVAL == 0:
-            if self._last_cursor:
-                upsert_cursor(CONSUMER_NAME, self._last_cursor)
-            if self._event_count % (CURSOR_SAVE_INTERVAL * 10) == 0:
-                LOG.info("ingested %d events, cursor=%s", self._event_count, self._last_cursor)
+        # Put on queue — non-blocking so WS read loop stays responsive for pings
+        await self._event_queue.put(ev)
 
     async def run(self):
         """Connect to Jetstream and process messages with reconnect resilience."""
@@ -188,10 +203,19 @@ class ATProtoConsumer:
         ws_url = _build_ws_url(self.ws_url, cursor=saved_cursor)
         LOG.info("starting Jetstream consumer, url=%s", ws_url)
 
+        # Start background drain task
+        drain_task = asyncio.ensure_future(self._drain_queue())
+
         while not self._stop:
             try:
                 url = _build_ws_url(self.ws_url, cursor=self._last_cursor or saved_cursor)
-                async with websockets.connect(url, max_size=10 * 1024 * 1024) as ws:
+                async with websockets.connect(
+                    url,
+                    max_size=10 * 1024 * 1024,
+                    ping_interval=None,
+                    ping_timeout=None,
+                    close_timeout=10,
+                ) as ws:
                     LOG.info("connected to Jetstream")
                     async for msg in ws:
                         await self._handle_message(msg)
@@ -201,7 +225,8 @@ class ATProtoConsumer:
                 LOG.exception("Jetstream connection error, reconnecting in 5s")
                 await asyncio.sleep(5)
 
-        # Save cursor on shutdown
+        # Cleanup
+        drain_task.cancel()
         if self._last_cursor:
             upsert_cursor(CONSUMER_NAME, self._last_cursor)
             LOG.info("saved cursor on shutdown: %s", self._last_cursor)
