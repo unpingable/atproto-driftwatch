@@ -139,6 +139,10 @@ def init_db():
         conn.execute("ALTER TABLE claim_history ADD COLUMN evidence_class TEXT DEFAULT 'none'")
     except Exception:
         pass
+    try:
+        conn.execute("ALTER TABLE claim_history ADD COLUMN fp_kind TEXT DEFAULT 'unknown'")
+    except Exception:
+        pass
 
     # Legacy recheck_requests table (kept for DB compat; no longer used)
     conn.execute(
@@ -276,8 +280,9 @@ def insert_event(event_uri: str, ctime: Union[str, int, float, datetime.datetime
             if text and passes_complexity_gate(text, ext_links, embeds, facets):
                 evidence_hash = evidence_hash_from_raw(raw)
                 ev_class = classify_evidence(ext_links, embeds, facets)
-                fp = add_claim_history(author, text, ctime_dt.isoformat(), event_uri, raw.get("cid"), None, None, evidence_hash, ev_class)
+                fp, fp_kind = add_claim_history(author, text, ctime_dt.isoformat(), event_uri, raw.get("cid"), None, None, evidence_hash, ev_class)
                 queue_stats.inc("claims_written")
+                queue_stats.inc(f"kind:{fp_kind}")
                 has_link = bool(ext_links)
                 is_reply = bool(raw.get("replyRootUri") or raw.get("replyParentUri"))
                 if _fp_passes_enqueue_gate(fp, author, has_link, is_reply):
@@ -315,8 +320,9 @@ def insert_event(event_uri: str, ctime: Union[str, int, float, datetime.datetime
             if text and passes_complexity_gate(text, ext_links, embeds, facets):
                 evidence_hash = evidence_hash_from_raw(raw)
                 ev_class = classify_evidence(ext_links, embeds, facets)
-                fp = add_claim_history(author, text, ctime_dt.isoformat(), event_uri, raw.get("cid"), None, None, evidence_hash, ev_class)
+                fp, fp_kind = add_claim_history(author, text, ctime_dt.isoformat(), event_uri, raw.get("cid"), None, None, evidence_hash, ev_class)
                 queue_stats.inc("claims_written")
+                queue_stats.inc(f"kind:{fp_kind}")
                 has_link = bool(ext_links)
                 is_reply = bool(raw.get("replyRootUri") or raw.get("replyParentUri"))
                 if _fp_passes_enqueue_gate(fp, author, has_link, is_reply):

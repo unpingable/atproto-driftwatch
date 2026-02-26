@@ -340,6 +340,41 @@ def detect_regime_shifts(
 
 
 # ---------------------------------------------------------------------------
+# Cluster kind helpers
+# ---------------------------------------------------------------------------
+
+def _query_cluster_kinds(conn, since: str) -> Dict[str, Dict[str, int]]:
+    """Return {kind: {fingerprints: N, posts: N}} for the report window."""
+    rows = conn.execute(
+        "SELECT COALESCE(fp_kind, 'unknown'), COUNT(DISTINCT claim_fingerprint), COUNT(*) "
+        "FROM claim_history WHERE createdAt >= ? GROUP BY fp_kind",
+        (since,),
+    ).fetchall()
+    return {
+        row[0]: {"fingerprints": row[1], "posts": row[2]}
+        for row in rows
+    }
+
+
+def _query_fp_kind_map(conn, since: str) -> Dict[str, str]:
+    """Return {claim_fingerprint: dominant_fp_kind} for fingerprints in the window.
+
+    Uses the most common fp_kind per fingerprint (MODE).
+    """
+    rows = conn.execute(
+        "SELECT claim_fingerprint, fp_kind, COUNT(*) as cnt "
+        "FROM claim_history WHERE createdAt >= ? AND fp_kind IS NOT NULL "
+        "GROUP BY claim_fingerprint, fp_kind ORDER BY claim_fingerprint, cnt DESC",
+        (since,),
+    ).fetchall()
+    fp_map: Dict[str, str] = {}
+    for fp, kind, _cnt in rows:
+        if fp not in fp_map:
+            fp_map[fp] = kind or "unknown"
+    return fp_map
+
+
+# ---------------------------------------------------------------------------
 # Cluster report — the first Driftwatch artifact
 # ---------------------------------------------------------------------------
 
@@ -360,6 +395,12 @@ def cluster_report(
 
     ts = fingerprint_timeseries(conn=conn, bin_hours=bin_hours, since=since)
 
+    # --- Cluster kinds summary ---
+    cluster_kinds = _query_cluster_kinds(conn, since)
+
+    # --- Per-fingerprint kind lookup ---
+    fp_kind_map = _query_fp_kind_map(conn, since)
+
     bursts = compute_burst_scores(ts)[:top_n]
 
     # Separate single-author-heavy clusters (likely automation/spam)
@@ -370,7 +411,7 @@ def cluster_report(
         fp = b["fingerprint"]
         fp_ts = [t for t in ts if t["fingerprint"] == fp]
         hl = compute_half_life(fp_ts)
-        entry = {**b, "half_life": hl}
+        entry = {**b, "half_life": hl, "fp_kind": fp_kind_map.get(fp, "unknown")}
         if b["latest_authors"] <= 1 and b["total_posts"] >= SINGLE_AUTHOR_THRESHOLD:
             entry["single_author_heavy"] = True
             automation.append(entry)
@@ -391,6 +432,7 @@ def cluster_report(
         "generated_at": timeutil.now_utc().isoformat(),
         "window_hours": hours,
         "bin_hours": bin_hours,
+        "cluster_kinds": cluster_kinds,
         "clusters": clusters[:top_n],
         "likely_automation": automation,
         "regime_shifts": recent_shifts,

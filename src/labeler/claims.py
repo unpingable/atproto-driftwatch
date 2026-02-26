@@ -222,8 +222,11 @@ def _extract_link_domains(text: str) -> list:
     return sorted(set(domains))
 
 
-def fingerprint_text(text: str) -> str:
+def fingerprint_text_with_kind(text: str) -> tuple:
     """Derive a stable fingerprint with configurable heuristics.
+
+    Returns (fingerprint_hash, kind) where kind is one of:
+      "entity", "quantity", "domain", "span", "text"
 
     Source precedence (strongest signal wins):
       1. Multi-word named entity — E:New York,Jd Vance
@@ -240,6 +243,7 @@ def fingerprint_text(text: str) -> str:
 
     cs = extract_claim_signals(text or "")
     parts = []
+    kind = "text"  # default fallback
 
     # Split entities into multi-word (strong) and single-word (weak)
     all_ents = [e for e in cs.entities if e and e.lower().strip(":") not in FP_MODAL_FILTER and e.lower().strip(":") not in FP_ENTITY_STOPWORDS]
@@ -250,11 +254,14 @@ def fingerprint_text(text: str) -> str:
     # --- 1. Multi-word named entities ---
     if multi_word_ents:
         parts.append("E:" + ",".join(sorted(multi_word_ents)))
+        kind = "entity"
 
     # --- 2. Quantities + context ---
     if cs.quantities:
         qn = [str(_normalize_number(q)) for q in sorted(cs.quantities)]
         parts.append("Q:" + ",".join(qn))
+        if kind == "text":
+            kind = "quantity"
         # add predicate context to distinguish "10k killed" from "10k donated"
         if cs.spans:
             added_prep = False
@@ -279,23 +286,33 @@ def fingerprint_text(text: str) -> str:
         domains = _extract_link_domains(text or "")
         if domains:
             parts.append("D:" + ",".join(domains))
+            kind = "domain"
 
     # --- 4. Single-word entities (only if nothing stronger exists) ---
     if not parts and single_word_ents:
         parts.append("E:" + ",".join(sorted(single_word_ents)))
+        kind = "entity"
 
     # --- 5. Claim spans ---
     if cs.spans and not parts:
         spans_norm = [_normalize_text_for_fingerprint(s) for s in cs.spans]
         parts.append("S:" + ",".join(sorted(spans_norm)))
+        kind = "span"
 
     # --- 6. Fallback: normalized text ---
     if not parts:
         parts.append("T:" + _normalize_text_for_fingerprint(text or ""))
+        # kind remains "text"
 
     fingerprint_source = "|".join(parts)
     h = hashlib.sha256(fingerprint_source.encode("utf-8")).hexdigest()
-    return h[:16]
+    return h[:16], kind
+
+
+def fingerprint_text(text: str) -> str:
+    """Derive a stable fingerprint hash (convenience wrapper)."""
+    fp, _kind = fingerprint_text_with_kind(text)
+    return fp
 
 
 def fingerprint_debug(text: str) -> dict:
@@ -392,18 +409,16 @@ def classify_evidence(external_links: list = None, embeds: list = None, facets: 
 
 
 def add_claim_history(authorDid: str, text: str, createdAt: str, post_uri: str, post_cid: Optional[str] = None, confidence: Optional[float] = None, provenance: Optional[str] = None, evidence_hash: Optional[str] = None, evidence_class: Optional[str] = None):
-    fp = fingerprint_text(text)
+    fp, fp_kind = fingerprint_text_with_kind(text)
     createdAt = timeutil.to_utc_iso(createdAt)
     conn = get_conn()
     conn.execute(
-        "INSERT INTO claim_history (authorDid, claim_fingerprint, createdAt, confidence, provenance, evidence_hash, post_uri, post_cid, fingerprint_version, evidence_class) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (authorDid, fp, createdAt, confidence, provenance or "", evidence_hash or "", post_uri, post_cid or "", FP_VERSION, evidence_class or "none"),
+        "INSERT INTO claim_history (authorDid, claim_fingerprint, createdAt, confidence, provenance, evidence_hash, post_uri, post_cid, fingerprint_version, evidence_class, fp_kind) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (authorDid, fp, createdAt, confidence, provenance or "", evidence_hash or "", post_uri, post_cid or "", FP_VERSION, evidence_class or "none", fp_kind),
     )
     conn.commit()
     conn.close()
-    return fp
-    j = json.dumps(ent, sort_keys=True)
-    return hashlib.sha256(j.encode("utf-8")).hexdigest()[:16]
+    return fp, fp_kind
 
 
 def get_claim_history(authorDid: str, fingerprint: str) -> List[dict]:

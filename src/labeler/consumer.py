@@ -196,10 +196,22 @@ class ATProtoConsumer:
                 except Exception:
                     depth = -1
                 median_age = snap.get("median_dequeue_age_secs", -1)
+                # Build kind distribution string
+                kind_counts = {
+                    k.split(":", 1)[1]: v
+                    for k, v in snap.items()
+                    if k.startswith("kind:") and v
+                }
+                total_kinds = sum(kind_counts.values()) or 1
+                kinds_str = ",".join(
+                    f"{k[0].upper()}:{round(100*v/total_kinds)}%"
+                    for k, v in sorted(kind_counts.items())
+                ) or "n/a"
                 LOG.info(
                     "STATS window=%.0fs events_in=%d claims=%d "
                     "enq_attempt=%d enq_insert=%d enq_ignore=%d enq_gated=%d "
-                    "dequeued=%d queue_depth=%d median_age=%.0fs backlog=%d",
+                    "dequeued=%d queue_depth=%d median_age=%.0fs backlog=%d "
+                    "kinds=%s",
                     snap["window_secs"],
                     snap["events_in"],
                     snap["claims_written"],
@@ -211,6 +223,7 @@ class ATProtoConsumer:
                     depth,
                     median_age,
                     self._event_queue.qsize(),
+                    kinds_str,
                 )
 
     async def _handle_message(self, raw: str):
