@@ -76,6 +76,24 @@ Goal: Visibility, not control.
 Exit condition:
 The UI answers “what just happened?” in under 10 seconds.
 
+## Seams / Spec Work
+
+Patterns borrowed from PCAR (agent_gov), adapted for ATProto.
+Full analysis: [docs/ATPROTO_SEAMS.md](docs/ATPROTO_SEAMS.md)
+
+**Near-term:**
+- Adopt PCAR-D canonicalization profile for receipt hashing
+- Add `receipt_hash` to `label_decisions` (content-addressed decision identity)
+- Draft effect taxonomy: detect / warn / quarantine / suggest / emit
+
+**Later:**
+- Receipt chain (`prev_receipt_hash`) for tamper-evident audit trail
+- Formalize regime taxonomy (QUIET / ACTIVE / SURGE / ALARM) with hysteresis
+- Typed claim envelopes in decision ledger (explicit claim_type)
+- Cross-project receipt verification / replay tool
+- Casefile / annotation ledger for human review notes
+- Domain separation tags for hash namespacing
+
 ## Explicit Anti-Roadmap
 
 - No large corpora ingestion
