@@ -12,7 +12,7 @@ import asyncio
 import logging
 from typing import Optional
 import websockets
-from .db import insert_event, insert_edges, init_db, upsert_cursor, get_cursor
+from .db import insert_event, insert_edges, init_db, upsert_cursor, get_cursor, get_conn
 from .extractor import extract_edges_from_event
 from . import timeutil
 
@@ -147,6 +147,13 @@ class ATProtoConsumer:
         self._last_cursor: Optional[str] = None
         self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
 
+    @staticmethod
+    def _get_queue_depth() -> int:
+        conn = get_conn()
+        n = conn.execute("SELECT COUNT(*) FROM recheck_queue").fetchone()[0]
+        conn.close()
+        return n
+
     def _process_event(self, ev: dict):
         """Synchronous DB work — called from background drain task."""
         event_uri = ev["uri"]
@@ -158,7 +165,10 @@ class ATProtoConsumer:
 
     async def _drain_queue(self):
         """Background task that drains the event queue without blocking the WS read loop."""
+        from . import queue_stats
         loop = asyncio.get_event_loop()
+        last_stats_ts = asyncio.get_event_loop().time()
+
         while not self._stop:
             try:
                 ev = await self._event_queue.get()
@@ -168,13 +178,38 @@ class ATProtoConsumer:
                 await loop.run_in_executor(None, self._process_event, ev)
             except Exception:
                 LOG.exception("failed to process event")
+
+            queue_stats.inc("events_in")
             self._event_count += 1
+
             if self._event_count % CURSOR_SAVE_INTERVAL == 0:
                 if self._last_cursor:
                     await loop.run_in_executor(None, upsert_cursor, CONSUMER_NAME, self._last_cursor)
-                if self._event_count % (CURSOR_SAVE_INTERVAL * 10) == 0:
-                    LOG.info("ingested %d events, cursor=%s, queue_backlog=%d",
-                             self._event_count, self._last_cursor, self._event_queue.qsize())
+
+            # Per-minute stats line
+            now_mono = loop.time()
+            if now_mono - last_stats_ts >= 60:
+                last_stats_ts = now_mono
+                snap = queue_stats.snapshot_and_reset()
+                try:
+                    depth = await loop.run_in_executor(None, self._get_queue_depth)
+                except Exception:
+                    depth = -1
+                LOG.info(
+                    "STATS window=%.0fs events_in=%d claims=%d "
+                    "enq_attempt=%d enq_insert=%d enq_ignore=%d enq_gated=%d "
+                    "dequeued=%d queue_depth=%d backlog=%d",
+                    snap["window_secs"],
+                    snap["events_in"],
+                    snap["claims_written"],
+                    snap["enqueue_attempts"],
+                    snap["enqueue_inserted"],
+                    snap["enqueue_ignored"],
+                    snap["enqueue_gated"],
+                    snap["dequeued"],
+                    depth,
+                    self._event_queue.qsize(),
+                )
 
     async def _handle_message(self, raw: str):
         try:

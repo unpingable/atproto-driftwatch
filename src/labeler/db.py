@@ -3,6 +3,7 @@ import os
 import pathlib
 import datetime
 import sqlite3
+import time as _time
 from typing import Optional, Union
 import uuid
 from . import timeutil
@@ -262,9 +263,10 @@ def insert_event(event_uri: str, ctime: Union[str, int, float, datetime.datetime
             (event_uri, ctime_dt.isoformat(), author, raw_json),
         )
         conn.commit()
-        # add claim history entry and enqueue fingerprint for recheck (complexity-gated)
+        # add claim history entry and enqueue fingerprint for recheck (complexity-gated + singleton-gated)
         try:
             from .claims import add_claim_history, evidence_hash_from_raw, passes_complexity_gate, classify_evidence
+            from . import queue_stats
             text = raw.get("text")
             ext_links = raw.get("externalLinks") or []
             embeds = raw.get("embeds") or []
@@ -273,7 +275,13 @@ def insert_event(event_uri: str, ctime: Union[str, int, float, datetime.datetime
                 evidence_hash = evidence_hash_from_raw(raw)
                 ev_class = classify_evidence(ext_links, embeds, facets)
                 fp = add_claim_history(author, text, ctime_dt.isoformat(), event_uri, raw.get("cid"), None, None, evidence_hash, ev_class)
-                _add_recheck(conn, fp)
+                queue_stats.inc("claims_written")
+                has_link = bool(ext_links)
+                is_reply = bool(raw.get("replyRootUri") or raw.get("replyParentUri"))
+                if _fp_passes_enqueue_gate(fp, author, has_link, is_reply):
+                    _add_recheck(conn, fp)
+                else:
+                    queue_stats.inc("enqueue_gated")
         except Exception:
             pass
         conn.close()
@@ -294,9 +302,10 @@ def insert_event(event_uri: str, ctime: Union[str, int, float, datetime.datetime
             (raw_json, ctime_dt.isoformat(), author, event_uri),
         )
         conn.commit()
-        # on update, append new claim history version and enqueue fingerprint (complexity-gated)
+        # on update, append new claim history version and enqueue fingerprint (complexity-gated + singleton-gated)
         try:
             from .claims import add_claim_history, evidence_hash_from_raw, passes_complexity_gate, classify_evidence
+            from . import queue_stats
             text = raw.get("text")
             ext_links = raw.get("externalLinks") or []
             embeds = raw.get("embeds") or []
@@ -305,7 +314,13 @@ def insert_event(event_uri: str, ctime: Union[str, int, float, datetime.datetime
                 evidence_hash = evidence_hash_from_raw(raw)
                 ev_class = classify_evidence(ext_links, embeds, facets)
                 fp = add_claim_history(author, text, ctime_dt.isoformat(), event_uri, raw.get("cid"), None, None, evidence_hash, ev_class)
-                _add_recheck(conn, fp)
+                queue_stats.inc("claims_written")
+                has_link = bool(ext_links)
+                is_reply = bool(raw.get("replyRootUri") or raw.get("replyParentUri"))
+                if _fp_passes_enqueue_gate(fp, author, has_link, is_reply):
+                    _add_recheck(conn, fp)
+                else:
+                    queue_stats.inc("enqueue_gated")
         except Exception:
             pass
         conn.close()
@@ -318,6 +333,56 @@ def insert_event(event_uri: str, ctime: Union[str, int, float, datetime.datetime
 
 RECHECK_QUEUE_MAX = int(os.getenv("RECHECK_QUEUE_MAX", "10000"))
 
+# --- Singleton gate: in-memory sketch to avoid enqueueing one-off posts ---
+# Tracks {fp: (last_seen_epoch, set_of_author_dids)} — once >=2 dids, passes.
+_FP_SKETCH: dict = {}
+_FP_SKETCH_WINDOW = int(os.getenv("FP_SKETCH_WINDOW_SECS", "3600"))  # 1 hour
+_FP_SKETCH_LAST_PRUNE = 0.0
+
+
+def _prune_sketch_if_needed():
+    global _FP_SKETCH_LAST_PRUNE
+    now = _time.time()
+    if now - _FP_SKETCH_LAST_PRUNE < 300:
+        return
+    _FP_SKETCH_LAST_PRUNE = now
+    cutoff = now - _FP_SKETCH_WINDOW
+    stale = [fp for fp, (ts, _) in _FP_SKETCH.items() if ts < cutoff]
+    for fp in stale:
+        del _FP_SKETCH[fp]
+
+
+def _fp_passes_enqueue_gate(fp: str, author_did: str, has_link: bool, is_reply: bool) -> bool:
+    """Return True if this fingerprint should be enqueued for recheck.
+
+    Passes if any of:
+      - post has a link/domain
+      - post is in a reply thread
+      - fp has been seen from >=2 distinct authors recently
+    """
+    if has_link or is_reply:
+        return True
+
+    now = _time.time()
+    entry = _FP_SKETCH.get(fp)
+    if entry is None:
+        _FP_SKETCH[fp] = (now, {author_did})
+        _prune_sketch_if_needed()
+        return False
+
+    ts, dids = entry
+    if len(dids) >= 2:
+        _FP_SKETCH[fp] = (now, dids)
+        return True
+
+    dids.add(author_did)
+    _FP_SKETCH[fp] = (now, dids)
+    if len(dids) >= 2:
+        return True
+
+    _prune_sketch_if_needed()
+    return False
+
 
 def _add_recheck(conn, claim_fingerprint: str):
     """Enqueue a claim fingerprint for recheck.
@@ -325,6 +390,8 @@ def _add_recheck(conn, claim_fingerprint: str):
     Uses INSERT OR IGNORE so duplicate fingerprints are naturally debounced —
     the queue holds at most one entry per fingerprint at any time.
     """
+    from . import queue_stats
+    queue_stats.inc("enqueue_attempts")
     now = timeutil.now_utc().isoformat()
     # Best-effort: enqueue in Redis-backed queue if available
     try:
@@ -337,14 +404,23 @@ def _add_recheck(conn, claim_fingerprint: str):
 
     # Fallback: DB-backed INSERT OR IGNORE (debounce via UNIQUE PK)
     try:
-        conn.execute(
+        cur = conn.execute(
             "INSERT OR IGNORE INTO recheck_queue (claim_fingerprint, scheduled_at) VALUES (?, ?)",
             (claim_fingerprint, now),
         )
+        changed = cur.rowcount if hasattr(cur, 'rowcount') else 1
     except Exception:
-        cur = conn.execute("SELECT 1 FROM recheck_queue WHERE claim_fingerprint = ?", (claim_fingerprint,)).fetchall()
-        if not cur:
+        existing = conn.execute("SELECT 1 FROM recheck_queue WHERE claim_fingerprint = ?", (claim_fingerprint,)).fetchall()
+        if not existing:
             conn.execute("INSERT INTO recheck_queue (claim_fingerprint, scheduled_at) VALUES (?, ?)", (claim_fingerprint, now))
+            changed = 1
+        else:
+            changed = 0
+
+    if changed:
+        queue_stats.inc("enqueue_inserted")
+    else:
+        queue_stats.inc("enqueue_ignored")
 
     # Cap enforcement is handled by the recheck_queue_fp_cap trigger
     conn.commit()

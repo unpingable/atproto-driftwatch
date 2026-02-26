@@ -15,6 +15,8 @@ _label_ingest_task = None
 
 @app.on_event("startup")
 async def startup_event():
+    import logging
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
     init_db()
     # Optionally start the consumer in background when env var is set
     if os.getenv("FIREHOSE_AUTO_START") == "1":
@@ -62,7 +64,7 @@ async def health_extended():
     except Exception:
         quarantine_trips = None
     conn = get_conn()
-    queue_rows = conn.execute("SELECT COUNT(*) FROM recheck_requests").fetchall()
+    queue_rows = conn.execute("SELECT COUNT(*) FROM recheck_queue").fetchall()
     queue_depth = queue_rows[0][0] if queue_rows else 0
     cursor_rows = conn.execute("SELECT consumer, cursor, updated_at FROM cursors ORDER BY updated_at DESC LIMIT 1").fetchall()
     conn.close()

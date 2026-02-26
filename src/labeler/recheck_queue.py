@@ -12,23 +12,32 @@ class LocalFallbackQueue:
         self.conn = conn
 
     def enqueue(self, claim_fingerprint: str):
+        from . import queue_stats
         now = timeutil.now_utc().isoformat()
         # INSERT OR IGNORE — UNIQUE PK on claim_fingerprint provides debounce
         try:
-            self.conn.execute(
+            cur = self.conn.execute(
                 "INSERT OR IGNORE INTO recheck_queue (claim_fingerprint, scheduled_at) VALUES (?, ?)",
                 (claim_fingerprint, now),
             )
+            changed = cur.rowcount if hasattr(cur, 'rowcount') else 1
         except Exception:
-            cur = self.conn.execute(
+            existing = self.conn.execute(
                 "SELECT 1 FROM recheck_queue WHERE claim_fingerprint = ?",
                 (claim_fingerprint,),
             ).fetchall()
-            if not cur:
+            if not existing:
                 self.conn.execute(
                     "INSERT INTO recheck_queue (claim_fingerprint, scheduled_at) VALUES (?, ?)",
                     (claim_fingerprint, now),
                 )
+                changed = 1
+            else:
+                changed = 0
+        if changed:
+            queue_stats.inc("enqueue_inserted")
+        else:
+            queue_stats.inc("enqueue_ignored")
         self.conn.commit()
         try:
             rows = self.conn.execute("SELECT COUNT(*) FROM recheck_queue").fetchall()

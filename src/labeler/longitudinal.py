@@ -175,6 +175,12 @@ def recheck_once(limit: int = 100) -> int:
         conn.close()
         return 0
 
+    try:
+        from . import queue_stats
+        queue_stats.inc("dequeued", len(fingerprints))
+    except Exception:
+        pass
+
     processed = 0
     emit_mode = get_emit_mode()
     emit_cap = get_emit_limits()

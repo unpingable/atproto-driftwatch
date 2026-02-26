@@ -56,6 +56,10 @@ These non-goals are **fuses, not walls**. If the instrument works well and the g
 - **Expiry**: TTL anything account-adjacent that isn't needed for unique-author counts.
 - **Receipted**: every label decision records why it fired, with what evidence, under what config.
 
+## Queue Semantics
+
+The recheck queue (`recheck_queue` table) is capped at 10k entries and functions as a **rolling hotset**, not a backlog. The queue holds recently-seen claim fingerprints; a DB trigger trims the oldest entries when the cap is exceeded. A singleton gate prevents one-off posts from entering the queue — fingerprints must either appear from multiple authors, contain links, or be part of a reply thread. Queue depth pinned at 10k is normal operation, not a sign of system overload.
+
 ## Relationship to Labelwatch
 
 Labelwatch watches **labeler behavior** (are labelers consistent, accountable, governed?).
