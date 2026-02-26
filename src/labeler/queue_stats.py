@@ -19,6 +19,8 @@ _counters = {
     "dequeued": 0,
 }
 
+_gauges = {}  # point-in-time values (not reset on snapshot)
+
 _last_snapshot_ts = time.time()
 
 
@@ -27,11 +29,18 @@ def inc(name: str, n: int = 1):
         _counters[name] = _counters.get(name, 0) + n
 
 
+def set_gauge(name: str, value: float):
+    with _lock:
+        _gauges[name] = value
+
+
 def snapshot_and_reset() -> dict:
-    """Return a copy of all counters and reset them to zero."""
+    """Return a copy of all counters and reset them to zero.
+    Gauges are included but not reset."""
     global _last_snapshot_ts
     with _lock:
         snap = dict(_counters)
+        snap.update(_gauges)
         now = time.time()
         snap["window_secs"] = round(now - _last_snapshot_ts, 1)
         _last_snapshot_ts = now

@@ -160,18 +160,20 @@ def init_db():
         """
     )
 
-    # DB-enforced queue cap on recheck_queue
+    # DB-enforced queue cap with hysteresis: only trim when >11k, trim down to 10k.
+    # Reduces trigger churn by ~10x vs trimming on every insert above 10k.
+    conn.execute("DROP TRIGGER IF EXISTS recheck_queue_fp_cap")
     conn.execute("""
-        CREATE TRIGGER IF NOT EXISTS recheck_queue_fp_cap
+        CREATE TRIGGER IF NOT EXISTS recheck_queue_fp_cap_hysteresis
         AFTER INSERT ON recheck_queue
+        WHEN (SELECT COUNT(*) FROM recheck_queue) > 11000
         BEGIN
           DELETE FROM recheck_queue
           WHERE rowid IN (
             SELECT rowid FROM recheck_queue
             ORDER BY scheduled_at ASC
             LIMIT (
-              SELECT CASE WHEN COUNT(*)>10000 THEN COUNT(*)-10000 ELSE 0 END
-              FROM recheck_queue
+              SELECT COUNT(*) - 10000 FROM recheck_queue
             )
           );
         END;

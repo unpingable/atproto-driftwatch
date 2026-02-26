@@ -1,6 +1,9 @@
 FROM python:3.11-slim
 WORKDIR /app
 
+ARG GIT_SHA=unknown
+ENV GIT_SHA=${GIT_SHA}
+
 RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 
 COPY deploy/requirements.prod.txt requirements.txt

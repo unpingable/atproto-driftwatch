@@ -163,10 +163,11 @@ def recheck_once(limit: int = 100) -> int:
     """
     conn = get_conn()
     # try queue-backed dequeue first (Redis preferred)
+    ages = []
     try:
         from .recheck_queue import get_queue
         q = get_queue(conn)
-        fingerprints = q.dequeue(limit)
+        fingerprints, ages = q.dequeue_with_age(limit)
     except Exception:
         rows = conn.execute("SELECT claim_fingerprint FROM recheck_queue ORDER BY scheduled_at ASC LIMIT ?", (limit,)).fetchall()
         fingerprints = [r[0] for r in rows]
@@ -178,6 +179,10 @@ def recheck_once(limit: int = 100) -> int:
     try:
         from . import queue_stats
         queue_stats.inc("dequeued", len(fingerprints))
+        if ages:
+            sorted_ages = sorted(ages)
+            median_age = sorted_ages[len(sorted_ages) // 2]
+            queue_stats.set_gauge("median_dequeue_age_secs", round(median_age, 1))
     except Exception:
         pass
 

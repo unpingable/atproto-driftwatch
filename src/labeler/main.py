@@ -55,6 +55,9 @@ async def health():
     return {"status": "ok"}
 
 
+BUILD_SHA = os.getenv("GIT_SHA", "unknown")
+
+
 @app.get("/health/extended")
 async def health_extended():
     from .emit_mode import get_emit_mode
@@ -73,6 +76,7 @@ async def health_extended():
         cursor_info = {"consumer": cursor_rows[0][0], "cursor": cursor_rows[0][1], "updated_at": cursor_rows[0][2]}
     return {
         "status": "ok",
+        "build_sha": BUILD_SHA,
         "emit_mode": get_emit_mode(),
         "queue_depth": queue_depth,
         "last_cursor": cursor_info,

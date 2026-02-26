@@ -3,6 +3,8 @@ services:
     build:
       context: ..
       dockerfile: deploy/Dockerfile.prod
+      args:
+        GIT_SHA: ${GIT_SHA:-unknown}
     container_name: driftwatch
     env_file: .env
     ports:

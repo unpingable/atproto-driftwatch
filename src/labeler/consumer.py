@@ -195,10 +195,11 @@ class ATProtoConsumer:
                     depth = await loop.run_in_executor(None, self._get_queue_depth)
                 except Exception:
                     depth = -1
+                median_age = snap.get("median_dequeue_age_secs", -1)
                 LOG.info(
                     "STATS window=%.0fs events_in=%d claims=%d "
                     "enq_attempt=%d enq_insert=%d enq_ignore=%d enq_gated=%d "
-                    "dequeued=%d queue_depth=%d backlog=%d",
+                    "dequeued=%d queue_depth=%d median_age=%.0fs backlog=%d",
                     snap["window_secs"],
                     snap["events_in"],
                     snap["claims_written"],
@@ -208,6 +209,7 @@ class ATProtoConsumer:
                     snap["enqueue_gated"],
                     snap["dequeued"],
                     depth,
+                    median_age,
                     self._event_queue.qsize(),
                 )
 

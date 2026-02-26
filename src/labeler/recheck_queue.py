@@ -1,6 +1,6 @@
 import os
 import time
-from typing import List
+from typing import List, Tuple
 from . import timeutil
 from . import metrics
 
@@ -46,11 +46,26 @@ class LocalFallbackQueue:
             pass
 
     def dequeue(self, limit: int = 100) -> List[str]:
+        fps, _ = self.dequeue_with_age(limit)
+        return fps
+
+    def dequeue_with_age(self, limit: int = 100) -> Tuple[List[str], List[float]]:
+        """Dequeue fingerprints and return (fingerprints, age_seconds) lists."""
+        now = time.time()
         rows = self.conn.execute(
-            "SELECT claim_fingerprint FROM recheck_queue ORDER BY scheduled_at ASC LIMIT ?",
+            "SELECT claim_fingerprint, scheduled_at FROM recheck_queue ORDER BY scheduled_at ASC LIMIT ?",
             (limit,),
         ).fetchall()
-        fps = [r[0] for r in rows]
+        fps = []
+        ages = []
+        for r in rows:
+            fps.append(r[0])
+            try:
+                from datetime import datetime
+                dt = datetime.fromisoformat(r[1])
+                ages.append(now - dt.timestamp())
+            except Exception:
+                ages.append(0.0)
         for fp in fps:
             self.conn.execute("DELETE FROM recheck_queue WHERE claim_fingerprint = ?", (fp,))
         self.conn.commit()
@@ -59,7 +74,7 @@ class LocalFallbackQueue:
             metrics.RECHECK_QUEUE_DEPTH.set(rows[0][0] if rows else 0)
         except Exception:
             pass
-        return fps
+        return fps, ages
 
 
 class RedisQueue:
@@ -77,26 +92,33 @@ class RedisQueue:
             pass
 
     def dequeue(self, limit: int = 100) -> List[str]:
+        fps, _ = self.dequeue_with_age(limit)
+        return fps
+
+    def dequeue_with_age(self, limit: int = 100) -> Tuple[List[str], List[float]]:
+        """Dequeue fingerprints and return (fingerprints, age_seconds) lists."""
+        now = time.time()
         try:
             items = self.r.zpopmin(self.key, limit)
-            fps = [m.decode() if isinstance(m, bytes) else m for m, _ in items]
+            fps = [m.decode() if isinstance(m, bytes) else m for m, score in items]
+            ages = [now - float(score) for _, score in items]
             try:
                 metrics.RECHECK_QUEUE_DEPTH.set(self.r.zcard(self.key))
             except Exception:
                 pass
-            return fps
+            return fps, ages
         except Exception:
-            # fallback: range + remove
+            # fallback: range + remove (no scores available)
             items = self.r.zrange(self.key, 0, limit - 1)
             if not items:
-                return []
+                return [], []
             items = [it.decode() if isinstance(it, bytes) else it for it in items]
             self.r.zrem(self.key, *items)
             try:
                 metrics.RECHECK_QUEUE_DEPTH.set(self.r.zcard(self.key))
             except Exception:
                 pass
-            return items
+            return items, [0.0] * len(items)
 
 
 def get_queue(conn=None):
