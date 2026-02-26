@@ -277,7 +277,20 @@ def recheck_once(limit: int = 100) -> int:
                                 )
                             except Exception:
                                 pass
-                            decision_trace = json.dumps({"reasons": l.reasons, "evidence": l.evidence, "scheduler": "fingerprint"}, sort_keys=True)
+                            try:
+                                from . import platform_health as _ph
+                                _ph_snap = _ph.get_health_snapshot()
+                                _platform_ctx = {
+                                    "health_state": _ph_snap.get("health_state"),
+                                    "coverage_pct": _ph_snap.get("coverage_pct"),
+                                    "baseline_eps": _ph_snap.get("baseline_eps"),
+                                    "current_eps": _ph_snap.get("current_eps"),
+                                    "stream_lag_s": _ph_snap.get("stream_lag_s"),
+                                    "gate_reasons": _ph_snap.get("gate_reasons", []),
+                                }
+                            except Exception:
+                                _platform_ctx = {}
+                            decision_trace = json.dumps({"reasons": l.reasons, "evidence": l.evidence, "scheduler": "fingerprint", "platform": _platform_ctx}, sort_keys=True)
                             insert_label_decision(
                                 subject_uri=subj,
                                 root_uri=p.replyRootUri or p.uri,
@@ -370,7 +383,20 @@ def recheck_once(limit: int = 100) -> int:
                                     )
                                 except Exception:
                                     pass
-                                decision_trace = json.dumps({"reasons": l.reasons, "evidence": l.evidence, "scheduler": "claim_group"}, sort_keys=True)
+                                try:
+                                    from . import platform_health as _ph2
+                                    _ph2_snap = _ph2.get_health_snapshot()
+                                    _platform_ctx2 = {
+                                        "health_state": _ph2_snap.get("health_state"),
+                                        "coverage_pct": _ph2_snap.get("coverage_pct"),
+                                        "baseline_eps": _ph2_snap.get("baseline_eps"),
+                                        "current_eps": _ph2_snap.get("current_eps"),
+                                        "stream_lag_s": _ph2_snap.get("stream_lag_s"),
+                                        "gate_reasons": _ph2_snap.get("gate_reasons", []),
+                                    }
+                                except Exception:
+                                    _platform_ctx2 = {}
+                                decision_trace = json.dumps({"reasons": l.reasons, "evidence": l.evidence, "scheduler": "claim_group", "platform": _platform_ctx2}, sort_keys=True)
                                 insert_label_decision(
                                     subject_uri=p.uri,
                                     root_uri=p.replyRootUri or p.uri,

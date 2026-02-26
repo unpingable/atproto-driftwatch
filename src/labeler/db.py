@@ -367,7 +367,19 @@ def _fp_passes_enqueue_gate(fp: str, author_did: str, has_link: bool, is_reply: 
       - post has a link/domain
       - post is in a reply thread
       - fp has been seen from >=2 distinct authors recently
+
+    Hard-gated by platform health watermark: if stream is degraded,
+    don't enqueue (rechecks against incomplete data are unreliable).
     """
+    try:
+        from . import platform_health
+        if platform_health.is_degraded():
+            from . import queue_stats
+            queue_stats.inc("enqueue_platform_gated")
+            return False
+    except Exception:
+        pass
+
     if has_link or is_reply:
         return True
 

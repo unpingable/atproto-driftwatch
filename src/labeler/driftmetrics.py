@@ -437,6 +437,20 @@ def cluster_report(
     if own_conn:
         conn.close()
 
+    # Platform health context
+    try:
+        from . import platform_health
+        health_snap = platform_health.get_health_snapshot()
+        ph_state = health_snap.get("health_state", "unknown")
+        ph_coverage = health_snap.get("coverage_pct", 0)
+        ph_lag = health_snap.get("stream_lag_s", 0)
+        ph_reasons = health_snap.get("gate_reasons", [])
+    except Exception:
+        ph_state = "unavailable"
+        ph_coverage = 0
+        ph_lag = 0
+        ph_reasons = []
+
     return {
         "generated_at": timeutil.now_utc().isoformat(),
         "window_hours": hours,
@@ -444,6 +458,10 @@ def cluster_report(
         "total_claims_in_window": total_claims,
         "distinct_fps_in_window": distinct_fps,
         "cluster_kinds": cluster_kinds,
+        "platform_health": ph_state,
+        "coverage_pct": ph_coverage,
+        "stream_lag_s": ph_lag,
+        "gate_reasons": ph_reasons,
         "clusters": clusters[:top_n],
         "likely_automation": automation,
         "regime_shifts": recent_shifts,

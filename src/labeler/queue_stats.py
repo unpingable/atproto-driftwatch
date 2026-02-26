@@ -16,6 +16,7 @@ _counters = {
     "enqueue_inserted": 0,
     "enqueue_ignored": 0,
     "enqueue_gated": 0,       # blocked by singleton gate
+    "enqueue_platform_gated": 0,  # blocked by platform health watermark
     "dequeued": 0,
 }
 

@@ -74,6 +74,12 @@ async def health_extended():
     cursor_info = None
     if cursor_rows:
         cursor_info = {"consumer": cursor_rows[0][0], "cursor": cursor_rows[0][1], "updated_at": cursor_rows[0][2]}
+    # Platform health watermark
+    try:
+        from . import platform_health
+        health_snap = platform_health.get_health_snapshot()
+    except Exception:
+        health_snap = {}
     return {
         "status": "ok",
         "build_sha": BUILD_SHA,
@@ -81,6 +87,13 @@ async def health_extended():
         "queue_depth": queue_depth,
         "last_cursor": cursor_info,
         "quarantine_trips": quarantine_trips,
+        "platform_health": health_snap.get("health_state", "unavailable"),
+        "coverage_pct": health_snap.get("coverage_pct"),
+        "events_per_sec": health_snap.get("current_eps"),
+        "baseline_eps": health_snap.get("baseline_eps"),
+        "stream_lag_s": health_snap.get("stream_lag_s"),
+        "reconnect_count": health_snap.get("reconnect_count"),
+        "gate_reasons": health_snap.get("gate_reasons", []),
     }
 
 

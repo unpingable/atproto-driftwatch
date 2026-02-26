@@ -166,6 +166,7 @@ class ATProtoConsumer:
     async def _drain_queue(self):
         """Background task that drains the event queue without blocking the WS read loop."""
         from . import queue_stats
+        from . import platform_health
         loop = asyncio.get_event_loop()
         last_stats_ts = asyncio.get_event_loop().time()
 
@@ -216,11 +217,30 @@ class ATProtoConsumer:
                     f"{k[0].upper()}:{round(100*v/total_kinds)}%"
                     for k, v in sorted(kind_counts.items())
                 ) or "n/a"
+                # Platform health watermark
+                backlog = self._event_queue.qsize()
+                health_snap = platform_health.record_window(
+                    snap["events_in"], snap["window_secs"], backlog,
+                )
+                health_state = health_snap["health_state"]
+                coverage_str = (
+                    "n/a" if health_state == "warming_up"
+                    else f"{health_snap['coverage_pct'] * 100:.1f}%"
+                )
+                # Show primary gate reason in STATS (priority order)
+                gate_reasons = health_snap.get("gate_reasons", [])
+                if gate_reasons:
+                    # Priority: consumer_backlog > lag_high > platform_low_eps
+                    priority = ["consumer_backlog", "lag_high", "platform_low_eps"]
+                    primary = next((r for r in priority if r in gate_reasons), gate_reasons[0])
+                    health_display = f"degraded({primary})"
+                else:
+                    health_display = health_state
                 LOG.info(
                     "STATS window=%.0fs events_in=%d claims=%d "
                     "enq_attempt=%d enq_insert=%d enq_ignore=%d enq_gated=%d "
                     "dequeued=%d queue_depth=%d median_age=%.0fs backlog=%d "
-                    "kinds=%s",
+                    "kinds=%s coverage=%s health=%s baseline_eps=%.1f lag=%.1fs",
                     snap["window_secs"],
                     snap["events_in"],
                     snap["claims_written"],
@@ -231,8 +251,12 @@ class ATProtoConsumer:
                     snap["dequeued"],
                     depth,
                     median_age,
-                    self._event_queue.qsize(),
+                    backlog,
                     kinds_str,
+                    coverage_str,
+                    health_display,
+                    health_snap["baseline_eps"],
+                    health_snap["stream_lag_s"],
                 )
 
     async def _handle_message(self, raw: str):
@@ -242,10 +266,15 @@ class ATProtoConsumer:
             LOG.warning("failed to parse JSON message, skipping")
             return
 
-        # Track cursor for resume
+        # Track cursor for resume and lag
         time_us = js.get("time_us")
         if time_us:
             self._last_cursor = str(time_us)
+            try:
+                from . import platform_health
+                platform_health.record_event_time(time_us)
+            except Exception:
+                pass
 
         # Transform to canonical event
         ev = _jetstream_to_event(js)
@@ -276,6 +305,11 @@ class ATProtoConsumer:
                     close_timeout=10,
                 ) as ws:
                     LOG.info("connected to Jetstream")
+                    try:
+                        from . import platform_health
+                        platform_health.record_reconnect()
+                    except Exception:
+                        pass
                     async for msg in ws:
                         await self._handle_message(msg)
             except asyncio.CancelledError:
