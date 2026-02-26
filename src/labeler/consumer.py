@@ -196,13 +196,22 @@ class ATProtoConsumer:
                 except Exception:
                     depth = -1
                 median_age = snap.get("median_dequeue_age_secs", -1)
-                # Build kind distribution string
+                # Build kind distribution string (always include unknown as canary)
                 kind_counts = {
                     k.split(":", 1)[1]: v
                     for k, v in snap.items()
                     if k.startswith("kind:") and v
                 }
                 total_kinds = sum(kind_counts.values()) or 1
+                unknown_pct = round(100 * kind_counts.get("unknown", 0) / total_kinds)
+                if unknown_pct > 5:
+                    LOG.warning(
+                        "CANARY fp_kind unknown=%d%% (%d/%d) — "
+                        "check extractor health or schema migration",
+                        unknown_pct,
+                        kind_counts.get("unknown", 0),
+                        total_kinds,
+                    )
                 kinds_str = ",".join(
                     f"{k[0].upper()}:{round(100*v/total_kinds)}%"
                     for k, v in sorted(kind_counts.items())

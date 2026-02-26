@@ -228,6 +228,11 @@ def fingerprint_text_with_kind(text: str) -> tuple:
     Returns (fingerprint_hash, kind) where kind is one of:
       "entity", "quantity", "domain", "span", "text"
 
+    Kind rule: first winning source in precedence order. A post with both
+    a multi-word entity and a quantity gets kind="entity" because entity
+    wins the precedence race. This is stable across runs — changing
+    precedence order changes kind assignment, which is the point.
+
     Source precedence (strongest signal wins):
       1. Multi-word named entity — E:New York,Jd Vance
       2. Quantity + context — Q:10k|C:killed

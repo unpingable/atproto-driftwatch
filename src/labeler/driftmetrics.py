@@ -395,6 +395,15 @@ def cluster_report(
 
     ts = fingerprint_timeseries(conn=conn, bin_hours=bin_hours, since=since)
 
+    # --- Window totals ---
+    totals_row = conn.execute(
+        "SELECT COUNT(*), COUNT(DISTINCT claim_fingerprint) "
+        "FROM claim_history WHERE createdAt >= ?",
+        (since,),
+    ).fetchone()
+    total_claims = totals_row[0] if totals_row else 0
+    distinct_fps = totals_row[1] if totals_row else 0
+
     # --- Cluster kinds summary ---
     cluster_kinds = _query_cluster_kinds(conn, since)
 
@@ -432,6 +441,8 @@ def cluster_report(
         "generated_at": timeutil.now_utc().isoformat(),
         "window_hours": hours,
         "bin_hours": bin_hours,
+        "total_claims_in_window": total_claims,
+        "distinct_fps_in_window": distinct_fps,
         "cluster_kinds": cluster_kinds,
         "clusters": clusters[:top_n],
         "likely_automation": automation,
