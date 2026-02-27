@@ -150,6 +150,7 @@ def export_once(source_conn, facts_path=None):
     if facts_path is None:
         facts_path = _default_facts_path()
 
+    t0 = time.monotonic()
     tmp_path = facts_path + ".tmp"
     now = int(time.time())
     retention_start = now - (RETENTION_DAYS * 86400)
@@ -166,6 +167,7 @@ def export_once(source_conn, facts_path=None):
 
     # 3. Read checkpoint rowid
     last_rowid = _get_meta_int(sidecar, "last_checkpoint_rowid", 0)
+    rows_upserted = 0
 
     # 4. Loop batches until drained
     while True:
@@ -180,12 +182,14 @@ def export_once(source_conn, facts_path=None):
             break
 
         batch_max_rowid = rows[-1][0]
+        rows_upserted += len(rows)
 
         # 5. Upsert uri_fingerprint (dedup by post_uri, highest rowid wins)
         _upsert_uri_fingerprints(source_conn, sidecar, last_rowid, batch_max_rowid)
 
         last_rowid = batch_max_rowid
         _set_meta(sidecar, "last_checkpoint_rowid", last_rowid)
+        sidecar.commit()
 
         if len(rows) < BATCH_LIMIT:
             break
@@ -207,7 +211,10 @@ def export_once(source_conn, facts_path=None):
 
     # 10. Atomic replace
     os.replace(tmp_path, facts_path)
-    LOG.info("facts export complete: %s", facts_path)
+    elapsed = time.monotonic() - t0
+    size_mb = os.path.getsize(facts_path) / (1024 * 1024)
+    LOG.info("facts export complete: %s (%.1fs, %.0fMB, %d new rows)",
+             facts_path, elapsed, size_mb, rows_upserted)
 
 
 async def run_periodic(facts_path=None):
@@ -218,12 +225,17 @@ async def run_periodic(facts_path=None):
 
     LOG.info("facts export periodic started, interval=%ds, path=%s", interval, facts_path)
 
+    loop = asyncio.get_event_loop()
     while True:
         try:
-            from .db import get_conn
-            source_conn = get_conn()
-            export_once(source_conn, facts_path)
-            source_conn.close()
+            def _run():
+                from .db import get_conn
+                source_conn = get_conn()
+                try:
+                    export_once(source_conn, facts_path)
+                finally:
+                    source_conn.close()
+            await loop.run_in_executor(None, _run)
         except Exception:
             LOG.exception("facts export failed")
         await asyncio.sleep(interval)
