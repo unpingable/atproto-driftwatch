@@ -39,6 +39,12 @@ async def startup_event():
         loop = asyncio.get_event_loop()
         _label_recheck_task = loop.create_task(_lr())
 
+    # Optionally start facts sidecar export for labelwatch
+    if os.environ.get("ENABLE_FACTS_EXPORT", "").lower() in ("1", "true"):
+        from .facts_export import run_periodic as _fe
+        loop = asyncio.get_event_loop()
+        loop.create_task(_fe())
+
 
 @app.on_event("shutdown")
 async def shutdown_event():

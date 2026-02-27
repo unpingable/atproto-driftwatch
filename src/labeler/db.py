@@ -238,6 +238,7 @@ def init_db():
         pass  # json_extract indexes not supported on all SQLite versions
     try:
         conn.execute("CREATE INDEX IF NOT EXISTS idx_claim_history_fp ON claim_history(claim_fingerprint, createdAt)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_claim_history_created ON claim_history(createdAt)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_ctime ON edges(ctime)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_label_decisions_created ON label_decisions(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_recheck_scheduled ON recheck_requests(scheduled_at)")
