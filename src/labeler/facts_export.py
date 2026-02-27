@@ -2,7 +2,12 @@
 
 Output: /app/data/facts.sqlite (container) = /opt/driftwatch/deploy/data/facts.sqlite (host)
 
-Strategy: copy-forward existing sidecar → tmp, update incrementally, prune, atomic replace.
+Strategy: update working DB in place, periodically snapshot via VACUUM INTO for
+atomic reads by labelwatch.
+
+Layout:
+  facts_work.sqlite — in-place working DB (updated every cycle, WAL mode)
+  facts.sqlite      — read-only snapshot (VACUUM INTO, DELETE journal, atomic replace)
 """
 
 import asyncio
@@ -18,11 +23,17 @@ RETENTION_DAYS = 30
 OVERLAP_HOURS = 72
 BATCH_LIMIT = 500_000
 DEFAULT_INTERVAL_SEC = 30 * 60  # 30 minutes
+DEFAULT_SNAPSHOT_INTERVAL_SEC = 60 * 60  # 1 hour
 
 
 def _default_facts_path():
     from .db import DATA_DIR
     return str(DATA_DIR / "facts.sqlite")
+
+
+def _default_work_path():
+    from .db import DATA_DIR
+    return str(DATA_DIR / "facts_work.sqlite")
 
 
 def _ensure_tables(sidecar):
@@ -145,31 +156,53 @@ def _prune(sidecar, retention_start):
     )
 
 
-def export_once(source_conn, facts_path=None):
-    """Run one export cycle: copy-forward → update → prune → atomic replace."""
+def _snapshot(work_conn, snapshot_path):
+    """Create a compacted snapshot via VACUUM INTO + atomic replace."""
+    tmp_snap = snapshot_path + ".tmp"
+    # Remove stale tmp if exists (e.g. from previous crash)
+    if os.path.exists(tmp_snap):
+        os.remove(tmp_snap)
+    work_conn.execute(f"VACUUM INTO '{tmp_snap}'")
+    # VACUUM INTO produces DELETE journal mode by default, which is what we want
+    os.replace(tmp_snap, snapshot_path)
+
+
+def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=False):
+    """Run one export cycle: update working DB in place, optionally snapshot.
+
+    Args:
+        source_conn: Connection to the main labeler.sqlite (claim_history).
+        facts_path: Path for the read-only snapshot (labelwatch reads this).
+        work_path: Path for the in-place working DB.
+        force_snapshot: If True, always create a snapshot this cycle.
+    """
     if facts_path is None:
         facts_path = _default_facts_path()
+    if work_path is None:
+        work_path = _default_work_path()
 
     t0 = time.monotonic()
-    tmp_path = facts_path + ".tmp"
     now = int(time.time())
     retention_start = now - (RETENTION_DAYS * 86400)
     overlap_start = now - (OVERLAP_HOURS * 3600)
+    snap_interval = int(os.environ.get("FACTS_SNAPSHOT_INTERVAL", DEFAULT_SNAPSHOT_INTERVAL_SEC))
 
-    # 1. Copy-forward (preserves accumulated 30d data)
-    if os.path.exists(facts_path):
-        shutil.copyfile(facts_path, tmp_path)
+    # Seed working DB from existing snapshot on first run
+    if not os.path.exists(work_path) and os.path.exists(facts_path):
+        shutil.copyfile(facts_path, work_path)
+        LOG.info("seeded working DB from existing snapshot")
 
-    # 2. Open tmp (or create fresh)
-    sidecar = sqlite3.connect(tmp_path)
-    sidecar.execute("PRAGMA journal_mode=DELETE")
+    # Open working DB directly (no copy-forward!)
+    sidecar = sqlite3.connect(work_path)
+    sidecar.execute("PRAGMA journal_mode=WAL")
+    sidecar.execute("PRAGMA busy_timeout=30000")
     _ensure_tables(sidecar)
 
-    # 3. Read checkpoint rowid
+    # Read checkpoint rowid
     last_rowid = _get_meta_int(sidecar, "last_checkpoint_rowid", 0)
     rows_upserted = 0
 
-    # 4. Loop batches until drained
+    # Loop batches until drained
     while True:
         rows = source_conn.execute("""
             SELECT rowid, post_uri, claim_fingerprint, createdAt, authorDid
@@ -184,7 +217,6 @@ def export_once(source_conn, facts_path=None):
         batch_max_rowid = rows[-1][0]
         rows_upserted += len(rows)
 
-        # 5. Upsert uri_fingerprint (dedup by post_uri, highest rowid wins)
         _upsert_uri_fingerprints(source_conn, sidecar, last_rowid, batch_max_rowid)
 
         last_rowid = batch_max_rowid
@@ -194,48 +226,69 @@ def export_once(source_conn, facts_path=None):
         if len(rows) < BATCH_LIMIT:
             break
 
-    # 6. Recompute fingerprint_hourly for 72h overlap (delete/replace from source)
+    # Recompute fingerprint_hourly for 72h overlap
     _recompute_hourly(source_conn, sidecar, overlap_start, now)
 
-    # 7. Prune all tables to retention
+    # Prune all tables to retention
     _prune(sidecar, retention_start)
 
-    # 8. Recompute fingerprint_bounds from sidecar (AFTER prune)
+    # Recompute fingerprint_bounds (AFTER prune)
     _recompute_bounds(sidecar)
 
-    # 9. Update meta
+    # Update meta
     _set_meta(sidecar, "last_export_epoch", now)
-
     sidecar.commit()
+
+    elapsed_update = time.monotonic() - t0
+
+    # Snapshot if interval elapsed or forced
+    last_snap = _get_meta_int(sidecar, "last_snapshot_epoch", 0)
+    did_snapshot = False
+    if force_snapshot or (now - last_snap >= snap_interval):
+        t_snap = time.monotonic()
+        _snapshot(sidecar, facts_path)
+        _set_meta(sidecar, "last_snapshot_epoch", now)
+        sidecar.commit()
+        snap_elapsed = time.monotonic() - t_snap
+        did_snapshot = True
+        snap_mb = os.path.getsize(facts_path) / (1024 * 1024)
+        LOG.info("snapshot created: %.0fMB in %.1fs", snap_mb, snap_elapsed)
+
     sidecar.close()
 
-    # 10. Atomic replace
-    os.replace(tmp_path, facts_path)
     elapsed = time.monotonic() - t0
-    size_mb = os.path.getsize(facts_path) / (1024 * 1024)
-    LOG.info("facts export complete: %s (%.1fs, %.0fMB, %d new rows)",
-             facts_path, elapsed, size_mb, rows_upserted)
+    work_mb = os.path.getsize(work_path) / (1024 * 1024)
+    LOG.info("facts export complete: %.1fs (update=%.1fs, %d new rows, work=%.0fMB%s)",
+             elapsed, elapsed_update, rows_upserted, work_mb,
+             ", +snapshot" if did_snapshot else "")
 
 
-async def run_periodic(facts_path=None):
+async def run_periodic(facts_path=None, work_path=None):
     """Run export on a periodic loop (async-friendly)."""
     interval = int(os.environ.get("FACTS_EXPORT_INTERVAL", DEFAULT_INTERVAL_SEC))
     if facts_path is None:
         facts_path = _default_facts_path()
+    if work_path is None:
+        work_path = _default_work_path()
 
     LOG.info("facts export periodic started, interval=%ds, path=%s", interval, facts_path)
 
     loop = asyncio.get_event_loop()
+    first_run = True
     while True:
         try:
+            _fp = facts_path
+            _wp = work_path
+            _force = first_run  # always snapshot on first run
             def _run():
                 from .db import get_conn
                 source_conn = get_conn()
                 try:
-                    export_once(source_conn, facts_path)
+                    export_once(source_conn, _fp, _wp, force_snapshot=_force)
                 finally:
                     source_conn.close()
             await loop.run_in_executor(None, _run)
+            first_run = False
         except Exception:
             LOG.exception("facts export failed")
         await asyncio.sleep(interval)
@@ -248,7 +301,8 @@ if __name__ == "__main__":
     # One-shot export for manual/cron runs
     from .db import get_conn
     facts_path = sys.argv[1] if len(sys.argv) > 1 else _default_facts_path()
+    work_path = _default_work_path()
     source_conn = get_conn()
-    export_once(source_conn, facts_path)
+    export_once(source_conn, facts_path, work_path, force_snapshot=True)
     source_conn.close()
     LOG.info("one-shot export done")

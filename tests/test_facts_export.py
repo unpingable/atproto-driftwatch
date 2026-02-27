@@ -55,15 +55,21 @@ def _ts(offset_hours=0):
     return dt.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _export(source, tmp_path):
+    """Helper: run export_once with proper paths and forced snapshot."""
+    facts_path = str(tmp_path / "facts.sqlite")
+    work_path = str(tmp_path / "facts_work.sqlite")
+    export_once(source, facts_path, work_path, force_snapshot=True)
+    return facts_path, work_path
+
+
 # -------------------------------------------------------------------
 # 1. Export from empty claim_history → empty tables, meta populated
 # -------------------------------------------------------------------
 class TestEmptyExport:
     def test_empty_source(self, tmp_path):
         source = _make_source()
-        facts_path = str(tmp_path / "facts.sqlite")
-
-        export_once(source, facts_path)
+        facts_path, _ = _export(source, tmp_path)
 
         assert os.path.exists(facts_path)
         sidecar = sqlite3.connect(facts_path)
@@ -83,8 +89,6 @@ class TestEmptyExport:
 # -------------------------------------------------------------------
 class TestSampleData:
     def test_basic_export(self, tmp_path):
-        # Use timestamps 1h ago so they fall within the 72h overlap window
-        # but aren't at the exact edge of the upper bound
         ts = _ts(-1)
         rows = [
             ("did:alice", "fp_abc", ts, None, "", "", "at://did:alice/post/1", "cid1", "v1"),
@@ -92,31 +96,23 @@ class TestSampleData:
             ("did:carol", "fp_xyz", ts, None, "", "", "at://did:carol/post/3", "cid3", "v1"),
         ]
         source = _make_source(rows)
-        facts_path = str(tmp_path / "facts.sqlite")
-
-        export_once(source, facts_path)
+        facts_path, _ = _export(source, tmp_path)
 
         sidecar = sqlite3.connect(facts_path)
-        # uri_fingerprint: 3 unique posts
         assert sidecar.execute("SELECT COUNT(*) FROM uri_fingerprint").fetchone()[0] == 3
-
-        # fingerprint_bounds: 2 fingerprints
         assert sidecar.execute("SELECT COUNT(*) FROM fingerprint_bounds").fetchone()[0] == 2
         fp_abc = sidecar.execute(
             "SELECT total_claims FROM fingerprint_bounds WHERE fingerprint='fp_abc'"
         ).fetchone()
-        assert fp_abc[0] == 2  # alice + bob
-
-        # fingerprint_hourly: at least 2 rows (one per fingerprint for the hour)
+        assert fp_abc[0] == 2
         hourly_count = sidecar.execute("SELECT COUNT(*) FROM fingerprint_hourly").fetchone()[0]
         assert hourly_count >= 2
-
         sidecar.close()
         source.close()
 
 
 # -------------------------------------------------------------------
-# 3. Copy-forward: second export preserves old data + adds new
+# 3. Second export preserves old data + adds new
 # -------------------------------------------------------------------
 class TestCopyForward:
     def test_second_export_preserves(self, tmp_path):
@@ -126,15 +122,15 @@ class TestCopyForward:
         ]
         source = _make_source(rows1)
         facts_path = str(tmp_path / "facts.sqlite")
+        work_path = str(tmp_path / "facts_work.sqlite")
 
-        export_once(source, facts_path)
+        export_once(source, facts_path, work_path, force_snapshot=True)
 
-        sidecar = sqlite3.connect(facts_path)
-        assert sidecar.execute("SELECT COUNT(*) FROM uri_fingerprint").fetchone()[0] == 1
-        checkpoint_1 = int(sidecar.execute(
-            "SELECT value FROM meta WHERE key='last_checkpoint_rowid'"
-        ).fetchone()[0])
-        sidecar.close()
+        # Check working DB directly (snapshot is compacted copy)
+        work = sqlite3.connect(work_path)
+        assert work.execute("SELECT COUNT(*) FROM uri_fingerprint").fetchone()[0] == 1
+        checkpoint_1 = _get_meta_int(work, "last_checkpoint_rowid")
+        work.close()
 
         # Add more data
         source.execute(
@@ -143,15 +139,18 @@ class TestCopyForward:
         )
         source.commit()
 
-        export_once(source, facts_path)
+        export_once(source, facts_path, work_path, force_snapshot=True)
 
-        sidecar = sqlite3.connect(facts_path)
-        assert sidecar.execute("SELECT COUNT(*) FROM uri_fingerprint").fetchone()[0] == 2
-        checkpoint_2 = int(sidecar.execute(
-            "SELECT value FROM meta WHERE key='last_checkpoint_rowid'"
-        ).fetchone()[0])
+        work = sqlite3.connect(work_path)
+        assert work.execute("SELECT COUNT(*) FROM uri_fingerprint").fetchone()[0] == 2
+        checkpoint_2 = _get_meta_int(work, "last_checkpoint_rowid")
         assert checkpoint_2 > checkpoint_1
-        sidecar.close()
+        work.close()
+
+        # Snapshot should also have 2 rows
+        snap = sqlite3.connect(facts_path)
+        assert snap.execute("SELECT COUNT(*) FROM uri_fingerprint").fetchone()[0] == 2
+        snap.close()
         source.close()
 
 
@@ -169,16 +168,13 @@ class TestBatchLoop:
             for i in range(5)
         ]
         source = _make_source(rows)
-        facts_path = str(tmp_path / "facts.sqlite")
+        facts_path, work_path = _export(source, tmp_path)
 
-        export_once(source, facts_path)
-
-        sidecar = sqlite3.connect(facts_path)
-        assert sidecar.execute("SELECT COUNT(*) FROM uri_fingerprint").fetchone()[0] == 5
-        # checkpoint should be at max rowid (5)
-        cp = _get_meta_int(sidecar, "last_checkpoint_rowid")
+        snap = sqlite3.connect(facts_path)
+        assert snap.execute("SELECT COUNT(*) FROM uri_fingerprint").fetchone()[0] == 5
+        cp = _get_meta_int(snap, "last_checkpoint_rowid")
         assert cp == 5
-        sidecar.close()
+        snap.close()
         source.close()
 
 
@@ -187,29 +183,30 @@ class TestBatchLoop:
 # -------------------------------------------------------------------
 class TestOverlapHourly:
     def test_no_double_counting(self, tmp_path):
-        ts = _ts(-1)  # 1h ago, safely within overlap window
+        ts = _ts(-1)
         rows = [
             ("did:a", "fp1", ts, None, "", "", "at://did:a/post/1", "cid1", "v1"),
         ]
         source = _make_source(rows)
         facts_path = str(tmp_path / "facts.sqlite")
+        work_path = str(tmp_path / "facts_work.sqlite")
 
-        export_once(source, facts_path)
+        export_once(source, facts_path, work_path, force_snapshot=True)
 
-        sidecar = sqlite3.connect(facts_path)
-        hourly_before = sidecar.execute(
+        snap = sqlite3.connect(facts_path)
+        hourly_before = snap.execute(
             "SELECT SUM(event_count) FROM fingerprint_hourly"
         ).fetchone()[0] or 0
-        sidecar.close()
+        snap.close()
 
-        # Re-export without new data — hourly should not double count
-        export_once(source, facts_path)
+        # Re-export without new data
+        export_once(source, facts_path, work_path, force_snapshot=True)
 
-        sidecar = sqlite3.connect(facts_path)
-        hourly_after = sidecar.execute(
+        snap = sqlite3.connect(facts_path)
+        hourly_after = snap.execute(
             "SELECT SUM(event_count) FROM fingerprint_hourly"
         ).fetchone()[0] or 0
-        sidecar.close()
+        snap.close()
 
         assert hourly_after == hourly_before
         source.close()
@@ -231,13 +228,10 @@ class TestPruning:
             ("did:new", "fp2", recent_ts, None, "", "", "at://did:new/post/2", "cid2", "v1"),
         ]
         source = _make_source(rows)
-        facts_path = str(tmp_path / "facts.sqlite")
-
-        export_once(source, facts_path)
+        facts_path, _ = _export(source, tmp_path)
 
         sidecar = sqlite3.connect(facts_path)
         count = sidecar.execute("SELECT COUNT(*) FROM uri_fingerprint").fetchone()[0]
-        # Old row should be pruned (>30d), only recent should remain
         assert count == 1
         uri = sidecar.execute("SELECT post_uri FROM uri_fingerprint").fetchone()[0]
         assert uri == "at://did:new/post/2"
@@ -261,15 +255,12 @@ class TestBoundsAfterPrune:
             ("did:new", "fp_shared", recent_ts, None, "", "", "at://did:new/post/2", "cid2", "v1"),
         ]
         source = _make_source(rows)
-        facts_path = str(tmp_path / "facts.sqlite")
-
-        export_once(source, facts_path)
+        facts_path, _ = _export(source, tmp_path)
 
         sidecar = sqlite3.connect(facts_path)
         bounds = sidecar.execute(
             "SELECT total_claims FROM fingerprint_bounds WHERE fingerprint='fp_shared'"
         ).fetchone()
-        # Only 1 should remain after prune (old one pruned)
         assert bounds[0] == 1
         sidecar.close()
         source.close()
@@ -286,9 +277,7 @@ class TestDedup:
             ("did:a", "fp_new", now_ts, None, "", "", "at://did:a/post/1", "cid1", "v1"),
         ]
         source = _make_source(rows)
-        facts_path = str(tmp_path / "facts.sqlite")
-
-        export_once(source, facts_path)
+        facts_path, _ = _export(source, tmp_path)
 
         sidecar = sqlite3.connect(facts_path)
         count = sidecar.execute("SELECT COUNT(*) FROM uri_fingerprint").fetchone()[0]
@@ -296,23 +285,67 @@ class TestDedup:
         fp = sidecar.execute(
             "SELECT fingerprint FROM uri_fingerprint WHERE post_uri='at://did:a/post/1'"
         ).fetchone()[0]
-        assert fp == "fp_new"  # second insert has higher rowid
+        assert fp == "fp_new"
         sidecar.close()
         source.close()
 
 
 # -------------------------------------------------------------------
-# 9. Journal mode is DELETE
+# 9. Snapshot has DELETE journal mode
 # -------------------------------------------------------------------
 class TestJournalMode:
     def test_delete_journal(self, tmp_path):
         source = _make_source()
-        facts_path = str(tmp_path / "facts.sqlite")
-
-        export_once(source, facts_path)
+        facts_path, _ = _export(source, tmp_path)
 
         sidecar = sqlite3.connect(facts_path)
         mode = sidecar.execute("PRAGMA journal_mode").fetchone()[0]
         assert mode == "delete"
         sidecar.close()
+        source.close()
+
+
+# -------------------------------------------------------------------
+# 10. Working DB uses WAL, snapshot uses DELETE
+# -------------------------------------------------------------------
+class TestWorkingDbWal:
+    def test_work_wal_snap_delete(self, tmp_path):
+        source = _make_source()
+        facts_path = str(tmp_path / "facts.sqlite")
+        work_path = str(tmp_path / "facts_work.sqlite")
+        export_once(source, facts_path, work_path, force_snapshot=True)
+
+        work = sqlite3.connect(work_path)
+        work_mode = work.execute("PRAGMA journal_mode").fetchone()[0]
+        assert work_mode == "wal"
+        work.close()
+
+        snap = sqlite3.connect(facts_path)
+        snap_mode = snap.execute("PRAGMA journal_mode").fetchone()[0]
+        assert snap_mode == "delete"
+        snap.close()
+        source.close()
+
+
+# -------------------------------------------------------------------
+# 11. No snapshot when interval not elapsed
+# -------------------------------------------------------------------
+class TestSnapshotInterval:
+    def test_no_snapshot_when_recent(self, tmp_path):
+        source = _make_source()
+        facts_path = str(tmp_path / "facts.sqlite")
+        work_path = str(tmp_path / "facts_work.sqlite")
+
+        # First export: force snapshot
+        export_once(source, facts_path, work_path, force_snapshot=True)
+        mtime_1 = os.path.getmtime(facts_path)
+
+        # Second export: no force, interval not elapsed
+        import time as _time
+        _time.sleep(0.1)
+        export_once(source, facts_path, work_path, force_snapshot=False)
+
+        # Snapshot file should not have been updated
+        mtime_2 = os.path.getmtime(facts_path)
+        assert mtime_2 == mtime_1
         source.close()
