@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-SSH_KEY="/home/jbeck/git/claude/ssh/linode"
-HOST="root@192.46.223.21"
-DEST="/opt/driftwatch/"
+SSH_KEY="${DEPLOY_SSH_KEY:?Set DEPLOY_SSH_KEY to your SSH private key path}"
+HOST="${DEPLOY_HOST:?Set DEPLOY_HOST (e.g. user@host)}"
+DEST="${DEPLOY_DEST:-/opt/driftwatch/}"
 GIT_SHA=$(git rev-parse --short HEAD)
 
 echo "==> Syncing code to ${HOST}:${DEST} (${GIT_SHA})"

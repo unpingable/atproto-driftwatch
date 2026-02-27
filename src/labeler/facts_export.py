@@ -1,6 +1,6 @@
 """Export driftwatch facts to a SQLite sidecar for labelwatch consumption.
 
-Output: /app/data/facts.sqlite (container) = /opt/driftwatch/deploy/data/facts.sqlite (host)
+Output: /app/data/facts.sqlite (container path, host path depends on deploy config)
 
 Strategy: update working DB in place, periodically snapshot via VACUUM INTO for
 atomic reads by labelwatch.
@@ -20,7 +20,8 @@ import time
 LOG = logging.getLogger("labeler.facts_export")
 
 RETENTION_DAYS = 30
-OVERLAP_HOURS = 72
+OVERLAP_HOURS = 72      # full overlap for first run / restart
+HOURLY_OVERLAP_HOURS = 6  # steady-state hourly recompute window
 BATCH_LIMIT = 500_000
 DEFAULT_INTERVAL_SEC = 30 * 60  # 30 minutes
 DEFAULT_SNAPSHOT_INTERVAL_SEC = 60 * 60  # 1 hour
@@ -229,11 +230,14 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
             break
     elapsed_batch = time.monotonic() - t_batch
 
-    # Narrow hourly recompute window on subsequent runs:
-    # First run (or after long gap): full OVERLAP_HOURS window
-    # Subsequent runs: since last export - 1h buffer (typically ~1.5h vs 72h)
+    # Hourly recompute window:
+    # First run (or after long gap): full OVERLAP_HOURS (72h)
+    # Subsequent runs: HOURLY_OVERLAP_HOURS (6h) — covers normal clock skew
+    # and late ingestion while keeping the query fast. Outliers with very old
+    # createdAt still get correct uri_fingerprint mappings (checkpoint-based);
+    # only their hourly bin counts may be stale until the next snapshot.
     if last_export > 0 and (now - last_export) < OVERLAP_HOURS * 3600:
-        hourly_start = last_export - 3600
+        hourly_start = now - (HOURLY_OVERLAP_HOURS * 3600)
     else:
         hourly_start = overlap_start
 

@@ -328,7 +328,49 @@ class TestWorkingDbWal:
 
 
 # -------------------------------------------------------------------
-# 11. No snapshot when interval not elapsed
+# 11. Hourly overlap covers recent late arrivals
+# -------------------------------------------------------------------
+class TestHourlyOverlap:
+    def test_late_arrival_within_window(self, tmp_path):
+        """A late arrival within HOURLY_OVERLAP_HOURS is counted in hourly bins."""
+        recent_ts = _ts(0)
+        rows = [
+            ("did:a", "fp1", recent_ts, None, "", "", "at://did:a/post/1", "cid1", "v1"),
+        ]
+        source = _make_source(rows)
+        facts_path = str(tmp_path / "facts.sqlite")
+        work_path = str(tmp_path / "facts_work.sqlite")
+
+        # First export establishes last_export_epoch
+        export_once(source, facts_path, work_path, force_snapshot=True)
+
+        # Insert a late arrival within the 6h hourly overlap window
+        late_ts = _ts(-3)
+        source.execute(
+            "INSERT INTO claim_history VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("did:b", "fp_late", late_ts, None, "", "", "at://did:b/post/2", "cid2", "v1"),
+        )
+        source.commit()
+
+        export_once(source, facts_path, work_path, force_snapshot=True)
+
+        snap = sqlite3.connect(facts_path)
+        # Late arrival within window should appear in hourly bins
+        late_hourly = snap.execute(
+            "SELECT SUM(event_count) FROM fingerprint_hourly WHERE fingerprint='fp_late'"
+        ).fetchone()[0]
+        assert late_hourly is not None and late_hourly >= 1
+        # Its uri_fingerprint mapping should also be correct
+        uri_count = snap.execute(
+            "SELECT COUNT(*) FROM uri_fingerprint WHERE post_uri='at://did:b/post/2'"
+        ).fetchone()[0]
+        assert uri_count == 1
+        snap.close()
+        source.close()
+
+
+# -------------------------------------------------------------------
+# 12. No snapshot when interval not elapsed
 # -------------------------------------------------------------------
 class TestSnapshotInterval:
     def test_no_snapshot_when_recent(self, tmp_path):
