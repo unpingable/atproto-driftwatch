@@ -198,11 +198,13 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
     sidecar.execute("PRAGMA busy_timeout=30000")
     _ensure_tables(sidecar)
 
-    # Read checkpoint rowid
+    # Read checkpoint rowid and last export time
     last_rowid = _get_meta_int(sidecar, "last_checkpoint_rowid", 0)
+    last_export = _get_meta_int(sidecar, "last_export_epoch", 0)
     rows_upserted = 0
 
     # Loop batches until drained
+    t_batch = time.monotonic()
     while True:
         rows = source_conn.execute("""
             SELECT rowid, post_uri, claim_fingerprint, createdAt, authorDid
@@ -225,15 +227,24 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
 
         if len(rows) < BATCH_LIMIT:
             break
+    elapsed_batch = time.monotonic() - t_batch
 
-    # Recompute fingerprint_hourly for 72h overlap
-    _recompute_hourly(source_conn, sidecar, overlap_start, now)
+    # Narrow hourly recompute window on subsequent runs:
+    # First run (or after long gap): full OVERLAP_HOURS window
+    # Subsequent runs: since last export - 1h buffer (typically ~1.5h vs 72h)
+    if last_export > 0 and (now - last_export) < OVERLAP_HOURS * 3600:
+        hourly_start = last_export - 3600
+    else:
+        hourly_start = overlap_start
+
+    t_hourly = time.monotonic()
+    _recompute_hourly(source_conn, sidecar, hourly_start, now)
+    elapsed_hourly = time.monotonic() - t_hourly
 
     # Prune all tables to retention
+    t_prune = time.monotonic()
     _prune(sidecar, retention_start)
-
-    # Recompute fingerprint_bounds (AFTER prune)
-    _recompute_bounds(sidecar)
+    elapsed_prune = time.monotonic() - t_prune
 
     # Update meta
     _set_meta(sidecar, "last_export_epoch", now)
@@ -242,9 +253,16 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
     elapsed_update = time.monotonic() - t0
 
     # Snapshot if interval elapsed or forced
+    # Recompute bounds only before snapshot (expensive, only needed for reads)
     last_snap = _get_meta_int(sidecar, "last_snapshot_epoch", 0)
     did_snapshot = False
+    elapsed_bounds = 0.0
     if force_snapshot or (now - last_snap >= snap_interval):
+        t_bounds = time.monotonic()
+        _recompute_bounds(sidecar)
+        sidecar.commit()
+        elapsed_bounds = time.monotonic() - t_bounds
+
         t_snap = time.monotonic()
         _snapshot(sidecar, facts_path)
         _set_meta(sidecar, "last_snapshot_epoch", now)
@@ -252,14 +270,16 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
         snap_elapsed = time.monotonic() - t_snap
         did_snapshot = True
         snap_mb = os.path.getsize(facts_path) / (1024 * 1024)
-        LOG.info("snapshot created: %.0fMB in %.1fs", snap_mb, snap_elapsed)
+        LOG.info("snapshot created: %.0fMB in %.1fs (bounds=%.1fs)", snap_mb, snap_elapsed, elapsed_bounds)
 
     sidecar.close()
 
     elapsed = time.monotonic() - t0
     work_mb = os.path.getsize(work_path) / (1024 * 1024)
-    LOG.info("facts export complete: %.1fs (update=%.1fs, %d new rows, work=%.0fMB%s)",
-             elapsed, elapsed_update, rows_upserted, work_mb,
+    hourly_window_h = (now - hourly_start) / 3600
+    LOG.info("facts export complete: %.1fs (batch=%.1fs, hourly=%.1fs/%.0fh, prune=%.1fs, bounds=%.1fs, %d new rows, work=%.0fMB%s)",
+             elapsed, elapsed_batch, elapsed_hourly, hourly_window_h,
+             elapsed_prune, elapsed_bounds, rows_upserted, work_mb,
              ", +snapshot" if did_snapshot else "")
 
 
