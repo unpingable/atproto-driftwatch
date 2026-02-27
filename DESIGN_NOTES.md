@@ -1,6 +1,6 @@
-# Design Notes (Governance Extensions, Non-Operational)
+# Driftwatch Design Notes (Governance Extensions, Non-Operational)
 
-This document captures optional extensions that are **explicitly out of the MVP runtime path**.
+This document captures optional extensions that are **explicitly out of the current runtime path**.
 They are recorded here to keep future changes coherent and reversible.
 
 ## 1. Authority Delegation (Multi-Operator Ledger)

@@ -3,6 +3,28 @@
 Mapping from governance concepts to source locations. Not exhaustive — just
 enough to navigate.
 
+## Core pipeline (Driftwatch-specific)
+
+- **Jetstream ingestion**
+  → `src/labeler/consumer.py` (WebSocket consumer, event parsing, cursor persistence)
+  → `src/labeler/db.py::insert_event()` (claim_history insert with fp_kind)
+
+- **Claim fingerprinting**
+  → `src/labeler/claims.py::fingerprint_text_with_kind()` (hash + kind)
+  → `src/labeler/drift/extract.py` (entity, quantity, span extraction)
+  → Precedence: multi-word entity > quantity+context > URL domain > single-word entity > spans > normalized text
+
+- **Cluster analysis**
+  → `src/labeler/driftmetrics.py::cluster_report()` (burst score, half-life, regime shifts)
+  → fp_kind distribution, single-author detection, evidence class tracking
+
+- **Platform health watermark**
+  → `src/labeler/platform_health.py` (EWMA baseline, degradation triggers, recovery hysteresis)
+  → Gates rechecks during incomplete data periods
+
+- **Facts export (Driftwatch → Labelwatch bridge)**
+  → `src/labeler/facts_export.py` (SQLite sidecar, atomic snapshot, incremental update)
+
 ## Invariants
 
 - **Language may propose; only evidence commits state**
@@ -27,14 +49,16 @@ enough to navigate.
 - Receipt fields: `rule_id`, `fingerprint_version`, `inputs_json`, `evidence_hashes_json`, `config_hash`, `decision_trace`
 - Receipts on commit → `src/labeler/db.py::insert_label_decision()`
 - Receipts on expiry → `src/labeler/db.py::expire_label_decisions()`
+- Platform context stamped in decision traces → `src/labeler/longitudinal.py`
 
 ## Drift detection (longitudinal)
 
 - Claim fingerprinting → `src/labeler/claims.py::fingerprint_text()`
-- Claim history tracking → `src/labeler/db.py` (`claim_history` table)
+- Claim history tracking → `src/labeler/db.py` (`claim_history` table, `fp_kind` column)
 - Delta computation → `src/labeler/drift/diff.py`
 - Drift rules (assertiveness increase, provenance laundering) → `src/labeler/drift/rules.py`
 - Recheck scheduling → `src/labeler/longitudinal.py`, `src/labeler/recheck_queue.py`
+- Enqueue gate (platform health + singleton) → `src/labeler/db.py::_fp_passes_enqueue_gate()`
 
 ## Budget enforcement
 
@@ -58,15 +82,10 @@ enough to navigate.
 - Known separation pairs → `fixtures/fingerprint_known_pairs.jsonl`
 - Stability transforms → `fixtures/fp_stability_transforms.jsonl`
 
-## Replay
-
-- Demo replay (seeds events from fixture) → `src/labeler/demo_replay.py`
-- Golden test regeneration → `scripts/regenerate_golden.py`
-- All golden/regression tests are deterministic, no network dependencies
-
 ## Known gaps
 
-- No `THEORY_TO_CODE` crosswalk for the Δt framework papers specifically (this repo predates the complete series)
-- Strain detection is design-only (`DESIGN_NOTES.md`), not implemented
-- Authority delegation / multi-operator quorum is design-only
+- Regime shift detection is computed but not yet validated against known campaigns
+- Half-life estimation needs 8+ hourly bins to be meaningful
+- Per-kind EPS baseline (cheap to add — kind counters exist in STATS)
+- AppView/HTTP read health tracking (platform health covers stream only)
 - No failure gallery (adversarial fixtures exist but aren't framed as "how it fails")

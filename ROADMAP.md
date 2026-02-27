@@ -1,80 +1,59 @@
-# Labeler ROADMAP (Conservative, Operator-First)
+# Driftwatch Roadmap (Conservative, Operator-First)
 
 This roadmap is intentionally narrow. It favors reversible steps, observable outcomes,
 and explicit stop conditions to prevent scope creep.
 
-## Phase 0 — Freeze the Contract (now / pre-release)
+## Phase 0 — Sealed Lab (current)
 
-Goal: Make it boring and legible.
+Goal: Ingest, fingerprint, and compute. No emits, no labeler registration.
 
-- Fingerprint format, `FP_VERSION`, and decision ledger are schemas, not features.
-- No semantic changes without fixtures + budget tests.
-- Emit stays detect-only by default.
-
-Exit condition:
-You can diff two runs and explain every difference.
-
-## Phase 1 — Operate Without Lying (first live runs)
-
-Goal: If something goes wrong, it fails quietly and explainably.
-
-- Document inspection surfaces:
-  - `/health`
-  - `/health/extended`
-  - decision ledger anatomy
-- Single, explicit fail-closed path:
-  - reason → quarantine → suppress emit
-- Ops checklist:
-  - env flags
-  - budget defaults
-  - recheck cadence
-  - how to shut it off in 30 seconds
+- Jetstream consumer running, ~500 eps steady state
+- Fingerprint pipeline with kind tracking (entity/quantity/domain/span/text)
+- Cluster reports with burst scoring, half-life estimation, single-author detection
+- Longitudinal rechecks with drift rules (assertiveness, provenance laundering)
+- Platform health watermark gating rechecks during incomplete data
+- Facts export sidecar for labelwatch consumption
+- Decision ledger receipting every label decision with full provenance
 
 Exit condition:
-A non-author can tell whether the system is healthy without reading the code.
+Cluster reports show real signal — half-life estimates stabilize, burst detection
+catches actual coordinated posts, fp_kind distribution is healthy.
 
-## Phase 2 — Evidence Tightening (Reactive Only)
+## Phase 1 — Data Validation (next)
 
-Goal: Improve precision only when disputes appear.
+Goal: Confirm the fingerprint pipeline and cluster analysis produce trustworthy output.
 
-- Tighten evidence hashes (quote spans + prior claim IDs).
-- Add small, targeted near-miss fixtures (10–20 cases).
-- No broad corpus expansion.
-
-Explicit rule:
-If no one is arguing with the labels, do nothing.
-
-Exit condition:
-Disputes are resolved by pointing at receipts, not intuition.
-
-## Phase 3 — Semantic Scheduling (Opt-In, Constrained)
-
-Goal: Allow deeper longitudinal reasoning without global blast radius.
-
-- Claim-group rechecks:
-  - enabled per-rule
-  - hard caps
-  - quarantine on spillover
-- Root-based scheduling remains the default.
-
-Important framing:
-This is a performance optimization, not a correctness upgrade.
+- Validate fp_kind distribution (entity/quantity should dominate, text < 20%)
+- Confirm half-life estimates require 8+ hourly bins before reporting
+- Verify burst detection against known coordinated campaigns (retrospective)
+- Tune complexity gate if low-signal posts are leaking through
+- Evidence tightening: quote spans + prior claim IDs in evidence hashes
 
 Exit condition:
-You can turn it off instantly and the system still behaves sanely.
+You can point at a cluster report and explain every entry to a non-author.
 
-## Phase 4 — Minimal Operator UX (Only If Watched)
+## Phase 2 — Regime Detection (patience required)
+
+Goal: Detect shifts in claim distribution over time.
+
+- Baseline accumulation (needs days/weeks of data)
+- Rolling window divergence detection (label distribution vs baseline)
+- Regime taxonomy formalization (QUIET / ACTIVE / SURGE / ALARM) with hysteresis
+- Cluster-aware recheck promotion (burst score drives recheck priority)
+
+Exit condition:
+Regime shifts are detected and explicable, not just statistical noise.
+
+## Phase 3 — Observatory UX (only if watched)
 
 Goal: Visibility, not control.
 
-- Inspection UI, not a dashboard:
-  - recent decisions
-  - recent quarantines
-  - rule activity
-- No charts unless someone checks them daily.
+- Inspection UI for cluster reports and decision ledger
+- Recent decisions, quarantines, regime state
+- No charts unless someone checks them daily
 
 Exit condition:
-The UI answers “what just happened?” in under 10 seconds.
+The UI answers "what just happened?" in under 10 seconds.
 
 ## Seams / Spec Work
 
@@ -88,7 +67,6 @@ Full analysis: [docs/ATPROTO_SEAMS.md](docs/ATPROTO_SEAMS.md)
 
 **Later:**
 - Receipt chain (`prev_receipt_hash`) for tamper-evident audit trail
-- Formalize regime taxonomy (QUIET / ACTIVE / SURGE / ALARM) with hysteresis
 - Typed claim envelopes in decision ledger (explicit claim_type)
 - Cross-project receipt verification / replay tool
 - Casefile / annotation ledger for human review notes
@@ -100,7 +78,8 @@ Full analysis: [docs/ATPROTO_SEAMS.md](docs/ATPROTO_SEAMS.md)
 - No policy enforcement or moderation
 - No ML classifiers
 - No LLM-in-the-loop decisions
-- No “intelligence” claims
+- No "intelligence" claims
+- No per-account profiling
 
 This is a forensic instrument, not a referee.
 

@@ -1,4 +1,4 @@
-# Contributing (Normative)
+# Contributing to Driftwatch (Normative)
 
 ## 0. Conformance Language
 This document uses **MUST**, **SHOULD**, and **MAY** as defined in RFC 2119.
@@ -25,7 +25,14 @@ If you need to regenerate the golden file as part of a PR, add a short section i
 ## 2. Fingerprint Contract
 - `FP_VERSION` MUST only change for intentional semantic changes.
 - Any change to fingerprint behavior SHOULD include a migration note.
+- fp_kind tracking MUST remain consistent with the precedence order documented in `claims.py`.
 
 ## 3. Ledger Receipts
 - Any committed label MUST have a decision record in `label_decisions`.
 - Decision traces SHOULD remain short and stable.
+- Platform health context SHOULD be stamped in decision traces when available.
+
+## 4. Data Posture
+- Aggregate-first: cluster-level analysis, not per-account profiling.
+- Hashes over text: `claim_history` stores fingerprints, not raw content.
+- New features MUST NOT introduce per-account scoring or "top offenders" views.
