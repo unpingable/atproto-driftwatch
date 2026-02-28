@@ -20,8 +20,7 @@ import time
 LOG = logging.getLogger("labeler.facts_export")
 
 RETENTION_DAYS = 30
-OVERLAP_HOURS = 72      # full overlap for first run / restart
-HOURLY_OVERLAP_HOURS = 6  # steady-state hourly recompute window
+OVERLAP_HOURS = 72  # hourly rollup window (recomputed each snapshot)
 BATCH_LIMIT = 500_000
 DEFAULT_INTERVAL_SEC = 30 * 60  # 30 minutes
 DEFAULT_SNAPSHOT_INTERVAL_SEC = 60 * 60  # 1 hour
@@ -230,21 +229,6 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
             break
     elapsed_batch = time.monotonic() - t_batch
 
-    # Hourly recompute window:
-    # First run (or after long gap): full OVERLAP_HOURS (72h)
-    # Subsequent runs: HOURLY_OVERLAP_HOURS (6h) — covers normal clock skew
-    # and late ingestion while keeping the query fast. Outliers with very old
-    # createdAt still get correct uri_fingerprint mappings (checkpoint-based);
-    # only their hourly bin counts may be stale until the next snapshot.
-    if last_export > 0 and (now - last_export) < OVERLAP_HOURS * 3600:
-        hourly_start = now - (HOURLY_OVERLAP_HOURS * 3600)
-    else:
-        hourly_start = overlap_start
-
-    t_hourly = time.monotonic()
-    _recompute_hourly(source_conn, sidecar, hourly_start, now)
-    elapsed_hourly = time.monotonic() - t_hourly
-
     # Prune all tables to retention
     t_prune = time.monotonic()
     _prune(sidecar, retention_start)
@@ -256,12 +240,20 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
 
     elapsed_update = time.monotonic() - t0
 
-    # Snapshot if interval elapsed or forced
-    # Recompute bounds only before snapshot (expensive, only needed for reads)
+    # Snapshot: recompute expensive aggregates (hourly + bounds) then VACUUM INTO
+    # These are only needed for reads (labelwatch ATTACHes the snapshot, not working DB)
     last_snap = _get_meta_int(sidecar, "last_snapshot_epoch", 0)
     did_snapshot = False
+    elapsed_hourly = 0.0
     elapsed_bounds = 0.0
+    hourly_start = overlap_start  # default for logging
     if force_snapshot or (now - last_snap >= snap_interval):
+        # Hourly rollup: OVERLAP_HOURS window from source (expensive GROUP BY)
+        hourly_start = overlap_start
+        t_hourly = time.monotonic()
+        _recompute_hourly(source_conn, sidecar, hourly_start, now)
+        elapsed_hourly = time.monotonic() - t_hourly
+
         t_bounds = time.monotonic()
         _recompute_bounds(sidecar)
         sidecar.commit()
@@ -274,17 +266,17 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
         snap_elapsed = time.monotonic() - t_snap
         did_snapshot = True
         snap_mb = os.path.getsize(facts_path) / (1024 * 1024)
-        LOG.info("snapshot created: %.0fMB in %.1fs (bounds=%.1fs)", snap_mb, snap_elapsed, elapsed_bounds)
+        LOG.info("snapshot created: %.0fMB in %.1fs (hourly=%.1fs, bounds=%.1fs)",
+                 snap_mb, snap_elapsed, elapsed_hourly, elapsed_bounds)
 
     sidecar.close()
 
     elapsed = time.monotonic() - t0
     work_mb = os.path.getsize(work_path) / (1024 * 1024)
-    hourly_window_h = (now - hourly_start) / 3600
-    LOG.info("facts export complete: %.1fs (batch=%.1fs, hourly=%.1fs/%.0fh, prune=%.1fs, bounds=%.1fs, %d new rows, work=%.0fMB%s)",
-             elapsed, elapsed_batch, elapsed_hourly, hourly_window_h,
-             elapsed_prune, elapsed_bounds, rows_upserted, work_mb,
-             ", +snapshot" if did_snapshot else "")
+    LOG.info("facts export complete: %.1fs (batch=%.1fs, prune=%.1fs, %d new rows, work=%.0fMB%s)",
+             elapsed, elapsed_batch, elapsed_prune, rows_upserted, work_mb,
+             ", +snapshot[hourly=%.1fs bounds=%.1fs]" % (elapsed_hourly, elapsed_bounds)
+             if did_snapshot else "")
 
 
 async def run_periodic(facts_path=None, work_path=None):
