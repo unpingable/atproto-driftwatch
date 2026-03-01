@@ -27,6 +27,7 @@ from .detection import (
     make_hashset_root,
     make_note,
     receipt_hash,
+    get_cooldown_filter,
     ENVELOPE_SCHEMA_VERSION,
 )
 
@@ -601,6 +602,13 @@ def cluster_report(
     if len(detections) > MAX_TOTAL_DETECTIONS:
         detections = detections[:MAX_TOTAL_DETECTIONS]
 
+    # Cooldown/dedupe: suppress repeated det_ids across windows
+    cooldown = get_cooldown_filter()
+    cooldown.tick_window()
+    pre_cooldown_count = len(detections)
+    detections = cooldown.filter_detections(detections)
+    detections_suppressed = pre_cooldown_count - len(detections)
+
     return {
         "generated_at": now_iso,
         "window_hours": hours,
@@ -616,4 +624,5 @@ def cluster_report(
         "likely_automation": automation,
         "regime_shifts": recent_shifts,
         "detections": [envelope_to_dict(d) for d in detections],
+        "detections_suppressed": detections_suppressed,
     }

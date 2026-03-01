@@ -416,3 +416,76 @@ def sort_detections(detections: list) -> list:
             e.subject.value,
         ),
     )
+
+
+# --- Cooldown / dedupe filter ---
+
+import os
+
+COOLDOWN_WINDOWS = int(os.getenv("COOLDOWN_WINDOWS", "5"))
+COOLDOWN_SCORE_DELTA = float(os.getenv("COOLDOWN_SCORE_DELTA", "0.5"))
+
+
+class CooldownFilter:
+    """Suppress repeated det_ids unless severity or score escalates.
+
+    In-memory state: det_id → (last_emitted_window_num, last_score, last_severity).
+    State resets on restart — correct behavior: re-emit everything once, then cooldown.
+    """
+
+    def __init__(self):
+        self._state: dict = {}   # det_id → (window_num, score, severity)
+        self._window_counter = 0
+
+    def tick_window(self):
+        """Advance the window counter. Call once per report cycle."""
+        self._window_counter += 1
+
+    def filter_detections(self, detections: list) -> list:
+        """Return only non-suppressed envelopes."""
+        passed = []
+        for det in detections:
+            if self._should_emit(det):
+                passed.append(det)
+        return passed
+
+    def _should_emit(self, det: DetectionEnvelope) -> bool:
+        """True if this detection should be emitted (not in cooldown or escalated)."""
+        did = det.det_id
+        prev = self._state.get(did)
+
+        if prev is None:
+            self._state[did] = (self._window_counter, det.score, det.severity)
+            return True
+
+        prev_window, prev_score, prev_severity = prev
+
+        # Cooldown expired — re-emit
+        if self._window_counter - prev_window >= COOLDOWN_WINDOWS:
+            self._state[did] = (self._window_counter, det.score, det.severity)
+            return True
+
+        # Severity escalated
+        if severity_rank(det.severity) > severity_rank(prev_severity):
+            self._state[did] = (self._window_counter, det.score, det.severity)
+            return True
+
+        # Score increased by delta
+        if det.score - prev_score >= COOLDOWN_SCORE_DELTA:
+            self._state[did] = (self._window_counter, det.score, det.severity)
+            return True
+
+        return False
+
+    def reset(self):
+        """Reset state (for testing)."""
+        self._state.clear()
+        self._window_counter = 0
+
+
+# Module-level singleton (same pattern as platform_health)
+_cooldown_filter = CooldownFilter()
+
+
+def get_cooldown_filter() -> CooldownFilter:
+    return _cooldown_filter

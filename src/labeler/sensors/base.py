@@ -12,6 +12,7 @@ Invariants:
 """
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import List, Optional, Protocol, runtime_checkable
@@ -89,6 +90,14 @@ def _make_skip_envelope(
 _warmup_counters: dict = {}
 
 
+def _get_disabled_sensor_ids() -> set:
+    """Parse SENSOR_DISABLED_IDS env var (comma-separated)."""
+    raw = os.getenv("SENSOR_DISABLED_IDS", "")
+    if not raw.strip():
+        return set()
+    return {s.strip() for s in raw.split(",") if s.strip()}
+
+
 def run_sensor_with_budget(
     sensor: Sensor,
     ctx: SensorContext,
@@ -98,6 +107,10 @@ def run_sensor_with_budget(
     Returns list of DetectionEnvelope (may include skip envelopes).
     """
     sid = sensor.sensor_id
+
+    # Per-sensor kill switch
+    if sid in _get_disabled_sensor_ids():
+        return []
 
     # Volume gate: skip silently (normal for low-traffic)
     if ctx.total_claims < sensor.min_volume:

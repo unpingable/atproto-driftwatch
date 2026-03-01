@@ -99,10 +99,20 @@ async def health_extended():
     except Exception:
         pass
 
+    # Sensor array status + capabilities
+    try:
+        from .sensors import _sensor_array_enabled, get_capabilities
+        sensor_enabled = _sensor_array_enabled()
+        capabilities = get_capabilities()
+    except Exception:
+        sensor_enabled = True
+        capabilities = None
+
     result = {
         "status": "ok",
         "build_sha": BUILD_SHA,
         "emit_mode": get_emit_mode(),
+        "sensor_array_enabled": sensor_enabled,
         "queue_depth": queue_depth,
         "last_cursor": cursor_info,
         "quarantine_trips": quarantine_trips,
@@ -116,6 +126,17 @@ async def health_extended():
     }
     if platform_detection is not None:
         result["platform_detection"] = platform_detection
+    if capabilities is not None:
+        result["capabilities"] = capabilities
+    return result
+
+
+@app.get("/health/preflight")
+async def health_preflight():
+    from .preflight import preflight
+    conn = get_conn()
+    result = preflight(conn=conn)
+    conn.close()
     return result
 
 

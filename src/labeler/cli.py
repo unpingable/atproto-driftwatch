@@ -67,6 +67,7 @@ def main():
 
     dw = sub.add_parser("driftwatch")
     dwsub = dw.add_subparsers(dest="dwcmd")
+    dwsub.add_parser("preflight", help="run preflight checks")
     dwreport = dwsub.add_parser("report")
     dwreport.add_argument("--top", type=int, default=20, help="top N clusters by burst score")
     dwreport.add_argument("--hours", type=int, default=24, help="lookback window in hours")
@@ -171,6 +172,21 @@ def main():
         with open(args.out, "w") as f:
             json.dump(prod, f, indent=2, sort_keys=True)
         print(json.dumps({"ok": True, "out": args.out}, sort_keys=True))
+    elif args.cmd == "driftwatch" and args.dwcmd == "preflight":
+        from .db import init_db
+        from .preflight import preflight
+        init_db()
+        conn = get_conn()
+        result = preflight(conn=conn)
+        conn.close()
+        # Pretty-print: verdict line + per-check lines
+        verdict = result["verdict"]
+        print(f"Preflight: {verdict}")
+        for check in result["checks"]:
+            status = check["status"]
+            marker = {"PASS": "+", "WARN": "~", "FAIL": "!"}[status]
+            print(f"  [{marker}] {check['name']}: {status} — {check['detail']}")
+        print(json.dumps(result, indent=2, sort_keys=True))
     elif args.cmd == "driftwatch" and args.dwcmd == "report":
         from .db import init_db
         init_db()
