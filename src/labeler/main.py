@@ -53,6 +53,12 @@ async def startup_event():
         loop = asyncio.get_event_loop()
         loop.create_task(_maint())
 
+    # Retention loop (strip raw JSON, prune old rows)
+    if os.environ.get("ENABLE_RETENTION", "").lower() in ("1", "true"):
+        from .retention import run_periodic as _ret
+        loop = asyncio.get_event_loop()
+        loop.create_task(_ret())
+
 
 @app.on_event("shutdown")
 async def shutdown_event():

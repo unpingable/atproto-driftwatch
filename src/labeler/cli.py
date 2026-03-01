@@ -69,6 +69,7 @@ def main():
     dwsub = dw.add_subparsers(dest="dwcmd")
     dwsub.add_parser("preflight", help="run preflight checks")
     dwsub.add_parser("maintenance", help="run maintenance pass (label expiry, disk check, growth stats)")
+    dwsub.add_parser("retention", help="run retention pass (strip raw, archive+prune old data)")
     dwreport = dwsub.add_parser("report")
     dwreport.add_argument("--top", type=int, default=20, help="top N clusters by burst score")
     dwreport.add_argument("--hours", type=int, default=24, help="lookback window in hours")
@@ -194,6 +195,19 @@ def main():
         init_db()
         results = run_maintenance_once()
         print(json.dumps(results, indent=2, sort_keys=True))
+    elif args.cmd == "driftwatch" and args.dwcmd == "retention":
+        import logging as _log
+        _log.basicConfig(level=_log.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+        from .db import init_db
+        from .retention import run_retention_once
+        init_db()
+        results = run_retention_once()
+        print(json.dumps({k: v for k, v in results.items() if k != "archive_files"},
+                         indent=2, sort_keys=True))
+        if results.get("archive_files"):
+            print(f"\nArchive files: {len(results['archive_files'])}")
+            for f in results["archive_files"]:
+                print(f"  {f}")
     elif args.cmd == "driftwatch" and args.dwcmd == "report":
         from .db import init_db
         init_db()

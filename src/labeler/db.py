@@ -143,6 +143,10 @@ def init_db():
         conn.execute("ALTER TABLE claim_history ADD COLUMN fp_kind TEXT DEFAULT 'unknown'")
     except Exception:
         pass
+    try:
+        conn.execute("ALTER TABLE claim_history ADD COLUMN observed_at TIMESTAMP")
+    except Exception:
+        pass
 
     # Legacy recheck_requests table (kept for DB compat; no longer used)
     conn.execute(
@@ -240,6 +244,7 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_claim_history_fp ON claim_history(claim_fingerprint, createdAt)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_claim_history_created ON claim_history(createdAt)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_ctime ON edges(ctime)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ctime ON events(ctime)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_label_decisions_created ON label_decisions(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_recheck_scheduled ON recheck_requests(scheduled_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_recheck_queue_scheduled ON recheck_queue(scheduled_at)")
