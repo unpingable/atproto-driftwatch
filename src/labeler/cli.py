@@ -68,6 +68,7 @@ def main():
     dw = sub.add_parser("driftwatch")
     dwsub = dw.add_subparsers(dest="dwcmd")
     dwsub.add_parser("preflight", help="run preflight checks")
+    dwsub.add_parser("maintenance", help="run maintenance pass (label expiry, disk check, growth stats)")
     dwreport = dwsub.add_parser("report")
     dwreport.add_argument("--top", type=int, default=20, help="top N clusters by burst score")
     dwreport.add_argument("--hours", type=int, default=24, help="lookback window in hours")
@@ -187,6 +188,12 @@ def main():
             marker = {"PASS": "+", "WARN": "~", "FAIL": "!"}[status]
             print(f"  [{marker}] {check['name']}: {status} — {check['detail']}")
         print(json.dumps(result, indent=2, sort_keys=True))
+    elif args.cmd == "driftwatch" and args.dwcmd == "maintenance":
+        from .db import init_db
+        from .maintenance import run_maintenance_once
+        init_db()
+        results = run_maintenance_once()
+        print(json.dumps(results, indent=2, sort_keys=True))
     elif args.cmd == "driftwatch" and args.dwcmd == "report":
         from .db import init_db
         init_db()

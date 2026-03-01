@@ -47,6 +47,12 @@ async def startup_event():
         loop = asyncio.get_event_loop()
         loop.create_task(_fe())
 
+    # Periodic maintenance (label expiry, disk monitoring, growth stats)
+    if os.environ.get("ENABLE_MAINTENANCE", "").lower() in ("1", "true"):
+        from .maintenance import run_periodic as _maint
+        loop = asyncio.get_event_loop()
+        loop.create_task(_maint())
+
 
 @app.on_event("shutdown")
 async def shutdown_event():
@@ -108,6 +114,14 @@ async def health_extended():
         sensor_enabled = True
         capabilities = None
 
+    # Disk pressure
+    try:
+        from .maintenance import check_disk_pressure, is_disk_pressure
+        disk_info = check_disk_pressure()
+        disk_info["emergency_brake"] = is_disk_pressure()
+    except Exception:
+        disk_info = None
+
     result = {
         "status": "ok",
         "build_sha": BUILD_SHA,
@@ -128,6 +142,8 @@ async def health_extended():
         result["platform_detection"] = platform_detection
     if capabilities is not None:
         result["capabilities"] = capabilities
+    if disk_info is not None:
+        result["disk"] = disk_info
     return result
 
 

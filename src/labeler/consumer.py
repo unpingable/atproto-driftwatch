@@ -169,8 +169,24 @@ class ATProtoConsumer:
         from . import platform_health
         loop = asyncio.get_event_loop()
         last_stats_ts = asyncio.get_event_loop().time()
+        _disk_brake_logged = False
 
         while not self._stop:
+            # Emergency brake: pause ingest when disk is critical
+            try:
+                from .maintenance import is_disk_pressure
+                if is_disk_pressure():
+                    if not _disk_brake_logged:
+                        LOG.error("DISK PRESSURE: pausing event processing until brake released")
+                        _disk_brake_logged = True
+                    await asyncio.sleep(10)
+                    continue
+                elif _disk_brake_logged:
+                    LOG.info("DISK PRESSURE: cleared, resuming event processing")
+                    _disk_brake_logged = False
+            except ImportError:
+                pass
+
             try:
                 ev = await self._event_queue.get()
             except asyncio.CancelledError:
@@ -236,11 +252,29 @@ class ATProtoConsumer:
                     health_display = f"degraded({primary})"
                 else:
                     health_display = health_state
+                # Disk pressure (cheap check, once per minute)
+                try:
+                    from .maintenance import check_disk_pressure
+                    dp = check_disk_pressure()
+                    disk_str = f"{dp['used_pct']}%({dp['free_gb']}GB)"
+                except Exception:
+                    disk_str = "n/a"
+
+                # DB file size
+                try:
+                    from .db import DATA_DIR as _dd
+                    _db = _dd / "labeler.sqlite"
+                    db_mb = _db.stat().st_size / (1024 * 1024) if _db.exists() else 0
+                    db_str = f"{db_mb:.0f}MB"
+                except Exception:
+                    db_str = "n/a"
+
                 LOG.info(
                     "STATS window=%.0fs events_in=%d claims=%d "
                     "enq_attempt=%d enq_insert=%d enq_ignore=%d enq_gated=%d "
                     "dequeued=%d queue_depth=%d median_age=%.0fs backlog=%d "
-                    "kinds=%s coverage=%s health=%s baseline_eps=%.1f lag=%.1fs",
+                    "kinds=%s coverage=%s health=%s baseline_eps=%.1f lag=%.1fs "
+                    "disk=%s db=%s",
                     snap["window_secs"],
                     snap["events_in"],
                     snap["claims_written"],
@@ -257,6 +291,8 @@ class ATProtoConsumer:
                     health_display,
                     health_snap["baseline_eps"],
                     health_snap["stream_lag_s"],
+                    disk_str,
+                    db_str,
                 )
 
     async def _handle_message(self, raw: str):
