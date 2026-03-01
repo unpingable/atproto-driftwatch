@@ -1,8 +1,10 @@
 """Tests for the Driftwatch longitudinal metrics layer."""
 
+import datetime
 import json
 import pytest
 from labeler.db import init_db, get_conn
+from labeler.timeutil import now_utc
 from labeler.driftmetrics import (
     _bin_timestamp,
     fingerprint_timeseries,
@@ -289,17 +291,22 @@ class TestClusterReport:
         assert "generated_at" in report
         assert "clusters" in report
         assert "regime_shifts" in report
+        assert "detections" in report
         assert report["clusters"] == []
 
     def test_with_data(self):
         conn = get_conn()
-        # Populate claim_history across several hours
-        for h in range(10, 15):
-            for i in range(h - 9):  # ramp up
-                _insert_claim(conn, f"did:user{i}", "fp_hot", f"2026-02-25T{h:02d}:{i*5:02d}:00+00:00", 0.5, f"ev{i}")
+        # Populate claim_history across recent hours (relative to now)
+        base = now_utc() - datetime.timedelta(hours=5)
+        for h_offset in range(5):
+            ts = (base + datetime.timedelta(hours=h_offset)).isoformat()
+            for i in range(h_offset + 1):  # ramp up
+                minutes = i * 5
+                t = (base + datetime.timedelta(hours=h_offset, minutes=minutes)).isoformat()
+                _insert_claim(conn, f"did:user{i}", "fp_hot", t, 0.5, f"ev{i}")
         # A second quiet fingerprint
-        _insert_claim(conn, "did:alice", "fp_quiet", "2026-02-25T12:00:00+00:00", 0.3, "ev_q")
-        _insert_claim(conn, "did:alice", "fp_quiet", "2026-02-25T13:00:00+00:00", 0.3, "ev_q")
+        _insert_claim(conn, "did:alice", "fp_quiet", (base + datetime.timedelta(hours=2)).isoformat(), 0.3, "ev_q")
+        _insert_claim(conn, "did:alice", "fp_quiet", (base + datetime.timedelta(hours=3)).isoformat(), 0.3, "ev_q")
         conn.commit()
 
         report = cluster_report(conn=conn, hours=48, bin_hours=1)
@@ -309,3 +316,5 @@ class TestClusterReport:
         # fp_hot should rank higher than fp_quiet
         fps = [c["fingerprint"] for c in report["clusters"]]
         assert "fp_hot" in fps
+        # M1: detections key present
+        assert "detections" in report

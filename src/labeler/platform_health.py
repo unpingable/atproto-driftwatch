@@ -323,7 +323,8 @@ class PlatformHealth:
             "baseline_eps": snap["baseline_eps"],
             "stream_lag_s": snap["stream_lag_s"],
             "gate_reasons": snap["gate_reasons"],
-            "windows_seen": snap["windows_seen"],
+            "baseline_kind": "ewma",
+            "baseline_windows_seen": snap["windows_seen"],
         }
 
         return build_envelope(

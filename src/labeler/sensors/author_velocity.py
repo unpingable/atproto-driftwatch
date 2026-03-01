@@ -122,6 +122,7 @@ class AuthorVelocitySensor:
                 "authors": authors,
                 "baseline_kind": "ewma",
                 "baseline_window": "24h",
+                "baseline_windows_seen": _fp_windows_seen.get(fp, 0),
             }
 
             evidence = (

@@ -121,6 +121,7 @@ class ConcentrationSensor:
             "top_fps": top_k_list,
             "baseline_kind": "ewma",
             "baseline_window": "24h",
+            "baseline_windows_seen": _windows_seen,
         }
         if len(sorted_fps) > MAX_EXPLAIN_TOP_K:
             explain["truncated"] = True
