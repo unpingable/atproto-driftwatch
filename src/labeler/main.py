@@ -86,7 +86,18 @@ async def health_extended():
         health_snap = platform_health.get_health_snapshot()
     except Exception:
         health_snap = {}
-    return {
+    # Platform health detection envelope (if state transition pending)
+    platform_detection = None
+    try:
+        from . import platform_health as ph_mod
+        from .detection import envelope_to_dict
+        det = ph_mod.get_detection()
+        if det is not None:
+            platform_detection = envelope_to_dict(det)
+    except Exception:
+        pass
+
+    result = {
         "status": "ok",
         "build_sha": BUILD_SHA,
         "emit_mode": get_emit_mode(),
@@ -101,6 +112,9 @@ async def health_extended():
         "reconnect_count": health_snap.get("reconnect_count"),
         "gate_reasons": health_snap.get("gate_reasons", []),
     }
+    if platform_detection is not None:
+        result["platform_detection"] = platform_detection
+    return result
 
 
 import logging

@@ -17,6 +17,19 @@ from typing import Optional, List, Dict, Any
 
 from .db import get_conn
 from . import timeutil
+from .detection import (
+    SubjectRef,
+    EvidenceStub,
+    DetectionEnvelope,
+    build_envelope,
+    envelope_to_dict,
+    sort_detections,
+    compute_window_fingerprint,
+    make_query_commitment,
+    make_hashset_root,
+    receipt_hash,
+    ENVELOPE_SCHEMA_VERSION,
+)
 
 
 def _bin_timestamp(ts_str: str, bin_hours: int = 1) -> str:
@@ -446,13 +459,151 @@ def cluster_report(
         ph_lag = health_snap.get("stream_lag_s", 0)
         ph_reasons = health_snap.get("gate_reasons", [])
     except Exception:
+        health_snap = {}
         ph_state = "unavailable"
         ph_coverage = 0
         ph_lag = 0
         ph_reasons = []
 
+    # --- Emit detection envelopes (M1+M2) ---
+    now_iso = timeutil.now_utc().isoformat()
+    window_str = f"{hours}h"
+
+    # Config hash for burst detector (thresholds are implicit in code version)
+    from .claims import fingerprint_config_hash
+    cfg_hash = fingerprint_config_hash()
+
+    # Window fingerprint (M2)
+    wfp = compute_window_fingerprint(
+        ts_start=since, ts_end=now_iso, window=window_str,
+        schema_version=ENVELOPE_SCHEMA_VERSION,
+        config_hash=cfg_hash,
+        watermark_snapshot=health_snap if health_snap else {},
+    )
+
+    detections: List[DetectionEnvelope] = []
+
+    # Burst score envelopes
+    for entry in clusters + automation:
+        fp = entry["fingerprint"]
+        bs = entry["burst_score"]
+        if bs < 1.0:
+            continue  # only envelope notable bursts
+
+        severity = "info"
+        if bs >= 5.0:
+            severity = "high"
+        elif bs >= 3.0:
+            severity = "med"
+        elif bs >= 2.0:
+            severity = "low"
+
+        hl = entry.get("half_life")
+        explain = {
+            "burst_score": bs,
+            "synchrony": entry.get("synchrony", 0),
+            "author_growth": entry.get("author_growth", 0),
+            "latest_posts": entry.get("latest_posts", 0),
+            "latest_authors": entry.get("latest_authors", 0),
+            "total_posts": entry.get("total_posts", 0),
+            "fp_kind": entry.get("fp_kind", "unknown"),
+            "baseline_kind": "rolling_zscore",
+            "baseline_window": window_str,
+        }
+        if hl and hl.get("half_life_bins") is not None:
+            explain["half_life_bins"] = hl["half_life_bins"]
+        if entry.get("single_author_heavy"):
+            explain["single_author_heavy"] = True
+
+        # Evidence: hashset_root for the top contributors
+        evidence = (
+            make_hashset_root(
+                subjects=[fp],
+                total_count=entry.get("total_posts", 0),
+            ),
+        )
+
+        detections.append(build_envelope(
+            detector_id="burst_score",
+            detector_version="v1",
+            ts_start=since,
+            ts_end=now_iso,
+            window=window_str,
+            subject=SubjectRef("fingerprint", fp),
+            detection_type="burst",
+            score=bs,
+            severity=severity,
+            explain=explain,
+            evidence=evidence,
+            window_fingerprint=wfp,
+            config_hash=cfg_hash,
+        ))
+
+    # Regime shift envelopes
+    for shift in recent_shifts:
+        if not shift.get("is_shift"):
+            continue
+        div = shift["divergence"]
+        severity = "info"
+        if div >= 0.7:
+            severity = "high"
+        elif div >= 0.5:
+            severity = "med"
+        elif div >= 0.3:
+            severity = "low"
+
+        explain = {
+            "bin": shift["bin"],
+            "divergence": div,
+            "baseline_total": shift.get("baseline_total", 0),
+            "bin_total": shift.get("bin_total", 0),
+            "baseline_kind": "rolling_jsd",
+            "baseline_window": f"{hours * 7}h",
+        }
+
+        detections.append(build_envelope(
+            detector_id="regime_shift",
+            detector_version="v1",
+            ts_start=since,
+            ts_end=now_iso,
+            window=window_str,
+            subject=SubjectRef("global", ""),
+            detection_type="distribution_divergence",
+            score=div,
+            severity=severity,
+            explain=explain,
+            evidence=(),
+            window_fingerprint=wfp,
+            config_hash=cfg_hash,
+        ))
+
+    # Run M3 sensors if available
+    try:
+        from .sensors import run_sensors, SensorContext
+        sensor_ctx = SensorContext(
+            conn=conn if not own_conn else None,
+            ts_start=since,
+            ts_end=now_iso,
+            window=window_str,
+            watermark=health_snap if health_snap else {},
+            window_fingerprint=wfp,
+            config_hash=cfg_hash,
+            timeseries=ts,
+            total_claims=total_claims,
+        )
+        sensor_detections = run_sensors(sensor_ctx)
+        detections.extend(sensor_detections)
+    except ImportError:
+        pass  # sensors package not yet available
+
+    # Sort and cap detections
+    detections = sort_detections(detections)
+    MAX_TOTAL_DETECTIONS = 100
+    if len(detections) > MAX_TOTAL_DETECTIONS:
+        detections = detections[:MAX_TOTAL_DETECTIONS]
+
     return {
-        "generated_at": timeutil.now_utc().isoformat(),
+        "generated_at": now_iso,
         "window_hours": hours,
         "bin_hours": bin_hours,
         "total_claims_in_window": total_claims,
@@ -465,4 +616,5 @@ def cluster_report(
         "clusters": clusters[:top_n],
         "likely_automation": automation,
         "regime_shifts": recent_shifts,
+        "detections": [envelope_to_dict(d) for d in detections],
     }

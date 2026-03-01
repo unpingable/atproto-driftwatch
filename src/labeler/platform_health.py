@@ -94,6 +94,10 @@ class PlatformHealth:
         # Active gate reasons
         self._gate_reasons: list = []
 
+        # Detection emission tracking
+        self._pending_detection: str = ""  # "" | "platform_degraded" | "platform_recovered"
+        self._degraded_heartbeat_counter = 0
+
     def record_event_time(self, time_us: int):
         """Record a Jetstream event's time_us for lag tracking.
 
@@ -198,6 +202,8 @@ class PlatformHealth:
             if self._windows_seen >= WARMUP_WINDOWS:
                 if new_reasons:
                     self._state = DEGRADED
+                    self._pending_detection = "platform_degraded"
+                    self._degraded_heartbeat_counter = 0
                     LOG.warning(
                         "platform health: WARMING_UP -> DEGRADED reasons=%s",
                         new_reasons,
@@ -209,6 +215,8 @@ class PlatformHealth:
         elif self._state == OK:
             if new_reasons:
                 self._state = DEGRADED
+                self._pending_detection = "platform_degraded"
+                self._degraded_heartbeat_counter = 0
                 LOG.warning(
                     "platform health: OK -> DEGRADED reasons=%s coverage=%.1f%% lag=%.1fs",
                     new_reasons,
@@ -219,6 +227,12 @@ class PlatformHealth:
                 self._recalibration_remaining = 0
 
         elif self._state == DEGRADED:
+            # Periodic heartbeat every 10 windows while degraded
+            self._degraded_heartbeat_counter += 1
+            if self._degraded_heartbeat_counter >= 10:
+                self._pending_detection = "platform_degraded"
+                self._degraded_heartbeat_counter = 0
+
             # Recovery check: all triggers must be clear
             recovery_ok = (
                 coverage > COVERAGE_RECOVER_THRESHOLD
@@ -234,6 +248,7 @@ class PlatformHealth:
                 self._state = OK
                 self._recalibration_remaining = RECALIBRATION_WINDOWS
                 self._gate_reasons = []
+                self._pending_detection = "platform_recovered"
                 LOG.info(
                     "platform health: DEGRADED -> OK (recalibration=%d windows)",
                     RECALIBRATION_WINDOWS,
@@ -273,6 +288,59 @@ class PlatformHealth:
         """All active gate reasons."""
         with self._lock:
             return list(self._gate_reasons)
+
+    def get_detection(self, ts_start: str = "", ts_end: str = "", window: str = "1m"):
+        """Return a DetectionEnvelope on state transitions or periodic heartbeats.
+
+        Emits on:
+        - State transitions (OK→DEGRADED, DEGRADED→OK)
+        - Periodic heartbeat every 10 windows while DEGRADED
+
+        Returns None when no detection is warranted.
+        """
+        from .detection import (
+            SubjectRef, build_envelope,
+        )
+
+        with self._lock:
+            # Only emit on transitions or periodic heartbeats during degraded
+            if not self._pending_detection:
+                return None
+
+            snap = self._snapshot_locked(
+                min(self._current_eps / max(self._baseline_eps, _EPS), 1.0)
+            )
+            detection_type = self._pending_detection
+            self._pending_detection = None
+
+        severity = "high" if detection_type == "platform_degraded" else "info"
+        score = 1.0 if detection_type == "platform_degraded" else 0.0
+
+        explain = {
+            "health_state": snap["health_state"],
+            "coverage_pct": snap["coverage_pct"],
+            "current_eps": snap["current_eps"],
+            "baseline_eps": snap["baseline_eps"],
+            "stream_lag_s": snap["stream_lag_s"],
+            "gate_reasons": snap["gate_reasons"],
+            "windows_seen": snap["windows_seen"],
+        }
+
+        return build_envelope(
+            detector_id="platform_health",
+            detector_version="v1",
+            ts_start=ts_start,
+            ts_end=ts_end,
+            window=window,
+            subject=SubjectRef("global", ""),
+            detection_type=detection_type,
+            score=score,
+            severity=severity,
+            explain=explain,
+            evidence=(),
+            window_fingerprint="",
+            config_hash="",
+        )
 
     def _snapshot_locked(self, coverage: float) -> dict:
         return {
@@ -315,6 +383,10 @@ def get_health_snapshot() -> dict:
 
 def get_gate_reasons() -> list:
     return _instance.get_gate_reasons()
+
+
+def get_detection(ts_start: str = "", ts_end: str = "", window: str = "1m"):
+    return _instance.get_detection(ts_start, ts_end, window)
 
 
 def _reset():
