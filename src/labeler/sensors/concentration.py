@@ -18,8 +18,7 @@ from ..detection import (
     DetectionEnvelope,
     SubjectRef,
     build_envelope,
-    make_query_commitment,
-    receipt_hash,
+    make_hashset_root,
     MAX_EXPLAIN_TOP_K,
 )
 from .base import SensorContext
@@ -127,7 +126,6 @@ class ConcentrationSensor:
             explain["truncated"] = True
 
         # Evidence: hashset root of top contributors
-        from ..detection import make_hashset_root
         evidence = (
             make_hashset_root(
                 subjects=[fp for fp, _ in top_fps],

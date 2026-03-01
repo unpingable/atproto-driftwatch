@@ -240,9 +240,9 @@ def _cap_explain_value(v):
     return v
 
 
-def _was_truncated(explain: dict, original_explain: dict) -> bool:
-    """Check if capping changed anything."""
-    for k, v in original_explain.items():
+def _was_truncated(original_explain: dict) -> bool:
+    """Check if capping would change any top-level values."""
+    for v in original_explain.values():
         if isinstance(v, list) and len(v) > MAX_EXPLAIN_TOP_K:
             return True
         if isinstance(v, str) and len(v) > MAX_EXPLAIN_STR_LEN:
@@ -272,7 +272,7 @@ def build_envelope(
     # Cap explain block
     original_explain = explain
     explain = {k: _cap_explain_value(v) for k, v in explain.items()}
-    if _was_truncated(explain, original_explain):
+    if _was_truncated(original_explain):
         explain["truncated"] = True
 
     # Sort evidence by (kind, ref) for stability

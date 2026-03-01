@@ -19,14 +19,13 @@ from .db import get_conn
 from . import timeutil
 from .detection import (
     SubjectRef,
-    EvidenceStub,
     DetectionEnvelope,
     build_envelope,
     envelope_to_dict,
     sort_detections,
     compute_window_fingerprint,
-    make_query_commitment,
     make_hashset_root,
+    make_note,
     receipt_hash,
     ENVELOPE_SCHEMA_VERSION,
 )
@@ -572,7 +571,7 @@ def cluster_report(
             score=div,
             severity=severity,
             explain=explain,
-            evidence=(),
+            evidence=(make_note(f"jsd={div:.4f} bin={shift['bin']}"),),
             window_fingerprint=wfp,
             config_hash=cfg_hash,
         ))

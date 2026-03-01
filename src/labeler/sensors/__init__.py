@@ -11,6 +11,7 @@ from ..detection import (
     DetectionEnvelope,
     SubjectRef,
     build_envelope,
+    make_note,
     sort_detections,
 )
 from .base import (
@@ -57,7 +58,7 @@ def run_sensors(ctx: SensorContext) -> List[DetectionEnvelope]:
                 "health_state": watermark_state,
                 "gate_reasons": ctx.watermark.get("gate_reasons", []),
             },
-            evidence=(),
+            evidence=(make_note("sensors gated: platform degraded"),),
             window_fingerprint=ctx.window_fingerprint,
             config_hash=ctx.config_hash,
         )]

@@ -1,11 +1,13 @@
-import os
-import uvicorn
-from fastapi import FastAPI, HTTPException, Response, Depends, Header
-import os
-from .db import init_db, get_conn
-from .consumer import ATProtoConsumer
 import asyncio
 import json
+import logging
+import os
+
+import uvicorn
+from fastapi import FastAPI, HTTPException, Response, Depends, Header
+
+from .db import init_db, get_conn
+from .consumer import ATProtoConsumer
 
 app = FastAPI(title="Bluesky Labeler MVP")
 
@@ -115,9 +117,6 @@ async def health_extended():
     if platform_detection is not None:
         result["platform_detection"] = platform_detection
     return result
-
-
-import logging
 
 
 async def admin_auth(authorization: str = Header(None), x_admin_token: str = Header(None, alias="X-Admin-Token")):

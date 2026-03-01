@@ -20,6 +20,7 @@ from ..detection import (
     DetectionEnvelope,
     SubjectRef,
     build_envelope,
+    make_note,
     sort_detections,
 )
 
@@ -78,7 +79,7 @@ def _make_skip_envelope(
         score=0.0,
         severity="info",
         explain=explain,
-        evidence=(),
+        evidence=(make_note(f"sensor skipped: {reason}"),),
         window_fingerprint=ctx.window_fingerprint,
         config_hash=ctx.config_hash,
     )

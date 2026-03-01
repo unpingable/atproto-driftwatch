@@ -311,7 +311,7 @@ class PlatformHealth:
                 min(self._current_eps / max(self._baseline_eps, _EPS), 1.0)
             )
             detection_type = self._pending_detection
-            self._pending_detection = None
+            self._pending_detection = ""
 
         severity = "high" if detection_type == "platform_degraded" else "info"
         score = 1.0 if detection_type == "platform_degraded" else 0.0
