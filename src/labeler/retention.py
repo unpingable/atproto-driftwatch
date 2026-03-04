@@ -34,9 +34,12 @@ EDGES_RETENTION_SEC = int(os.getenv("EDGES_RETENTION_SEC", str(14 * 86400)))   #
 CLAIM_RETENTION_SEC = int(os.getenv("CLAIM_RETENTION_SEC", str(14 * 86400)))   # 14d
 
 # Batch sizes for UPDATE/DELETE to avoid holding locks too long
-STRIP_BATCH = 50_000
-DELETE_BATCH = 50_000
+STRIP_BATCH = int(os.getenv("RETENTION_STRIP_BATCH", "5000"))
+DELETE_BATCH = int(os.getenv("RETENTION_DELETE_BATCH", "5000"))
 ARCHIVE_BATCH = 50_000
+
+# Sleep between batches to yield the DB lock to other writers (consumer, longitudinal)
+BATCH_SLEEP_SEC = float(os.getenv("RETENTION_BATCH_SLEEP_SEC", "1.0"))
 
 # Archive directory
 ARCHIVE_DIR = pathlib.Path(os.getenv(
@@ -76,6 +79,8 @@ def _strip_old_raw(conn):
         conn.commit()
         if n < STRIP_BATCH:
             break
+        # Yield the DB lock so other writers can get through
+        time.sleep(BATCH_SLEEP_SEC)
 
     return total
 
@@ -101,6 +106,7 @@ def _prune_table(conn, table, time_col, retention_sec):
         conn.commit()
         if n < DELETE_BATCH:
             break
+        time.sleep(BATCH_SLEEP_SEC)
 
     return total
 
@@ -208,6 +214,7 @@ def _archive_claim_history(conn) -> dict:
             conn.commit()
             if n < DELETE_BATCH:
                 break
+            time.sleep(BATCH_SLEEP_SEC)
 
         total_archived += written
         total_deleted += deleted_day

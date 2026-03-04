@@ -188,22 +188,26 @@ class ATProtoConsumer:
                 pass
 
             try:
-                ev = await self._event_queue.get()
+                ev = await asyncio.wait_for(self._event_queue.get(), timeout=10.0)
+            except asyncio.TimeoutError:
+                ev = None
             except asyncio.CancelledError:
                 break
-            try:
-                await loop.run_in_executor(None, self._process_event, ev)
-            except Exception:
-                LOG.exception("failed to process event")
 
-            queue_stats.inc("events_in")
-            self._event_count += 1
+            if ev is not None:
+                try:
+                    await loop.run_in_executor(None, self._process_event, ev)
+                except Exception:
+                    LOG.exception("failed to process event")
 
-            if self._event_count % CURSOR_SAVE_INTERVAL == 0:
-                if self._last_cursor:
-                    await loop.run_in_executor(None, upsert_cursor, CONSUMER_NAME, self._last_cursor)
+                queue_stats.inc("events_in")
+                self._event_count += 1
 
-            # Per-minute stats line
+                if self._event_count % CURSOR_SAVE_INTERVAL == 0:
+                    if self._last_cursor:
+                        await loop.run_in_executor(None, upsert_cursor, CONSUMER_NAME, self._last_cursor)
+
+            # Per-minute stats line (fires even when idle)
             now_mono = loop.time()
             if now_mono - last_stats_ts >= 60:
                 last_stats_ts = now_mono
@@ -336,8 +340,8 @@ class ATProtoConsumer:
                 async with websockets.connect(
                     url,
                     max_size=10 * 1024 * 1024,
-                    ping_interval=None,
-                    ping_timeout=None,
+                    ping_interval=30,
+                    ping_timeout=10,
                     close_timeout=10,
                 ) as ws:
                     LOG.info("connected to Jetstream")
