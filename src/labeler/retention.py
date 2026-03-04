@@ -39,7 +39,7 @@ DELETE_BATCH = int(os.getenv("RETENTION_DELETE_BATCH", "5000"))
 ARCHIVE_BATCH = 50_000
 
 # Sleep between batches to yield the DB lock to other writers (consumer, longitudinal)
-BATCH_SLEEP_SEC = float(os.getenv("RETENTION_BATCH_SLEEP_SEC", "1.0"))
+BATCH_SLEEP_SEC = float(os.getenv("RETENTION_BATCH_SLEEP_SEC", "2.0"))
 
 # Archive directory
 ARCHIVE_DIR = pathlib.Path(os.getenv(

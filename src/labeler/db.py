@@ -22,7 +22,7 @@ def get_conn():
     if backend == "sqlite":
         db_path = DATA_DIR / "labeler.sqlite"
         conn = sqlite3.connect(str(db_path))
-        # return rows as tuples (keep compatibility with existing code)
+        conn.execute("PRAGMA busy_timeout=60000")
         return conn
     elif backend == "duckdb":
         try:
@@ -245,6 +245,7 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_claim_history_created ON claim_history(createdAt)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_edges_ctime ON edges(ctime)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_events_ctime ON events(ctime)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_events_raw_notnull ON events(ctime) WHERE raw IS NOT NULL")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_label_decisions_created ON label_decisions(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_recheck_scheduled ON recheck_requests(scheduled_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_recheck_queue_scheduled ON recheck_queue(scheduled_at)")
