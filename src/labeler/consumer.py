@@ -146,6 +146,7 @@ class ATProtoConsumer:
         self._event_count = 0
         self._last_cursor: Optional[str] = None
         self._event_queue: asyncio.Queue = asyncio.Queue(maxsize=5000)
+        self._events_dropped = 0
 
     @staticmethod
     def _get_queue_depth() -> int:
@@ -237,10 +238,15 @@ class ATProtoConsumer:
                     f"{k[0].upper()}:{round(100*v/total_kinds)}%"
                     for k, v in sorted(kind_counts.items())
                 ) or "n/a"
+                # Snapshot and reset drop counter (before record_window uses it)
+                dropped = self._events_dropped
+                self._events_dropped = 0
+
                 # Platform health watermark
                 backlog = self._event_queue.qsize()
                 health_snap = platform_health.record_window(
                     snap["events_in"], snap["window_secs"], backlog,
+                    dropped=dropped,
                 )
                 health_state = health_snap["health_state"]
                 coverage_str = (
@@ -277,6 +283,7 @@ class ATProtoConsumer:
                     "STATS window=%.0fs events_in=%d claims=%d "
                     "enq_attempt=%d enq_insert=%d enq_ignore=%d enq_gated=%d "
                     "dequeued=%d queue_depth=%d median_age=%.0fs backlog=%d "
+                    "dropped=%d "
                     "kinds=%s coverage=%s health=%s baseline_eps=%.1f lag=%.1fs "
                     "disk=%s db=%s",
                     snap["window_secs"],
@@ -290,6 +297,7 @@ class ATProtoConsumer:
                     depth,
                     median_age,
                     backlog,
+                    dropped,
                     kinds_str,
                     coverage_str,
                     health_display,
@@ -321,8 +329,12 @@ class ATProtoConsumer:
         if ev is None:
             return
 
-        # Put on queue — non-blocking so WS read loop stays responsive for pings
-        await self._event_queue.put(ev)
+        # Non-blocking put — drop events when queue is full rather than
+        # blocking the event loop (which kills WS pings → reconnect churn)
+        try:
+            self._event_queue.put_nowait(ev)
+        except asyncio.QueueFull:
+            self._events_dropped += 1
 
     async def run(self):
         """Connect to Jetstream and process messages with reconnect resilience."""

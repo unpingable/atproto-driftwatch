@@ -251,6 +251,7 @@ class TestSnapshot:
             "current_eps",
             "baseline_eps",
             "stream_lag_s",
+            "drop_frac",
             "reconnect_count",
             "reconnect_gap_s",
             "gate_reasons",

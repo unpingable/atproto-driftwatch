@@ -70,6 +70,7 @@ def main():
     dwsub.add_parser("preflight", help="run preflight checks")
     dwsub.add_parser("maintenance", help="run maintenance pass (label expiry, disk check, growth stats)")
     dwsub.add_parser("retention", help="run retention pass (strip raw, archive+prune old data)")
+    dwsub.add_parser("bake", help="check bake gate status (baselines trustworthy?)")
     dwreport = dwsub.add_parser("report")
     dwreport.add_argument("--top", type=int, default=20, help="top N clusters by burst score")
     dwreport.add_argument("--hours", type=int, default=24, help="lookback window in hours")
@@ -208,6 +209,16 @@ def main():
             print(f"\nArchive files: {len(results['archive_files'])}")
             for f in results["archive_files"]:
                 print(f"  {f}")
+    elif args.cmd == "driftwatch" and args.dwcmd == "bake":
+        from .bake_gate import bake_check
+        result = bake_check()
+        verdict = result["verdict"]
+        print(f"Bake: {verdict}")
+        for check in result["checks"]:
+            status = check["status"]
+            marker = {"PASS": "+", "WARN": "~", "FAIL": "!"}[status]
+            print(f"  [{marker}] {check['name']}: {status} — {check['detail']}")
+        print(json.dumps(result, indent=2, sort_keys=True))
     elif args.cmd == "driftwatch" and args.dwcmd == "report":
         from .db import init_db
         init_db()

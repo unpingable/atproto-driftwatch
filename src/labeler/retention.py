@@ -299,16 +299,50 @@ def run_retention_once(conn=None):
 
     # 6. WAL checkpoint after bulk operations
     try:
-        conn.execute("PRAGMA wal_checkpoint(PASSIVE)")
+        result = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        stats["wal_checkpoint"] = {"busy": result[0], "log": result[1], "checkpointed": result[2]}
     except Exception:
         LOG.exception("WAL checkpoint failed")
 
+    # 7. DB geometry snapshot (for VACUUM planning and growth monitoring)
+    try:
+        page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        freelist_count = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        db_size_mb = round(page_count * page_size / (1024 * 1024), 1)
+        freelist_mb = round(freelist_count * page_size / (1024 * 1024), 1)
+        freelist_pct = round(100 * freelist_count / max(page_count, 1), 1)
+
+        # WAL file size
+        import pathlib as _pl
+        from .db import DATA_DIR
+        wal_path = DATA_DIR / "labeler.sqlite-wal"
+        wal_mb = round(wal_path.stat().st_size / (1024 * 1024), 1) if wal_path.exists() else 0.0
+
+        stats["db_geometry"] = {
+            "db_size_mb": db_size_mb,
+            "freelist_mb": freelist_mb,
+            "freelist_pct": freelist_pct,
+            "wal_mb": wal_mb,
+        }
+        LOG.info("db geometry: size=%.0fMB freelist=%.0fMB(%.1f%%) wal=%.1fMB",
+                 db_size_mb, freelist_mb, freelist_pct, wal_mb)
+    except Exception:
+        LOG.exception("db geometry check failed")
+
     elapsed = time.monotonic() - t0
     LOG.info("retention pass complete in %.1fs: %s", elapsed,
-             {k: v for k, v in stats.items() if k != "archive_files"})
+             {k: v for k, v in stats.items() if k not in ("archive_files", "db_geometry")})
 
     if own_conn:
         conn.close()
+
+    # Record stats for bake gate
+    try:
+        from .bake_gate import record_retention_stats
+        record_retention_stats(stats)
+    except Exception:
+        pass
 
     return stats
 

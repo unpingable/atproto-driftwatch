@@ -30,6 +30,7 @@ EWMA_ALPHA = 2.0 / (EWMA_SPAN + 1)
 COVERAGE_LOW_THRESHOLD = float(os.getenv("HEALTH_COVERAGE_LOW", "0.6"))
 LAG_HIGH_THRESHOLD_S = float(os.getenv("HEALTH_LAG_HIGH_S", "120"))
 BACKLOG_GROWTH_THRESHOLD = int(os.getenv("HEALTH_BACKLOG_GROWTH", "100"))
+DROP_FRAC_HIGH_THRESHOLD = float(os.getenv("HEALTH_DROP_FRAC_HIGH", "0.02"))
 CONSECUTIVE_BAD_WINDOWS = int(os.getenv("HEALTH_BAD_WINDOWS", "3"))
 
 # Recovery thresholds
@@ -91,6 +92,10 @@ class PlatformHealth:
         # Backlog tracking
         self._prev_backlog = None
 
+        # Drop tracking
+        self._drop_frac = 0.0
+        self._high_drop_streak = 0
+
         # Active gate reasons
         self._gate_reasons: list = []
 
@@ -128,15 +133,17 @@ class PlatformHealth:
                 self._reconnect_gap_s = now - self._last_disconnect_ts
             self._last_disconnect_ts = now
 
-    def record_window(self, events_in: int, window_secs: float, backlog: int) -> dict:
+    def record_window(self, events_in: int, window_secs: float, backlog: int,
+                       dropped: int = 0) -> dict:
         """Record a STATS window and update health state.
 
         Called once per ~60s STATS cycle. Returns a snapshot dict.
         """
         with self._lock:
-            return self._record_window_locked(events_in, window_secs, backlog)
+            return self._record_window_locked(events_in, window_secs, backlog, dropped)
 
-    def _record_window_locked(self, events_in: int, window_secs: float, backlog: int) -> dict:
+    def _record_window_locked(self, events_in: int, window_secs: float, backlog: int,
+                              dropped: int = 0) -> dict:
         self._windows_seen += 1
         window_secs = max(window_secs, 1.0)  # avoid div-by-zero
         self._current_eps = events_in / window_secs
@@ -150,6 +157,10 @@ class PlatformHealth:
                     EWMA_ALPHA * self._current_eps
                     + (1 - EWMA_ALPHA) * self._baseline_eps
                 )
+
+        # --- Drop fraction ---
+        total_received = events_in + dropped
+        self._drop_frac = dropped / max(total_received, 1)
 
         # --- Coverage ---
         coverage = min(
@@ -187,7 +198,15 @@ class PlatformHealth:
         if self._high_lag_streak >= CONSECUTIVE_BAD_WINDOWS:
             new_reasons.append("lag_high")
 
-        # Trigger 3: consumer backlog growing AND lag rising
+        # Trigger 3: high drop rate (losing events at ingest)
+        if self._drop_frac > DROP_FRAC_HIGH_THRESHOLD:
+            self._high_drop_streak += 1
+        else:
+            self._high_drop_streak = 0
+        if self._high_drop_streak >= CONSECUTIVE_BAD_WINDOWS:
+            new_reasons.append("high_drop_rate")
+
+        # Trigger 4: consumer backlog growing AND lag rising
         if backlog_growing and self._stream_lag_s > LAG_RECOVER_THRESHOLD_S:
             self._backlog_growing_streak += 1
         else:
@@ -350,6 +369,7 @@ class PlatformHealth:
             "current_eps": round(self._current_eps, 1),
             "baseline_eps": round(self._baseline_eps, 1),
             "stream_lag_s": round(self._stream_lag_s, 1),
+            "drop_frac": round(self._drop_frac, 4),
             "reconnect_count": self._reconnect_count,
             "reconnect_gap_s": round(self._reconnect_gap_s, 1),
             "gate_reasons": list(self._gate_reasons),
@@ -370,8 +390,9 @@ def record_reconnect():
     _instance.record_reconnect()
 
 
-def record_window(events_in: int, window_secs: float, backlog: int) -> dict:
-    return _instance.record_window(events_in, window_secs, backlog)
+def record_window(events_in: int, window_secs: float, backlog: int,
+                   dropped: int = 0) -> dict:
+    return _instance.record_window(events_in, window_secs, backlog, dropped)
 
 
 def is_degraded() -> bool:

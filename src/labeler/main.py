@@ -142,6 +142,7 @@ async def health_extended():
         "baseline_eps": health_snap.get("baseline_eps"),
         "stream_lag_s": health_snap.get("stream_lag_s"),
         "reconnect_count": health_snap.get("reconnect_count"),
+        "drop_frac": health_snap.get("drop_frac"),
         "gate_reasons": health_snap.get("gate_reasons", []),
     }
     if platform_detection is not None:
@@ -160,6 +161,12 @@ async def health_preflight():
     result = preflight(conn=conn)
     conn.close()
     return result
+
+
+@app.get("/health/bake")
+async def health_bake():
+    from .bake_gate import bake_check
+    return bake_check()
 
 
 async def admin_auth(authorization: str = Header(None), x_admin_token: str = Header(None, alias="X-Admin-Token")):
