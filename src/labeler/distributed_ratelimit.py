@@ -88,7 +88,7 @@ class RedisTokenBucket:
     async def acquire(self):
         # Try to consume; if not available, sleep for the suggested time (ms) then retry
         while True:
-                ok, ms = await self._try_consume()
+            ok, ms = await self._try_consume()
             if ok:
                 return
             # record that distributed limiter returned a wait (no token available)
