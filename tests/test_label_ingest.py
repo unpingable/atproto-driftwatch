@@ -1,7 +1,6 @@
 import asyncio
 import datetime
 import pytest
-pytest.importorskip("duckdb")
 
 from labeler.db import init_db, insert_event, get_unlabeled_subjects, get_labels_for_subject
 

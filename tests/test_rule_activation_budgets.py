@@ -2,7 +2,6 @@ import json
 from pathlib import Path
 import pytest
 
-pytest.importorskip("duckdb")
 
 from labeler.db import init_db, get_conn, insert_event
 from labeler.longitudinal import recheck_once

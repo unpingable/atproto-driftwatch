@@ -1,6 +1,5 @@
 import pytest
 
-pytest.importorskip("duckdb")
 
 from labeler.db import init_db, enqueue_claim_recheck, dequeue_claim_rechecks
 

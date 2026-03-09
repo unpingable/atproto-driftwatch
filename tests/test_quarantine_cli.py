@@ -1,7 +1,6 @@
 import json
 import pytest
 
-pytest.importorskip("duckdb")
 
 
 def test_quarantine_show_cli(capsys):

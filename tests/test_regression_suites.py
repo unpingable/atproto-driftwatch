@@ -3,7 +3,6 @@ from pathlib import Path
 from collections import Counter, defaultdict
 import pytest
 
-pytest.importorskip("duckdb")
 
 from labeler.db import init_db, get_conn, insert_event
 from labeler.longitudinal import recheck_once

@@ -1,7 +1,6 @@
 import datetime
 import pytest
 
-pytest.importorskip("duckdb")
 
 from labeler.db import init_db, insert_event, get_conn
 from labeler.longitudinal import recheck_once

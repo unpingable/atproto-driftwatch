@@ -1,5 +1,4 @@
 import pytest
-pytest.importorskip("duckdb")
 import os
 import pathlib
 from labeler.db import init_db, get_conn, insert_event

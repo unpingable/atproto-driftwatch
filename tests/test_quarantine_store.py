@@ -1,6 +1,5 @@
 import pytest
 
-pytest.importorskip("duckdb")
 
 from labeler.db import init_db, get_conn
 from labeler.emitter import record_emit_decision

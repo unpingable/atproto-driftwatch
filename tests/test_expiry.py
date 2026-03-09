@@ -1,7 +1,5 @@
 import datetime
 import pytest
-# Skip if duckdb isn't available in this environment
-pytest.importorskip("duckdb")
 
 from labeler.db import init_db, insert_label, get_labels_for_subject
 from labeler.expiry import expire_labels_by_ttl

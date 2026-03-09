@@ -1,5 +1,4 @@
 import pytest
-pytest.importorskip("duckdb")
 
 from labeler.db import init_db, insert_event
 from labeler.claims import fingerprint_text, get_claim_history

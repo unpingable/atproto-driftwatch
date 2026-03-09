@@ -1,5 +1,4 @@
 import pytest
-pytest.importorskip("duckdb")
 
 from labeler.budgets import parse_rule_budgets, budget_exceeded_in_run
 from labeler.db import init_db, get_conn
