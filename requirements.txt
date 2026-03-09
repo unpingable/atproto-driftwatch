@@ -5,7 +5,7 @@ httpx==0.24.1
 networkx==3.1
 python-dotenv==1.0.0
 prometheus-client==0.17.0
-redis==5.3.7
+redis==5.3.1
 fakeredis==2.1.1
 pytest==7.4.0
 pytest-asyncio==0.22.0
