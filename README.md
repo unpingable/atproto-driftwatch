@@ -104,15 +104,18 @@ Key environment variables (full list in source):
 | `ENABLE_CLAIM_RECHECK` | `0` | Enable claim-group recheck scheduling |
 | `ENABLE_FACTS_EXPORT` | `0` | Enable facts sidecar for labelwatch |
 | `MIN_CLAIM_ALPHA_TOKENS` | `3` | Minimum tokens for fingerprint complexity gate |
+| `ENABLE_RETENTION` | `0` | Enable periodic retention loop (prune old data) |
+| `ENABLE_MAINTENANCE` | `0` | Enable maintenance loop (label expiry, disk monitoring) |
 | `ADMIN_API_TOKEN` | — | Protect admin endpoints; open access if unset |
-| `DB_BACKEND` | `sqlite` | `sqlite` or `duckdb` |
 
 ## API
 
 | Endpoint | Auth | Purpose |
 |----------|------|---------|
 | `GET /health` | — | Simple OK |
-| `GET /health/extended` | — | Queue depth, platform health, coverage, lag, emit mode |
+| `GET /health/extended` | — | Queue depth, platform health, coverage, lag, emit mode, disk |
+| `GET /health/preflight` | — | Startup checks: disk, DB, tables, WAL (503 on fail) |
+| `GET /health/bake` | — | Baseline trustworthiness: consumer, retention, DB growth |
 | `GET /metrics` | — | Prometheus metrics |
 | `GET /strain/top` | — | Top authors by event count |
 | `GET /labels/{uri}` | — | Labels for a post URI |
@@ -142,6 +145,13 @@ Jetstream (WebSocket)
       emit_mode gate → detect-only / quarantine / emit
             |
       facts_export → labelwatch sidecar
+
+  operational:
+      preflight checks → startup validation
+      retention loop → prune old events/edges/claims
+      maintenance loop → label expiry, disk monitoring
+      disk pressure brake → pause processing at 92% disk
+      STATS heartbeat → periodic observability line
 ```
 
 ## Invariants
