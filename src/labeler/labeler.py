@@ -64,7 +64,7 @@ async def query_labels_for_subject(subject_uri: str) -> List[Dict[str, Any]]:
         ttl = None
         try:
             ep_norm = cooldown.normalize_endpoint(LABELER_ENDPOINT)
-            ttl = __import__("asyncio").run(cooldown.is_in_cooldown(ep_norm))
+            ttl = await cooldown.is_in_cooldown(ep_norm)
         except Exception:
             # ignore cooldown check failures
             ttl = None

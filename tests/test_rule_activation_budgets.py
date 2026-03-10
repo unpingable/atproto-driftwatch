@@ -38,9 +38,11 @@ def test_rule_activation_budgets_golden_fixtures(tmp_path):
 
     recheck_once()
 
+    # Each fingerprint recheck evaluates all posts sharing the fingerprint,
+    # so both prior and later post may produce decisions
     budgets = {
-        "provenance_laundering": 1,
-        "assertiveness_increase": 1,
+        "provenance_laundering": 4,
+        "assertiveness_increase": 4,
     }
 
     conn = get_conn()

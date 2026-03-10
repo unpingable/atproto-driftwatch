@@ -18,15 +18,6 @@ from labeler.driftmetrics import (
 )
 
 
-@pytest.fixture(autouse=True)
-def fresh_db(tmp_path, monkeypatch):
-    """Each test gets a clean SQLite DB."""
-    monkeypatch.setenv("DB_BACKEND", "sqlite")
-    import labeler.db as db_mod
-    db_mod.DATA_DIR = tmp_path
-    init_db()
-    yield
-
 
 def _insert_claim(conn, author, fp, created_at, confidence=None, evidence_hash="", post_uri=None, evidence_class="none"):
     conn.execute(

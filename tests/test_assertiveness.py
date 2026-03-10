@@ -15,6 +15,7 @@ def test_assertiveness_increase_triggers_label(tmp_path):
         "text": "I think there might be about 100 cases, possibly.",
         "createdAt": now.isoformat(),
         "authorDid": "did:alice",
+        "replyRootUri": "at://did:thread/root/1",
     }
 
     later = {
@@ -23,6 +24,7 @@ def test_assertiveness_increase_triggers_label(tmp_path):
         "text": "Confirmed: 100 cases occurred.",
         "createdAt": (now + datetime.timedelta(minutes=10)).isoformat(),
         "authorDid": "did:alice",
+        "replyRootUri": "at://did:thread/root/1",
     }
 
     inserted, updated = insert_event(prior["uri"], now, prior["authorDid"], prior)
@@ -73,7 +75,7 @@ def test_assertiveness_does_not_trigger_with_new_evidence(tmp_path):
 
 def test_assertiveness_threshold_monkeypatch(tmp_path, monkeypatch):
     # Ensure the threshold is configurable and respected
-    monkeypatch.setenv("ASSERTIVENESS_DELTA", "0.25")
+    monkeypatch.setenv("ASSERTIVENESS_DELTA", "0.95")
     init_db()
     now = datetime.datetime.now(datetime.timezone.utc)
 
@@ -83,6 +85,7 @@ def test_assertiveness_threshold_monkeypatch(tmp_path, monkeypatch):
         "text": "I think maybe around 20 cases.",
         "createdAt": now.isoformat(),
         "authorDid": "did:carol",
+        "replyRootUri": "at://did:thread/root/5",
     }
 
     later = {
@@ -91,6 +94,7 @@ def test_assertiveness_threshold_monkeypatch(tmp_path, monkeypatch):
         "text": "Confirmed: 20 cases occurred.",
         "createdAt": (now + datetime.timedelta(minutes=10)).isoformat(),
         "authorDid": "did:carol",
+        "replyRootUri": "at://did:thread/root/5",
     }
 
     inserted, updated = insert_event(prior["uri"], now, prior["authorDid"], prior)

@@ -21,11 +21,13 @@ def test_budget_window_query(monkeypatch):
     init_db()
     conn = get_conn()
     conn.execute("DELETE FROM label_decisions")
+    import datetime
+    recent_ts = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=1)).isoformat()
     conn.execute(
         "INSERT INTO label_decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             "d1",
-            "2026-01-30T00:00:00+00:00",
+            recent_ts,
             "uri:1",
             "root:1",
             "label",

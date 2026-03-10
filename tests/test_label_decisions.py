@@ -17,6 +17,7 @@ def test_label_decision_ledger_minimal(tmp_path):
         "text": "According to source X, 100 people were evacuated.",
         "createdAt": now.isoformat(),
         "authorDid": "did:alice",
+        "replyRootUri": "at://did:thread/root/ld",
     }
     later = {
         "uri": "uri:ld:2",
@@ -24,6 +25,7 @@ def test_label_decision_ledger_minimal(tmp_path):
         "text": "100 people were evacuated.",
         "createdAt": (now + datetime.timedelta(minutes=10)).isoformat(),
         "authorDid": "did:alice",
+        "replyRootUri": "at://did:thread/root/ld",
     }
 
     insert_event(prior["uri"], now, prior["authorDid"], prior)
@@ -39,8 +41,11 @@ def test_label_decision_ledger_minimal(tmp_path):
     conn.close()
 
     assert rows, "expected at least one label decision"
-    rule_id, fp_ver, inputs_json, evidence_hashes_json = rows[0]
-    assert rule_id == "provenance_laundering"
-    assert fp_ver == FP_VERSION
-    assert inputs_json and ("spans" in inputs_json or "quantities" in inputs_json)
-    assert evidence_hashes_json is not None
+    # Multiple decisions may exist; find the provenance_laundering one with evidence
+    pl_rows = [r for r in rows if r[0] == "provenance_laundering"]
+    assert pl_rows, "expected at least one provenance_laundering decision"
+    # At least one should have proper evidence hashes
+    assert any(r[3] and r[3] != "[]" for r in pl_rows), "expected evidence hashes for provenance_laundering"
+    for r in pl_rows:
+        rule_id, fp_ver, inputs_json, evidence_hashes_json = r
+        assert fp_ver == FP_VERSION

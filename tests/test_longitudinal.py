@@ -21,6 +21,7 @@ def test_edit_triggers_recheck_and_labeling(tmp_path):
         "text": "According to source X, 100 people were evacuated.",
         "createdAt": now.isoformat(),
         "authorDid": "did:alice",
+        "replyRootUri": "at://did:thread/root/lt",
     }
 
     # later post that copies attribution (no laundering initially)
@@ -30,6 +31,7 @@ def test_edit_triggers_recheck_and_labeling(tmp_path):
         "text": "According to source X, 100 people were evacuated.",
         "createdAt": (now + datetime.timedelta(minutes=10)).isoformat(),
         "authorDid": "did:alice",
+        "replyRootUri": "at://did:thread/root/lt",
     }
 
     # insert prior and later

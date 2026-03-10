@@ -28,6 +28,7 @@ def test_claim_recheck_runs_when_enabled(monkeypatch):
         "externalLinks": [],
         "embeds": [],
         "facets": [],
+        "replyRootUri": "at://did:thread/root/cr",
     }
     later = {
         "uri": "uri:cr:2",
@@ -38,6 +39,7 @@ def test_claim_recheck_runs_when_enabled(monkeypatch):
         "externalLinks": [],
         "embeds": [],
         "facets": [],
+        "replyRootUri": "at://did:thread/root/cr",
     }
 
     insert_event(prior["uri"], now, prior["authorDid"], prior)
