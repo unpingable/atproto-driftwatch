@@ -76,6 +76,10 @@ def main():
     dwreport.add_argument("--hours", type=int, default=24, help="lookback window in hours")
     dwreport.add_argument("--bin-hours", type=int, default=1, help="time bin width in hours")
     dwreport.add_argument("--out", default="out/driftwatch_report.json", help="output path")
+    dwreport.add_argument("--summary", action="store_true", help="print human-readable summary instead of JSON")
+    dwsummary = dwsub.add_parser("summary", help="human-readable summary of current state")
+    dwsummary.add_argument("--hours", type=int, default=1, help="lookback window in hours (default: 1 for interactive use)")
+    dwsummary.add_argument("--top", type=int, default=10, help="top N clusters")
 
     args = parser.parse_args()
     if args.cmd == "quarantine" and args.qcmd == "list":
@@ -225,13 +229,24 @@ def main():
         conn = get_conn()
         report = cluster_report(conn=conn, top_n=args.top, hours=args.hours, bin_hours=args.bin_hours)
         conn.close()
-        pathlib.Path(args.out).parent.mkdir(parents=True, exist_ok=True)
-        with open(args.out, "w") as f:
-            json.dump(report, f, indent=2, sort_keys=True)
-        # print summary to stdout
-        nc = len(report.get("clusters", []))
-        ns = len([s for s in report.get("regime_shifts", []) if s.get("is_shift")])
-        print(json.dumps({"ok": True, "clusters": nc, "regime_shifts": ns, "out": args.out}, sort_keys=True))
+        if getattr(args, "summary", False):
+            from .summary import format_summary
+            print(format_summary(report))
+        else:
+            pathlib.Path(args.out).parent.mkdir(parents=True, exist_ok=True)
+            with open(args.out, "w") as f:
+                json.dump(report, f, indent=2, sort_keys=True)
+            nc = len(report.get("clusters", []))
+            ns = len([s for s in report.get("regime_shifts", []) if s.get("is_shift")])
+            print(json.dumps({"ok": True, "clusters": nc, "regime_shifts": ns, "out": args.out}, sort_keys=True))
+    elif args.cmd == "driftwatch" and args.dwcmd == "summary":
+        from .db import init_db
+        from .summary import format_summary
+        init_db()
+        conn = get_conn()
+        report = cluster_report(conn=conn, top_n=args.top, hours=args.hours)
+        conn.close()
+        print(format_summary(report))
     else:
         parser.print_help()
 

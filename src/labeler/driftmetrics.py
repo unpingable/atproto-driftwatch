@@ -458,12 +458,14 @@ def cluster_report(
         ph_coverage = health_snap.get("coverage_pct", 0)
         ph_lag = health_snap.get("stream_lag_s", 0)
         ph_reasons = health_snap.get("gate_reasons", [])
+        ph_restored = health_snap.get("baseline_restored", False)
     except Exception:
         health_snap = {}
         ph_state = "unavailable"
         ph_coverage = 0
         ph_lag = 0
         ph_reasons = []
+        ph_restored = False
 
     # --- Emit detection envelopes (M1+M2) ---
     now_iso = timeutil.now_utc().isoformat()
@@ -620,6 +622,7 @@ def cluster_report(
         "coverage_pct": ph_coverage,
         "stream_lag_s": ph_lag,
         "gate_reasons": ph_reasons,
+        "baseline_restored": ph_restored,
         "clusters": clusters[:top_n],
         "likely_automation": automation,
         "regime_shifts": recent_shifts,

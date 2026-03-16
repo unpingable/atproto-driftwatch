@@ -307,6 +307,12 @@ class ATProtoConsumer:
                     db_str,
                 )
 
+                # Checkpoint baseline periodically
+                try:
+                    platform_health.maybe_checkpoint()
+                except Exception:
+                    pass
+
     async def _handle_message(self, raw: str):
         try:
             js = json.loads(raw)
@@ -339,6 +345,14 @@ class ATProtoConsumer:
     async def run(self):
         """Connect to Jetstream and process messages with reconnect resilience."""
         init_db()
+
+        # Restore baseline from checkpoint (avoid cold start on restart)
+        try:
+            from . import platform_health
+            platform_health.restore_baseline()
+        except Exception:
+            LOG.debug("baseline restore skipped (no checkpoint or error)")
+
         saved_cursor = get_cursor(CONSUMER_NAME)
         ws_url = _build_ws_url(self.ws_url, cursor=saved_cursor)
         LOG.info("starting Jetstream consumer, url=%s", ws_url)
@@ -375,6 +389,12 @@ class ATProtoConsumer:
         if self._last_cursor:
             upsert_cursor(CONSUMER_NAME, self._last_cursor)
             LOG.info("saved cursor on shutdown: %s", self._last_cursor)
+        try:
+            from . import platform_health
+            platform_health.force_checkpoint()
+            LOG.info("baseline checkpoint saved on shutdown")
+        except Exception:
+            pass
 
     def stop(self):
         self._stop = True

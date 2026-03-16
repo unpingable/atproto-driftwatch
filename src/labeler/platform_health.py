@@ -13,10 +13,12 @@ This does NOT detect AppView indexing rot (HTTP read health) — that's a
 separate future concern.
 """
 
+import json
 import logging
 import os
 import threading
 import time
+from pathlib import Path
 
 LOG = logging.getLogger("labeler.platform_health")
 
@@ -65,6 +67,7 @@ class PlatformHealth:
     def _reset(self):
         """Reset all state (for testing or restart)."""
         self._state = WARMING_UP
+        self._baseline_restored = False
         self._windows_seen = 0
 
         # EWMA baseline
@@ -375,11 +378,114 @@ class PlatformHealth:
             "gate_reasons": list(self._gate_reasons),
             "windows_seen": self._windows_seen,
             "recalibration_remaining": self._recalibration_remaining,
+            "baseline_restored": self._baseline_restored,
         }
+
+    # --- Baseline persistence ---
+
+    CHECKPOINT_VERSION = 1
+    CHECKPOINT_INTERVAL_WINDOWS = 5  # checkpoint every ~5 minutes
+    MAX_CHECKPOINT_AGE_S = 3600  # 1 hour — older than this, cold start
+
+    def checkpoint(self) -> dict:
+        """Serialize baseline state for persistence.
+
+        Only the sufficient statistics needed to avoid cold start.
+        Not the full runtime state — streaks, gates, and pending
+        detections are ephemeral and should re-derive.
+        """
+        with self._lock:
+            return {
+                "version": self.CHECKPOINT_VERSION,
+                "baseline_eps": self._baseline_eps,
+                "current_eps": self._current_eps,
+                "stream_lag_s": self._stream_lag_s,
+                "windows_seen": self._windows_seen,
+                "state": self._state,
+                "checkpoint_at": time.time(),
+            }
+
+    def restore(self, data: dict) -> bool:
+        """Restore baseline state from a checkpoint.
+
+        Returns True if restored, False if checkpoint was rejected
+        (incompatible version, too stale, or invalid).
+        """
+        if not data:
+            return False
+
+        if data.get("version") != self.CHECKPOINT_VERSION:
+            LOG.info("baseline checkpoint version mismatch, cold start")
+            return False
+
+        age = time.time() - data.get("checkpoint_at", 0)
+        if age > self.MAX_CHECKPOINT_AGE_S:
+            LOG.info("baseline checkpoint too stale (%.0fs old), cold start", age)
+            return False
+
+        baseline_eps = data.get("baseline_eps", 0)
+        if baseline_eps <= 0:
+            LOG.info("baseline checkpoint has no baseline_eps, cold start")
+            return False
+
+        with self._lock:
+            self._baseline_eps = baseline_eps
+            self._current_eps = data.get("current_eps", baseline_eps)
+            self._stream_lag_s = data.get("stream_lag_s", 0)
+            self._windows_seen = data.get("windows_seen", WARMUP_WINDOWS)
+            # Start in OK regardless of prior state — let the state machine
+            # re-derive DEGRADED if conditions warrant it. This avoids
+            # restoring into a stale degraded state.
+            if self._windows_seen >= WARMUP_WINDOWS:
+                self._state = OK
+            self._baseline_restored = True
+            LOG.info(
+                "baseline restored: eps=%.1f windows=%d age=%.0fs",
+                self._baseline_eps, self._windows_seen, age,
+            )
+            return True
+
+    def maybe_checkpoint(self, path: Path) -> bool:
+        """Checkpoint to file if enough windows have passed since last save.
+
+        Called after record_window(). Writes atomically.
+        """
+        with self._lock:
+            if self._windows_seen % self.CHECKPOINT_INTERVAL_WINDOWS != 0:
+                return False
+            if self._state == WARMING_UP and self._windows_seen < WARMUP_WINDOWS:
+                return False  # don't checkpoint before first warmup
+
+        return self._write_checkpoint(path)
+
+    def _write_checkpoint(self, path: Path) -> bool:
+        """Atomic write of checkpoint to disk."""
+        data = self.checkpoint()
+        tmp = path.with_suffix(".tmp")
+        try:
+            tmp.write_text(json.dumps(data))
+            tmp.rename(path)
+            return True
+        except OSError as e:
+            LOG.warning("checkpoint write failed: %s", e)
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+            return False
+
+    def force_checkpoint(self, path: Path) -> bool:
+        """Force a checkpoint write (for clean shutdown)."""
+        return self._write_checkpoint(path)
 
 
 # --- Module-level singleton ---
 _instance = PlatformHealth()
+
+# Default checkpoint path (alongside the DB)
+_DATA_DIR = Path(os.getenv("DATA_DIR", "data"))
+CHECKPOINT_PATH = _DATA_DIR / "baseline_checkpoint.json"
 
 
 def record_event_time(time_us: int):
@@ -409,6 +515,30 @@ def get_gate_reasons() -> list:
 
 def get_detection(ts_start: str = "", ts_end: str = "", window: str = "1m"):
     return _instance.get_detection(ts_start, ts_end, window)
+
+
+def restore_baseline(path: Path | None = None) -> bool:
+    """Restore baseline from checkpoint file. Call once at startup."""
+    path = path or CHECKPOINT_PATH
+    try:
+        data = json.loads(path.read_text())
+        return _instance.restore(data)
+    except FileNotFoundError:
+        LOG.info("no baseline checkpoint at %s, cold start", path)
+        return False
+    except (json.JSONDecodeError, OSError) as e:
+        LOG.warning("baseline checkpoint unreadable: %s, cold start", e)
+        return False
+
+
+def maybe_checkpoint(path: Path | None = None) -> bool:
+    """Checkpoint baseline if interval has elapsed. Call after record_window."""
+    return _instance.maybe_checkpoint(path or CHECKPOINT_PATH)
+
+
+def force_checkpoint(path: Path | None = None) -> bool:
+    """Force checkpoint write (clean shutdown)."""
+    return _instance.force_checkpoint(path or CHECKPOINT_PATH)
 
 
 def _reset():

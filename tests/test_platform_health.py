@@ -257,6 +257,7 @@ class TestSnapshot:
             "gate_reasons",
             "windows_seen",
             "recalibration_remaining",
+            "baseline_restored",
         }
         assert set(snap.keys()) == expected
 
@@ -280,3 +281,97 @@ class TestModuleSingleton:
         platform_health.record_event_time(wall_us - 5_000_000)  # 5s ago
         snap = platform_health.get_health_snapshot()
         assert snap["stream_lag_s"] > 0
+
+
+class TestCheckpointRestore:
+    def test_checkpoint_roundtrip(self):
+        ph = PlatformHealth()
+        for _ in range(WARMUP_WINDOWS):
+            _window(ph, events_in=500)
+        assert ph.get_health_snapshot()["health_state"] == OK
+
+        data = ph.checkpoint()
+        assert data["version"] == PlatformHealth.CHECKPOINT_VERSION
+        assert data["baseline_eps"] > 0
+        assert data["windows_seen"] >= WARMUP_WINDOWS
+
+        # Restore into a fresh instance
+        ph2 = PlatformHealth()
+        assert ph2.get_health_snapshot()["health_state"] == WARMING_UP
+        assert ph2.restore(data) is True
+        assert ph2.get_health_snapshot()["health_state"] == OK
+        assert abs(ph2.get_health_snapshot()["baseline_eps"] - data["baseline_eps"]) < 0.1
+        assert ph2.get_health_snapshot()["baseline_restored"] is True
+
+    def test_restore_rejects_wrong_version(self):
+        ph = PlatformHealth()
+        assert ph.restore({"version": 999}) is False
+
+    def test_restore_rejects_stale_checkpoint(self):
+        ph = PlatformHealth()
+        data = {
+            "version": PlatformHealth.CHECKPOINT_VERSION,
+            "baseline_eps": 100.0,
+            "checkpoint_at": time.time() - 7200,  # 2 hours old
+        }
+        assert ph.restore(data) is False
+
+    def test_restore_rejects_zero_baseline(self):
+        ph = PlatformHealth()
+        data = {
+            "version": PlatformHealth.CHECKPOINT_VERSION,
+            "baseline_eps": 0,
+            "checkpoint_at": time.time(),
+        }
+        assert ph.restore(data) is False
+
+    def test_restore_rejects_empty(self):
+        ph = PlatformHealth()
+        assert ph.restore({}) is False
+        assert ph.restore(None) is False
+
+    def test_checkpoint_file_roundtrip(self, tmp_path):
+        ph = PlatformHealth()
+        for _ in range(WARMUP_WINDOWS):
+            _window(ph, events_in=500)
+
+        path = tmp_path / "baseline.json"
+        assert ph.force_checkpoint(path) is True
+        assert path.exists()
+
+        ph2 = PlatformHealth()
+        import json
+        data = json.loads(path.read_text())
+        assert ph2.restore(data) is True
+        assert ph2.get_health_snapshot()["health_state"] == OK
+
+    def test_maybe_checkpoint_respects_interval(self, tmp_path):
+        ph = PlatformHealth()
+        path = tmp_path / "baseline.json"
+
+        # Warmup first
+        for _ in range(WARMUP_WINDOWS):
+            _window(ph, events_in=500)
+
+        # Should checkpoint at interval boundaries
+        interval = PlatformHealth.CHECKPOINT_INTERVAL_WINDOWS
+        # Record enough windows to hit the next interval
+        for i in range(1, interval + 1):
+            _window(ph, events_in=500)
+            result = ph.maybe_checkpoint(path)
+            if ph._windows_seen % interval == 0:
+                assert result is True
+            else:
+                assert result is False
+
+    def test_restored_state_in_snapshot(self):
+        ph = PlatformHealth()
+        assert ph.get_health_snapshot()["baseline_restored"] is False
+
+        for _ in range(WARMUP_WINDOWS):
+            _window(ph, events_in=500)
+        data = ph.checkpoint()
+
+        ph2 = PlatformHealth()
+        ph2.restore(data)
+        assert ph2.get_health_snapshot()["baseline_restored"] is True
