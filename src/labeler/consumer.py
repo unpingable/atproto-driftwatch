@@ -313,6 +313,19 @@ class ATProtoConsumer:
                 except Exception:
                     pass
 
+                # Resolve unresolved DIDs (M2 PDS enrichment sidecar)
+                try:
+                    from .resolver import resolve_batch
+                    rstats = await loop.run_in_executor(None, resolve_batch)
+                    if rstats["resolved"] > 0:
+                        LOG.info(
+                            "RESOLVER resolved=%d ok=%d not_found=%d error=%d",
+                            rstats["resolved"], rstats["ok"],
+                            rstats["not_found"], rstats["error"],
+                        )
+                except Exception:
+                    LOG.debug("resolver batch failed", exc_info=True)
+
     async def _handle_message(self, raw: str):
         try:
             js = json.loads(raw)

@@ -261,6 +261,20 @@ def init_db():
         """
     )
 
+    # M2: resolver columns on actor_identity_current (ALTER TABLE for live migration)
+    for col, typedef in [
+        ("pds_endpoint", "TEXT"),
+        ("pds_host", "TEXT"),
+        ("resolver_status", "TEXT"),  # unresolved/ok/not_found/error
+        ("resolver_last_attempt_at", "TIMESTAMP"),
+        ("resolver_last_success_at", "TIMESTAMP"),
+        ("resolver_error", "TEXT"),
+    ]:
+        try:
+            conn.execute(f"ALTER TABLE actor_identity_current ADD COLUMN {col} {typedef}")
+        except Exception:
+            pass  # column already exists
+
     # Indexes for performance at scale
     # Thread lookup via json_extract (used by longitudinal recheck)
     try:
@@ -279,6 +293,8 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_recheck_queue_scheduled ON recheck_queue(scheduled_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_identity_events_did ON identity_events(did)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_identity_events_time_us ON identity_events(time_us)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_actor_identity_resolver ON actor_identity_current(resolver_status)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_actor_identity_pds_host ON actor_identity_current(pds_host)")
     except Exception:
         pass
 
