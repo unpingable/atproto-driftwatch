@@ -330,6 +330,19 @@ class ATProtoConsumer:
             except Exception:
                 pass
 
+        # Identity/account events: capture and reduce
+        kind = js.get("kind")
+        if kind in ("identity", "account"):
+            try:
+                from .identity import parse_identity_event, apply_identity_event
+                delta = parse_identity_event(js)
+                if delta is not None:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, apply_identity_event, delta)
+            except Exception:
+                LOG.debug("identity event processing failed", exc_info=True)
+            return
+
         # Transform to canonical event
         ev = _jetstream_to_event(js)
         if ev is None:

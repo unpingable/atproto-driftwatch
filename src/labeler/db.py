@@ -233,6 +233,34 @@ def init_db():
         """
     )
 
+    # Identity event capture (M1 PDS enrichment)
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS identity_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            did TEXT NOT NULL,
+            event_kind TEXT NOT NULL,
+            time_us INTEGER NOT NULL,
+            received_at TIMESTAMP NOT NULL,
+            raw TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS actor_identity_current (
+            did TEXT PRIMARY KEY,
+            handle TEXT,
+            is_active INTEGER DEFAULT 1,
+            first_seen_at TIMESTAMP,
+            last_seen_at TIMESTAMP,
+            last_event_time_us INTEGER,
+            last_event_kind TEXT,
+            reducer_version INTEGER NOT NULL DEFAULT 1
+        )
+        """
+    )
+
     # Indexes for performance at scale
     # Thread lookup via json_extract (used by longitudinal recheck)
     try:
@@ -249,6 +277,8 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_label_decisions_created ON label_decisions(created_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_recheck_scheduled ON recheck_requests(scheduled_at)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_recheck_queue_scheduled ON recheck_queue(scheduled_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_identity_events_did ON identity_events(did)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_identity_events_time_us ON identity_events(time_us)")
     except Exception:
         pass
 
