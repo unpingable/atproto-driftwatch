@@ -61,6 +61,16 @@ def _ensure_tables(sidecar):
             total_claims     INTEGER NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS actor_identity_facts (
+            did                     TEXT PRIMARY KEY,
+            handle                  TEXT,
+            pds_endpoint            TEXT,
+            pds_host                TEXT,
+            resolver_status         TEXT,
+            resolver_last_success_at TEXT,
+            is_active               INTEGER
+        );
+
         CREATE TABLE IF NOT EXISTS meta (
             key   TEXT PRIMARY KEY,
             value TEXT
@@ -143,6 +153,25 @@ def _recompute_bounds(sidecar):
         FROM uri_fingerprint
         GROUP BY fingerprint
     """)
+
+
+def _refresh_identity_facts(source_conn, sidecar):
+    """Full replace of actor_identity_facts from actor_identity_current.
+
+    Current-state table, not incremental — ~30k rows, fast full replace.
+    Only exports the thin projection labelwatch needs.
+    """
+    sidecar.execute("DELETE FROM actor_identity_facts")
+    rows = source_conn.execute("""
+        SELECT did, handle, pds_endpoint, pds_host,
+               resolver_status, resolver_last_success_at, is_active
+        FROM actor_identity_current
+    """).fetchall()
+    sidecar.executemany(
+        "INSERT INTO actor_identity_facts VALUES (?, ?, ?, ?, ?, ?, ?)",
+        rows,
+    )
+    return len(rows)
 
 
 def _prune(sidecar, retention_start):
@@ -259,6 +288,12 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
         sidecar.commit()
         elapsed_bounds = time.monotonic() - t_bounds
 
+        # Identity facts: full replace from actor_identity_current
+        t_identity = time.monotonic()
+        identity_count = _refresh_identity_facts(source_conn, sidecar)
+        sidecar.commit()
+        elapsed_identity = time.monotonic() - t_identity
+
         t_snap = time.monotonic()
         _snapshot(sidecar, facts_path)
         _set_meta(sidecar, "last_snapshot_epoch", now)
@@ -266,8 +301,8 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
         snap_elapsed = time.monotonic() - t_snap
         did_snapshot = True
         snap_mb = os.path.getsize(facts_path) / (1024 * 1024)
-        LOG.info("snapshot created: %.0fMB in %.1fs (hourly=%.1fs, bounds=%.1fs)",
-                 snap_mb, snap_elapsed, elapsed_hourly, elapsed_bounds)
+        LOG.info("snapshot created: %.0fMB in %.1fs (hourly=%.1fs, bounds=%.1fs, identity=%d in %.1fs)",
+                 snap_mb, snap_elapsed, elapsed_hourly, elapsed_bounds, identity_count, elapsed_identity)
 
     sidecar.close()
 

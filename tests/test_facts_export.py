@@ -14,13 +14,14 @@ from labeler.facts_export import (
     _get_meta_int,
     _recompute_bounds,
     _recompute_hourly,
+    _refresh_identity_facts,
     _set_meta,
     _upsert_uri_fingerprints,
     export_once,
 )
 
 
-def _make_source(rows=None):
+def _make_source(rows=None, identity_rows=None):
     """Create an in-memory claim_history table with optional seed rows."""
     conn = sqlite3.connect(":memory:")
     conn.execute("""
@@ -39,11 +40,36 @@ def _make_source(rows=None):
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_claim_history_created ON claim_history(createdAt)"
     )
+    conn.execute("""
+        CREATE TABLE actor_identity_current (
+            did TEXT PRIMARY KEY,
+            handle TEXT,
+            is_active INTEGER DEFAULT 1,
+            first_seen_at TIMESTAMP,
+            last_seen_at TIMESTAMP,
+            last_event_time_us INTEGER,
+            last_event_kind TEXT,
+            reducer_version INTEGER NOT NULL DEFAULT 1,
+            pds_endpoint TEXT,
+            pds_host TEXT,
+            resolver_status TEXT,
+            resolver_last_attempt_at TIMESTAMP,
+            resolver_last_success_at TIMESTAMP,
+            resolver_error TEXT
+        )
+    """)
     if rows:
         conn.executemany(
             "INSERT INTO claim_history VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", rows
         )
-        conn.commit()
+    if identity_rows:
+        conn.executemany(
+            "INSERT INTO actor_identity_current "
+            "(did, handle, pds_endpoint, pds_host, resolver_status, "
+            "resolver_last_success_at, is_active) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            identity_rows,
+        )
+    conn.commit()
     return conn
 
 
@@ -390,4 +416,84 @@ class TestSnapshotInterval:
         # Snapshot file should not have been updated
         mtime_2 = os.path.getmtime(facts_path)
         assert mtime_2 == mtime_1
+        source.close()
+
+
+# -------------------------------------------------------------------
+# 13. Identity facts projection
+# -------------------------------------------------------------------
+class TestIdentityFacts:
+    def test_refresh_identity_facts(self):
+        """actor_identity_facts populated from actor_identity_current."""
+        source = _make_source(identity_rows=[
+            ("did:plc:aaa", "alice.bsky.social", "https://pds1.bsky.network", "pds1.bsky.network", "ok", "2026-03-18T00:00:00", 1),
+            ("did:plc:bbb", "bob.example.com", "https://pds.example.com", "pds.example.com", "ok", "2026-03-18T00:00:00", 1),
+            ("did:plc:ccc", None, None, None, None, None, 0),
+        ])
+        sidecar = sqlite3.connect(":memory:")
+        _ensure_tables(sidecar)
+        count = _refresh_identity_facts(source, sidecar)
+
+        assert count == 3
+        rows = sidecar.execute(
+            "SELECT did, handle, pds_host, resolver_status, is_active "
+            "FROM actor_identity_facts ORDER BY did"
+        ).fetchall()
+        assert len(rows) == 3
+        assert rows[0] == ("did:plc:aaa", "alice.bsky.social", "pds1.bsky.network", "ok", 1)
+        assert rows[1] == ("did:plc:bbb", "bob.example.com", "pds.example.com", "ok", 1)
+        assert rows[2] == ("did:plc:ccc", None, None, None, 0)
+        source.close()
+        sidecar.close()
+
+    def test_refresh_replaces_stale_data(self):
+        """Full replace: old rows removed, new rows appear."""
+        source = _make_source(identity_rows=[
+            ("did:plc:aaa", "alice.bsky.social", "https://pds1.bsky.network", "pds1.bsky.network", "ok", "2026-03-18T00:00:00", 1),
+        ])
+        sidecar = sqlite3.connect(":memory:")
+        _ensure_tables(sidecar)
+
+        # First refresh
+        _refresh_identity_facts(source, sidecar)
+        assert sidecar.execute("SELECT COUNT(*) FROM actor_identity_facts").fetchone()[0] == 1
+
+        # Change source: remove old, add new
+        source.execute("DELETE FROM actor_identity_current")
+        source.execute(
+            "INSERT INTO actor_identity_current "
+            "(did, handle, pds_endpoint, pds_host, resolver_status, resolver_last_success_at, is_active) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("did:plc:zzz", "zara.test", "https://self.hosted", "self.hosted", "ok", "2026-03-18T01:00:00", 1),
+        )
+        source.commit()
+
+        # Second refresh should replace
+        count = _refresh_identity_facts(source, sidecar)
+        assert count == 1
+        rows = sidecar.execute("SELECT did, pds_host FROM actor_identity_facts").fetchall()
+        assert rows == [("did:plc:zzz", "self.hosted")]
+        source.close()
+        sidecar.close()
+
+    def test_identity_facts_in_snapshot(self, tmp_path):
+        """actor_identity_facts appears in the snapshot via export_once."""
+        source = _make_source(identity_rows=[
+            ("did:plc:aaa", "alice.test", "https://pds.bsky.network", "pds.bsky.network", "ok", "2026-03-18T00:00:00", 1),
+            ("did:plc:bbb", "bob.test", "https://weird.host", "weird.host", "ok", "2026-03-18T00:00:00", 1),
+        ])
+        facts_path = str(tmp_path / "facts.sqlite")
+        work_path = str(tmp_path / "facts_work.sqlite")
+
+        export_once(source, facts_path, work_path, force_snapshot=True)
+
+        # Read the snapshot directly
+        snap = sqlite3.connect(facts_path)
+        rows = snap.execute(
+            "SELECT did, pds_host FROM actor_identity_facts ORDER BY did"
+        ).fetchall()
+        assert len(rows) == 2
+        assert rows[0] == ("did:plc:aaa", "pds.bsky.network")
+        assert rows[1] == ("did:plc:bbb", "weird.host")
+        snap.close()
         source.close()
