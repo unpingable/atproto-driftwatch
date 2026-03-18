@@ -263,6 +263,11 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
     _prune(sidecar, retention_start)
     elapsed_prune = time.monotonic() - t_prune
 
+    # Identity facts: full replace every cycle (cheap, ~34k rows, not gated on snapshot)
+    t_identity = time.monotonic()
+    identity_count = _refresh_identity_facts(source_conn, sidecar)
+    elapsed_identity = time.monotonic() - t_identity
+
     # Update meta
     _set_meta(sidecar, "last_export_epoch", now)
     sidecar.commit()
@@ -288,12 +293,6 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
         sidecar.commit()
         elapsed_bounds = time.monotonic() - t_bounds
 
-        # Identity facts: full replace from actor_identity_current
-        t_identity = time.monotonic()
-        identity_count = _refresh_identity_facts(source_conn, sidecar)
-        sidecar.commit()
-        elapsed_identity = time.monotonic() - t_identity
-
         t_snap = time.monotonic()
         _snapshot(sidecar, facts_path)
         _set_meta(sidecar, "last_snapshot_epoch", now)
@@ -308,8 +307,9 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
 
     elapsed = time.monotonic() - t0
     work_mb = os.path.getsize(work_path) / (1024 * 1024)
-    LOG.info("facts export complete: %.1fs (batch=%.1fs, prune=%.1fs, %d new rows, work=%.0fMB%s)",
-             elapsed, elapsed_batch, elapsed_prune, rows_upserted, work_mb,
+    LOG.info("facts export complete: %.1fs (batch=%.1fs, prune=%.1fs, identity=%d in %.1fs, %d new rows, work=%.0fMB%s)",
+             elapsed, elapsed_batch, elapsed_prune, identity_count, elapsed_identity,
+             rows_upserted, work_mb,
              ", +snapshot[hourly=%.1fs bounds=%.1fs]" % (elapsed_hourly, elapsed_bounds)
              if did_snapshot else "")
 
