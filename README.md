@@ -47,8 +47,15 @@ partial ingest.
 with rule ID, fingerprint version, input evidence hashes, config hash, and
 decision trace. Labels are not just applied — they are receipted.
 
-**Facts export.** SQLite sidecar export for [Labelwatch](https://github.com/unpingable/labelwatch)
-consumption — URI→fingerprint mappings, hourly aggregates, fingerprint bounds.
+**Identity enrichment.** Captures Jetstream identity/account events into an
+append-only log with a fieldwise reducer producing converged current state.
+Async DID resolver extracts PDS endpoints from DID documents (did:plc via PLC
+directory, did:web via .well-known). Provenance tracked: `live` (observed via
+Jetstream), `labelwatch_seed` (seeded from labeled-target population), `both`.
+
+**Facts export.** SQLite sidecar export for [Labelwatch](https://github.com/unpingable/atproto-labelwatch)
+consumption — URI→fingerprint mappings, hourly aggregates, fingerprint bounds,
+and actor identity facts (DID→PDS host mapping with resolver status).
 Atomic snapshot via `VACUUM INTO` + `os.replace()`.
 
 ## Quickstart
@@ -126,25 +133,36 @@ Key environment variables (full list in source):
 
 ```
 Jetstream (WebSocket)
-    → consumer (posts + reposts, ~500 eps)
-        → claim_history (fingerprinted, fp_kind tracked)
-            |
-      fingerprint pipeline
-      (entity > quantity > domain > span > text)
-            |
-      cluster analysis (driftmetrics)
-            |— burst score / half-life / regime shifts
-            |— single-author detection
-            |
-      longitudinal rechecks (platform health gated)
-            |
-      drift rules (assertiveness, provenance laundering)
-            |
-      label_decisions (receipted)
-            |
-      emit_mode gate → detect-only / quarantine / emit
-            |
-      facts_export → labelwatch sidecar
+    → consumer (posts + reposts + identity + account events)
+        |
+        |— posts/reposts → claim_history (fingerprinted, fp_kind tracked)
+        |       |
+        |    fingerprint pipeline
+        |    (entity > quantity > domain > span > text)
+        |       |
+        |    cluster analysis (driftmetrics)
+        |       |— burst score / half-life / regime shifts
+        |       |— single-author detection
+        |       |
+        |    longitudinal rechecks (platform health gated)
+        |       |
+        |    drift rules → label_decisions (receipted)
+        |       |
+        |    emit_mode gate → detect-only / quarantine / emit
+        |
+        |— identity/account → identity_events (append-only log)
+                |
+             fieldwise reducer → actor_identity_current
+                |
+             async DID resolver → pds_endpoint, pds_host
+                |
+             facts_export → facts.sqlite → labelwatch
+                (uri_fingerprint + fingerprint_hourly +
+                 fingerprint_bounds + actor_identity_facts)
+
+  enrichment:
+      seed_targets — import labeled-target DIDs from labelwatch
+                     for resolver pickup (provenance: live/seed/both)
 
   operational:
       preflight checks → startup validation
@@ -154,6 +172,28 @@ Jetstream (WebSocket)
       STATS heartbeat → periodic observability line
 ```
 
+## What this system is and is not
+
+**Is:** A substrate observatory that watches how claims propagate and how
+hosting infrastructure maps onto labeled populations. Aggregate-first.
+
+**Is not:** A moderation tool, a user profiler, an enforcement mechanism, or a
+trust score. It does not decide who is bad. It measures where weirdness clusters.
+
+**Populations:**
+- **Live-observed actors** — DIDs seen via Jetstream identity/account events.
+- **Labeled-target actors** — DIDs seeded from labelwatch's labeled-target population.
+- **Overlap** — DIDs present in both (tracked as `identity_source = 'both'`).
+- Coverage metrics always specify which population they refer to.
+
+**Host family is not operator identity.** Co-location on the same PDS does not
+imply shared intent, coordination, or culpability. A host family may contain one
+person's VPS, a community instance, a bridge, or disposable infrastructure.
+
+**Current-state enrichment is not historical truth.** A DID's PDS today may differ
+from its PDS at the time it was labeled. Temporal claims require timestamped
+identity snapshots (future work).
+
 ## Invariants
 
 - Language may propose; only evidence commits state (ledger recorded).
@@ -161,6 +201,7 @@ Jetstream (WebSocket)
 - Emit is gated; default is detect-only and auditable.
 - Containment preserves records; nothing is silently dropped.
 - Aggregate-first: cluster-level analysis, not per-account profiling.
+- Only add enrichment that changes a live analytic question.
 
 ## Observatory family
 
