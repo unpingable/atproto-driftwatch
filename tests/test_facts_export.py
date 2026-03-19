@@ -55,7 +55,8 @@ def _make_source(rows=None, identity_rows=None):
             resolver_status TEXT,
             resolver_last_attempt_at TIMESTAMP,
             resolver_last_success_at TIMESTAMP,
-            resolver_error TEXT
+            resolver_error TEXT,
+            identity_source TEXT DEFAULT 'live'
         )
     """)
     if rows:

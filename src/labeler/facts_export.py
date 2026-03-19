@@ -68,7 +68,8 @@ def _ensure_tables(sidecar):
             pds_host                TEXT,
             resolver_status         TEXT,
             resolver_last_success_at TEXT,
-            is_active               INTEGER
+            is_active               INTEGER,
+            identity_source         TEXT
         );
 
         CREATE TABLE IF NOT EXISTS meta (
@@ -164,11 +165,12 @@ def _refresh_identity_facts(source_conn, sidecar):
     sidecar.execute("DELETE FROM actor_identity_facts")
     rows = source_conn.execute("""
         SELECT did, handle, pds_endpoint, pds_host,
-               resolver_status, resolver_last_success_at, is_active
+               resolver_status, resolver_last_success_at, is_active,
+               identity_source
         FROM actor_identity_current
     """).fetchall()
     sidecar.executemany(
-        "INSERT INTO actor_identity_facts VALUES (?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO actor_identity_facts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
     )
     return len(rows)

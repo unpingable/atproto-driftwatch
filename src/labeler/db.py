@@ -269,6 +269,7 @@ def init_db():
         ("resolver_last_attempt_at", "TIMESTAMP"),
         ("resolver_last_success_at", "TIMESTAMP"),
         ("resolver_error", "TEXT"),
+        ("identity_source", "TEXT DEFAULT 'live'"),  # live/labelwatch_seed/both
     ]:
         try:
             conn.execute(f"ALTER TABLE actor_identity_current ADD COLUMN {col} {typedef}")
