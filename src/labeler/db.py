@@ -23,6 +23,8 @@ def get_conn():
         db_path = DATA_DIR / "labeler.sqlite"
         conn = sqlite3.connect(str(db_path))
         conn.execute("PRAGMA busy_timeout=60000")
+        conn.execute("PRAGMA journal_size_limit=67108864")  # 64MB — truncate WAL after checkpoint
+        conn.execute("PRAGMA mmap_size=268435456")  # 256MB — reduce read syscalls
         return conn
     elif backend == "duckdb":
         try:

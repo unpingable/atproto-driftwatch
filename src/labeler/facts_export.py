@@ -204,7 +204,20 @@ def _prune(sidecar, retention_start):
 
 
 def _snapshot(work_conn, snapshot_path):
-    """Create a compacted snapshot via VACUUM INTO + atomic replace."""
+    """Create a compacted snapshot via VACUUM INTO + atomic replace.
+
+    Checks disk space before attempting — VACUUM INTO needs roughly
+    the compacted output size in free space.
+    """
+    data_dir = os.path.dirname(snapshot_path) or "."
+    work_db_path = work_conn.execute("PRAGMA database_list").fetchone()[2]
+    work_size = os.path.getsize(work_db_path) if work_db_path else 0
+    free_space = shutil.disk_usage(data_dir).free
+    if free_space < work_size * 1.2:
+        LOG.warning("skipping snapshot: %dMB free, need ~%dMB",
+                    free_space // (1024 * 1024), work_size * 1.2 // (1024 * 1024))
+        return False
+
     tmp_snap = snapshot_path + ".tmp"
     # Remove stale tmp if exists (e.g. from previous crash)
     if os.path.exists(tmp_snap):
@@ -212,13 +225,29 @@ def _snapshot(work_conn, snapshot_path):
     work_conn.execute(f"VACUUM INTO '{tmp_snap}'")
     # VACUUM INTO produces DELETE journal mode by default, which is what we want
     os.replace(tmp_snap, snapshot_path)
+    return True
 
 
-def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=False):
+def _open_source(source_conn_or_factory):
+    """Open a source connection, accepting either a factory callable or a live connection.
+
+    Returns (conn, should_close). If a factory is provided, the caller must close
+    the connection when done with it to release the WAL read lock.
+    """
+    if isinstance(source_conn_or_factory, sqlite3.Connection):
+        return source_conn_or_factory, False
+    # Assume callable factory
+    return source_conn_or_factory(), True
+
+
+def export_once(source_conn_or_factory, facts_path=None, work_path=None, force_snapshot=False):
     """Run one export cycle: update working DB in place, optionally snapshot.
 
     Args:
-        source_conn: Connection to the main labeler.sqlite (claim_history).
+        source_conn_or_factory: Connection to the main labeler.sqlite, or a
+            callable that returns one. Using a factory is preferred — each phase
+            opens and closes its own connection, releasing the WAL read lock
+            between phases to prevent WAL bloat on the source DB.
         facts_path: Path for the read-only snapshot (labelwatch reads this).
         work_path: Path for the in-place working DB.
         force_snapshot: If True, always create a snapshot this cycle.
@@ -243,6 +272,7 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
     sidecar = sqlite3.connect(work_path)
     sidecar.execute("PRAGMA journal_mode=WAL")
     sidecar.execute("PRAGMA busy_timeout=30000")
+    sidecar.execute("PRAGMA journal_size_limit=67108864")  # 64MB — truncate WAL after checkpoint
     _ensure_tables(sidecar)
 
     # Read checkpoint rowid and last export time
@@ -250,40 +280,50 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
     last_export = _get_meta_int(sidecar, "last_export_epoch", 0)
     rows_upserted = 0
 
-    # Loop batches until drained
+    # Phase 1: Batch upsert — bounded rowid ranges, no need for cross-phase consistency
     t_batch = time.monotonic()
-    while True:
-        rows = source_conn.execute("""
-            SELECT rowid, post_uri, claim_fingerprint, createdAt, authorDid
-            FROM claim_history
-            WHERE rowid > ? AND post_uri IS NOT NULL
-            ORDER BY rowid LIMIT ?
-        """, (last_rowid, BATCH_LIMIT)).fetchall()
+    source_conn, should_close = _open_source(source_conn_or_factory)
+    try:
+        while True:
+            rows = source_conn.execute("""
+                SELECT rowid, post_uri, claim_fingerprint, createdAt, authorDid
+                FROM claim_history
+                WHERE rowid > ? AND post_uri IS NOT NULL
+                ORDER BY rowid LIMIT ?
+            """, (last_rowid, BATCH_LIMIT)).fetchall()
 
-        if not rows:
-            break
+            if not rows:
+                break
 
-        batch_max_rowid = rows[-1][0]
-        rows_upserted += len(rows)
+            batch_max_rowid = rows[-1][0]
+            rows_upserted += len(rows)
 
-        _upsert_uri_fingerprints(source_conn, sidecar, last_rowid, batch_max_rowid)
+            _upsert_uri_fingerprints(source_conn, sidecar, last_rowid, batch_max_rowid)
 
-        last_rowid = batch_max_rowid
-        _set_meta(sidecar, "last_checkpoint_rowid", last_rowid)
-        sidecar.commit()
+            last_rowid = batch_max_rowid
+            _set_meta(sidecar, "last_checkpoint_rowid", last_rowid)
+            sidecar.commit()
 
-        if len(rows) < BATCH_LIMIT:
-            break
+            if len(rows) < BATCH_LIMIT:
+                break
+    finally:
+        if should_close:
+            source_conn.close()
     elapsed_batch = time.monotonic() - t_batch
 
-    # Prune all tables to retention
+    # Phase 2: Prune (sidecar-only, no source connection needed)
     t_prune = time.monotonic()
     _prune(sidecar, retention_start)
     elapsed_prune = time.monotonic() - t_prune
 
-    # Identity facts: full replace every cycle (cheap, ~34k rows, not gated on snapshot)
+    # Phase 3: Identity facts — short read from source, then release
     t_identity = time.monotonic()
-    identity_count = _refresh_identity_facts(source_conn, sidecar)
+    source_conn, should_close = _open_source(source_conn_or_factory)
+    try:
+        identity_count = _refresh_identity_facts(source_conn, sidecar)
+    finally:
+        if should_close:
+            source_conn.close()
     elapsed_identity = time.monotonic() - t_identity
 
     # Update meta
@@ -292,18 +332,21 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
 
     elapsed_update = time.monotonic() - t0
 
-    # Snapshot: recompute expensive aggregates (hourly + bounds) then VACUUM INTO
-    # These are only needed for reads (labelwatch ATTACHes the snapshot, not working DB)
+    # Phase 4: Snapshot — recompute expensive aggregates then VACUUM INTO
     last_snap = _get_meta_int(sidecar, "last_snapshot_epoch", 0)
     did_snapshot = False
     elapsed_hourly = 0.0
     elapsed_bounds = 0.0
-    hourly_start = overlap_start  # default for logging
+    hourly_start = overlap_start
     if force_snapshot or (now - last_snap >= snap_interval):
-        # Hourly rollup: OVERLAP_HOURS window from source (expensive GROUP BY)
-        hourly_start = overlap_start
+        # Hourly rollup: short read from source for OVERLAP_HOURS window
         t_hourly = time.monotonic()
-        _recompute_hourly(source_conn, sidecar, hourly_start, now)
+        source_conn, should_close = _open_source(source_conn_or_factory)
+        try:
+            _recompute_hourly(source_conn, sidecar, hourly_start, now)
+        finally:
+            if should_close:
+                source_conn.close()
         elapsed_hourly = time.monotonic() - t_hourly
 
         t_bounds = time.monotonic()
@@ -311,15 +354,21 @@ def export_once(source_conn, facts_path=None, work_path=None, force_snapshot=Fal
         sidecar.commit()
         elapsed_bounds = time.monotonic() - t_bounds
 
+        # Snapshot: VACUUM INTO with disk space preflight
         t_snap = time.monotonic()
-        _snapshot(sidecar, facts_path)
-        _set_meta(sidecar, "last_snapshot_epoch", now)
-        sidecar.commit()
-        snap_elapsed = time.monotonic() - t_snap
-        did_snapshot = True
-        snap_mb = os.path.getsize(facts_path) / (1024 * 1024)
-        LOG.info("snapshot created: %.0fMB in %.1fs (hourly=%.1fs, bounds=%.1fs, identity=%d in %.1fs)",
-                 snap_mb, snap_elapsed, elapsed_hourly, elapsed_bounds, identity_count, elapsed_identity)
+        snap_ok = _snapshot(sidecar, facts_path)
+        if snap_ok:
+            _set_meta(sidecar, "last_snapshot_epoch", now)
+            sidecar.commit()
+            snap_elapsed = time.monotonic() - t_snap
+            did_snapshot = True
+            snap_mb = os.path.getsize(facts_path) / (1024 * 1024)
+            LOG.info("snapshot created: %.0fMB in %.1fs (hourly=%.1fs, bounds=%.1fs, identity=%d in %.1fs)",
+                     snap_mb, snap_elapsed, elapsed_hourly, elapsed_bounds, identity_count, elapsed_identity)
+        else:
+            snap_elapsed = time.monotonic() - t_snap
+            LOG.warning("snapshot skipped (disk space): hourly=%.1fs, bounds=%.1fs",
+                        elapsed_hourly, elapsed_bounds)
 
     sidecar.close()
 
@@ -351,11 +400,9 @@ async def run_periodic(facts_path=None, work_path=None):
             _force = first_run  # always snapshot on first run
             def _run():
                 from .db import get_conn
-                source_conn = get_conn()
-                try:
-                    export_once(source_conn, _fp, _wp, force_snapshot=_force)
-                finally:
-                    source_conn.close()
+                # Pass factory, not connection — each phase opens/closes its own
+                # connection to release WAL read locks between phases.
+                export_once(get_conn, _fp, _wp, force_snapshot=_force)
             await loop.run_in_executor(None, _run)
             first_run = False
         except Exception:
@@ -371,7 +418,5 @@ if __name__ == "__main__":
     from .db import get_conn
     facts_path = sys.argv[1] if len(sys.argv) > 1 else _default_facts_path()
     work_path = _default_work_path()
-    source_conn = get_conn()
-    export_once(source_conn, facts_path, work_path, force_snapshot=True)
-    source_conn.close()
+    export_once(get_conn, facts_path, work_path, force_snapshot=True)
     LOG.info("one-shot export done")
