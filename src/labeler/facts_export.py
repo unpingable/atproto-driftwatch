@@ -140,7 +140,8 @@ def _recompute_hourly(source_conn, sidecar, overlap_start, now):
     """, (overlap_start, now)).fetchall()
 
     sidecar.executemany(
-        "INSERT OR REPLACE INTO fingerprint_hourly VALUES (?, ?, ?, ?)",
+        "INSERT OR REPLACE INTO fingerprint_hourly "
+        "(fingerprint, hour_epoch, event_count, unique_authors) VALUES (?, ?, ?, ?)",
         source_rows,
     )
 
@@ -156,12 +157,24 @@ def _recompute_bounds(sidecar):
     """)
 
 
+def _migrate_identity_facts(sidecar):
+    """Ensure actor_identity_facts has the current schema.
+
+    Handles persisted working DBs and snapshots that predate column additions.
+    """
+    cols = {r[1] for r in sidecar.execute("PRAGMA table_info(actor_identity_facts)").fetchall()}
+    if "identity_source" not in cols:
+        sidecar.execute("ALTER TABLE actor_identity_facts ADD COLUMN identity_source TEXT")
+        sidecar.commit()
+
+
 def _refresh_identity_facts(source_conn, sidecar):
     """Full replace of actor_identity_facts from actor_identity_current.
 
     Current-state table, not incremental — ~30k rows, fast full replace.
     Only exports the thin projection labelwatch needs.
     """
+    _migrate_identity_facts(sidecar)
     sidecar.execute("DELETE FROM actor_identity_facts")
     rows = source_conn.execute("""
         SELECT did, handle, pds_endpoint, pds_host,
@@ -170,7 +183,10 @@ def _refresh_identity_facts(source_conn, sidecar):
         FROM actor_identity_current
     """).fetchall()
     sidecar.executemany(
-        "INSERT INTO actor_identity_facts VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO actor_identity_facts "
+        "(did, handle, pds_endpoint, pds_host, resolver_status, "
+        " resolver_last_success_at, is_active, identity_source) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         rows,
     )
     return len(rows)

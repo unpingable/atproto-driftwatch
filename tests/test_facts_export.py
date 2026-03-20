@@ -498,3 +498,54 @@ class TestIdentityFacts:
         assert rows[1] == ("did:plc:bbb", "weird.host")
         snap.close()
         source.close()
+
+    def test_migration_adds_identity_source_column(self, tmp_path):
+        """Old 7-column actor_identity_facts gets migrated to 8 columns."""
+        from labeler.facts_export import _migrate_identity_facts, _refresh_identity_facts
+
+        # Create a working DB with the OLD 7-column schema
+        sidecar = sqlite3.connect(str(tmp_path / "old_work.sqlite"))
+        sidecar.execute("""
+            CREATE TABLE actor_identity_facts (
+                did TEXT PRIMARY KEY,
+                handle TEXT,
+                pds_endpoint TEXT,
+                pds_host TEXT,
+                resolver_status TEXT,
+                resolver_last_success_at TEXT,
+                is_active INTEGER
+            )
+        """)
+        sidecar.execute(
+            "INSERT INTO actor_identity_facts VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("did:plc:old", "old.test", "https://old.host", "old.host", "ok", "2026-01-01", 1),
+        )
+        sidecar.commit()
+
+        # Verify 7 columns before migration
+        cols_before = {r[1] for r in sidecar.execute("PRAGMA table_info(actor_identity_facts)").fetchall()}
+        assert "identity_source" not in cols_before
+
+        # Run migration
+        _migrate_identity_facts(sidecar)
+
+        # Verify 8 columns after migration
+        cols_after = {r[1] for r in sidecar.execute("PRAGMA table_info(actor_identity_facts)").fetchall()}
+        assert "identity_source" in cols_after
+
+        # Old data still intact
+        row = sidecar.execute("SELECT did, pds_host FROM actor_identity_facts").fetchone()
+        assert row == ("did:plc:old", "old.host")
+
+        # Can now do a full refresh with 8 columns (explicit column list INSERT)
+        source = _make_source(identity_rows=[
+            ("did:plc:new", "new.test", "https://new.host", "new.host", "ok", "2026-03-20", 1),
+        ])
+        count = _refresh_identity_facts(source, sidecar)
+        assert count == 1
+        row = sidecar.execute("SELECT did, pds_host, identity_source FROM actor_identity_facts").fetchone()
+        assert row[0] == "did:plc:new"
+        assert row[1] == "new.host"
+
+        sidecar.close()
+        source.close()
