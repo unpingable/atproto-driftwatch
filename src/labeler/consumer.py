@@ -57,6 +57,8 @@ def _jetstream_to_event(js: dict) -> Optional[dict]:
         return None
 
     commit = js.get("commit", {})
+    if not isinstance(commit, dict):
+        return None
     operation = commit.get("operation")
 
     # We only ingest creates and updates, not deletes
@@ -68,6 +70,8 @@ def _jetstream_to_event(js: dict) -> Optional[dict]:
     rkey = commit.get("rkey", "")
     cid = commit.get("cid", "")
     record = commit.get("record", {})
+    if not isinstance(record, dict):
+        record = {}
 
     # Build AT URI: at://{did}/{collection}/{rkey}
     uri = f"at://{did}/{collection}/{rkey}"
@@ -89,18 +93,18 @@ def _jetstream_to_event(js: dict) -> Optional[dict]:
         if not isinstance(reply_root, dict):
             reply_root = {}
 
-        # Extract external links from embeds
+        # Extract external links from embeds (defensive: any field could be non-dict)
         external_links = []
         embed = record.get("embed", {})
-        if embed:
+        if isinstance(embed, dict):
             ext = embed.get("external", {})
-            if ext and ext.get("uri"):
+            if isinstance(ext, dict) and ext.get("uri"):
                 external_links.append(ext["uri"])
             # record-with-media embeds
             media = embed.get("media", {})
-            if media:
+            if isinstance(media, dict):
                 ext2 = media.get("external", {})
-                if ext2 and ext2.get("uri"):
+                if isinstance(ext2, dict) and ext2.get("uri"):
                     external_links.append(ext2["uri"])
 
         return {
@@ -122,6 +126,8 @@ def _jetstream_to_event(js: dict) -> Optional[dict]:
 
     elif collection == "app.bsky.feed.repost":
         subject = record.get("subject", {})
+        if not isinstance(subject, dict):
+            subject = {}
         return {
             "uri": uri,
             "cid": cid,

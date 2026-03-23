@@ -83,19 +83,23 @@ def resolve_did(did: str) -> ResolvedDID:
             status="error", error=type(e).__name__,
         )
 
-    # Extract PDS endpoint
+    # Extract PDS endpoint (defensive: service/alsoKnownAs may be non-list or contain non-dicts)
     pds_endpoint = None
-    for svc in doc.get("service", []):
-        if svc.get("id") == "#atproto_pds":
-            pds_endpoint = svc.get("serviceEndpoint")
-            break
+    services = doc.get("service", [])
+    if isinstance(services, list):
+        for svc in services:
+            if isinstance(svc, dict) and svc.get("id") == "#atproto_pds":
+                pds_endpoint = svc.get("serviceEndpoint")
+                break
 
     # Extract handle from alsoKnownAs
     handle = None
-    for aka in doc.get("alsoKnownAs", []):
-        if aka.startswith("at://"):
-            handle = aka[5:]
-            break
+    also_known = doc.get("alsoKnownAs", [])
+    if isinstance(also_known, list):
+        for aka in also_known:
+            if isinstance(aka, str) and aka.startswith("at://"):
+                handle = aka[5:]
+                break
 
     # Hostname from PDS endpoint
     pds_host = None

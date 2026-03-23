@@ -65,6 +65,8 @@ def parse_identity_event(js: dict) -> Optional[IdentityDelta]:
 
     if kind == "identity":
         identity = js.get("identity", {})
+        if not isinstance(identity, dict):
+            identity = {}
         handle = identity.get("handle", MISSING)
         seq = identity.get("seq", MISSING)
         return IdentityDelta(
@@ -79,6 +81,8 @@ def parse_identity_event(js: dict) -> Optional[IdentityDelta]:
 
     if kind == "account":
         account = js.get("account", {})
+        if not isinstance(account, dict):
+            account = {}
         active = account.get("active", MISSING)
         seq = account.get("seq", MISSING)
         return IdentityDelta(
