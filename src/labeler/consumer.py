@@ -82,8 +82,12 @@ def _jetstream_to_event(js: dict) -> Optional[dict]:
     if collection == "app.bsky.feed.post":
         # Extract reply pointers
         reply = record.get("reply", {})
-        reply_parent = reply.get("parent", {}) if reply else {}
-        reply_root = reply.get("root", {}) if reply else {}
+        reply_parent = reply.get("parent", {}) if isinstance(reply, dict) else {}
+        reply_root = reply.get("root", {}) if isinstance(reply, dict) else {}
+        if not isinstance(reply_parent, dict):
+            reply_parent = {}
+        if not isinstance(reply_root, dict):
+            reply_root = {}
 
         # Extract external links from embeds
         external_links = []
