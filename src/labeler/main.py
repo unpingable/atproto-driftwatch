@@ -2,11 +2,12 @@ import asyncio
 import json
 import logging
 import os
+import time
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Response, Depends, Header
 
-from .db import init_db, get_conn
+from .db import init_db, get_conn, DATA_DIR
 from .consumer import ATProtoConsumer
 
 app = FastAPI(title="Bluesky Labeler MVP")
@@ -128,6 +129,57 @@ async def health_extended():
     except Exception:
         disk_info = None
 
+    # WAL size (main DB)
+    wal_info = {}
+    try:
+        db_path = str(DATA_DIR / "labeler.sqlite")
+        wal_path = db_path + "-wal"
+        if os.path.exists(wal_path):
+            wal_info["wal_size_mb"] = round(os.path.getsize(wal_path) / (1024 * 1024), 1)
+        # Checkpoint status
+        ckpt_conn = get_conn()
+        try:
+            ckpt = ckpt_conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+            if ckpt:
+                wal_info["checkpoint_log"] = ckpt[1]
+                wal_info["checkpoint_done"] = ckpt[2]
+                wal_info["checkpoint_busy"] = ckpt[1] - ckpt[2] if ckpt[1] and ckpt[2] else 0
+        finally:
+            ckpt_conn.close()
+    except Exception:
+        pass
+
+    # Resolver stats (from actor_identity_current)
+    resolver_info = {}
+    try:
+        rconn = get_conn()
+        try:
+            rows = rconn.execute(
+                "SELECT resolver_status, COUNT(*) FROM actor_identity_current GROUP BY resolver_status"
+            ).fetchall()
+            resolver_info = {(r[0] or "pending"): r[1] for r in rows}
+            resolver_info["total"] = sum(r[1] for r in rows)
+        finally:
+            rconn.close()
+    except Exception:
+        pass
+
+    # Facts export freshness
+    facts_info = {}
+    try:
+        facts_path = str(DATA_DIR / "facts.sqlite")
+        if os.path.exists(facts_path):
+            facts_info["snapshot_size_mb"] = round(os.path.getsize(facts_path) / (1024 * 1024), 1)
+            facts_info["snapshot_age_s"] = int(time.time() - os.path.getmtime(facts_path))
+        work_path = str(DATA_DIR / "facts_work.sqlite")
+        if os.path.exists(work_path):
+            facts_info["work_size_mb"] = round(os.path.getsize(work_path) / (1024 * 1024), 1)
+            work_wal = work_path + "-wal"
+            if os.path.exists(work_wal):
+                facts_info["work_wal_mb"] = round(os.path.getsize(work_wal) / (1024 * 1024), 1)
+    except Exception:
+        pass
+
     result = {
         "status": "ok",
         "build_sha": BUILD_SHA,
@@ -145,6 +197,12 @@ async def health_extended():
         "drop_frac": health_snap.get("drop_frac"),
         "gate_reasons": health_snap.get("gate_reasons", []),
     }
+    if wal_info:
+        result["wal"] = wal_info
+    if resolver_info:
+        result["resolver"] = resolver_info
+    if facts_info:
+        result["facts_export"] = facts_info
     if platform_detection is not None:
         result["platform_detection"] = platform_detection
     if capabilities is not None:
