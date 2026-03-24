@@ -3,6 +3,7 @@ WORKDIR /app
 
 ARG GIT_SHA=unknown
 ENV GIT_SHA=${GIT_SHA}
+ENV PYTHONDONTWRITEBYTECODE=1
 
 RUN apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
 
