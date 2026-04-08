@@ -115,10 +115,13 @@ def _check_retention_health() -> dict:
     if age_s > 7200:  # 2 hours — stale
         reasons.append(f"last pass {age_s/3600:.1f}h ago (stale)")
 
-    # Check WAL checkpoint
+    # Check WAL checkpoint — only flag if most pages are blocked,
+    # not just a few from the continuous write stream.
     ckpt = stats.get("wal_checkpoint", {})
-    if ckpt.get("busy", 0) > 0:
-        reasons.append(f"checkpoint blocked (busy={ckpt['busy']})")
+    ckpt_log = ckpt.get("log", 0)
+    ckpt_busy = ckpt.get("busy", 0)
+    if ckpt_log > 0 and ckpt_busy / ckpt_log > 0.9:
+        reasons.append(f"checkpoint mostly blocked (busy={ckpt_busy}/{ckpt_log})")
 
     if reasons:
         return {"name": "retention_health", "status": "FAIL",
