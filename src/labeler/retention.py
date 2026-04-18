@@ -299,10 +299,38 @@ def run_retention_once(conn=None):
 
     # 6. WAL checkpoint after bulk operations
     try:
-        result = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
+        result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         stats["wal_checkpoint"] = {"busy": result[0], "log": result[1], "checkpointed": result[2]}
     except Exception:
         LOG.exception("WAL checkpoint failed")
+
+    # 6b. Incremental vacuum: reclaim freelist pages without needing temp space.
+    # Only has effect if the DB was created/last-vacuumed with
+    # auto_vacuum=INCREMENTAL (mode 2). On a mode-0 DB, this is a silent
+    # no-op — safe to run unconditionally. After a future VACUUM INTO flips
+    # the DB to mode 2, this starts eating away at the freelist each pass
+    # and prevents the "trapped dead pages" problem from re-accumulating.
+    try:
+        mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+        if mode == 2:  # INCREMENTAL
+            freelist_before = conn.execute("PRAGMA freelist_count").fetchone()[0]
+            conn.execute("PRAGMA incremental_vacuum(1000)")
+            freelist_after = conn.execute("PRAGMA freelist_count").fetchone()[0]
+            reclaimed_pages = freelist_before - freelist_after
+            stats["incremental_vacuum"] = {
+                "freelist_before": freelist_before,
+                "freelist_after": freelist_after,
+                "reclaimed_pages": reclaimed_pages,
+            }
+            if reclaimed_pages > 0:
+                LOG.info(
+                    "incremental_vacuum: reclaimed %d pages (freelist %d -> %d)",
+                    reclaimed_pages, freelist_before, freelist_after,
+                )
+        else:
+            stats["incremental_vacuum"] = {"mode": mode, "skipped": True}
+    except Exception:
+        LOG.exception("incremental_vacuum failed")
 
     # 7. DB geometry snapshot (for VACUUM planning and growth monitoring)
     try:
