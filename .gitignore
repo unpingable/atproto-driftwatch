@@ -11,5 +11,6 @@ data/
 .pytest_cache/
 .vscode/
 .claude/
+.mcp.json
 out/
 src/data/
