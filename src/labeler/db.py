@@ -272,11 +272,39 @@ def init_db():
         ("resolver_last_success_at", "TIMESTAMP"),
         ("resolver_error", "TEXT"),
         ("identity_source", "TEXT DEFAULT 'live'"),  # live/labelwatch_seed/both
+        # Vintage columns (admissibility covariate, write-once by policy)
+        ("did_created_at", "TIMESTAMP"),
+        # vintage_source values: plc_export, plc_audit_log, plc_stream, unsupported_method, repair_override
+        ("vintage_source", "TEXT"),
+        ("vintage_resolved_at", "TIMESTAMP"),
+        ("vintage_run_id", "TEXT"),  # references plc_export_runs.run_id
     ]:
         try:
             conn.execute(f"ALTER TABLE actor_identity_current ADD COLUMN {col} {typedef}")
         except Exception:
             pass  # column already exists
+
+    # PLC export run receipts. Each full or partial /export backfill records
+    # its range and status here; actor_identity_current.vintage_run_id points
+    # back to the specific run that produced each genesis timestamp.
+    # Cursors are createdAt timestamps (plc.directory /export paginates by
+    # after=<createdAt>, not by an integer sequence).
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS plc_export_runs (
+            run_id TEXT PRIMARY KEY,
+            started_at TIMESTAMP NOT NULL,
+            ended_at TIMESTAMP,
+            first_cursor TEXT,
+            last_cursor TEXT,
+            ops_processed INTEGER DEFAULT 0,
+            dids_seen INTEGER DEFAULT 0,
+            genesis_ops_written INTEGER DEFAULT 0,
+            status TEXT NOT NULL,
+            note TEXT
+        )
+        """
+    )
 
     # Indexes for performance at scale
     # Thread lookup via json_extract (used by longitudinal recheck)
@@ -298,6 +326,11 @@ def init_db():
         conn.execute("CREATE INDEX IF NOT EXISTS idx_identity_events_time_us ON identity_events(time_us)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_actor_identity_resolver ON actor_identity_current(resolver_status)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_actor_identity_pds_host ON actor_identity_current(pds_host)")
+        # Vintage-stratified analysis indexes
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_actor_identity_vintage ON actor_identity_current(did_created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_actor_identity_source_vintage ON actor_identity_current(identity_source, did_created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_actor_identity_host_vintage ON actor_identity_current(pds_host, did_created_at)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_actor_identity_vintage_source ON actor_identity_current(vintage_source)")
     except Exception:
         pass
 
