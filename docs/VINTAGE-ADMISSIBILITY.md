@@ -158,18 +158,20 @@ The following are explicitly out of scope for Phase D:
   non-major skew"**. No attestation, no trust scoring, no provider
   ranking.
 
-## Provenance footer (to be filled in at Phase D time)
+## Provenance footer (filled at Phase D time)
 
 | Field | Value |
 |-------|-------|
-| Rerun executed at | _fill at rerun_ |
+| Rerun executed at | 2026-04-21T18:47:45Z |
 | Backfill run_id | plc_export_20260420_152312Z_db628ce9 |
 | target_dids at backfill launch | 1,012,453 |
-| vintaged DIDs at rerun | _fill at rerun_ |
-| vintage coverage (% of resolved) | _fill at rerun_ |
-| Bucket boundaries chosen | _fill at rerun_ |
-| Families clearing effect floor | _fill at rerun_ |
-| Findings artifact | _fill at rerun_ |
+| vintaged DIDs at rerun | 669,040 eligible (post-filter) |
+| vintage coverage (% of resolved) | ~68% of resolved rows had vintage+fresh by policy; 160,802 after 7d freshness filter |
+| Bucket boundaries chosen | 13 quarterly boundaries, 14 buckets (doctrine fallback — single joint jellybaby+stropharia regime detected, below 2-event minimum) |
+| Families clearing effect floor | 0 |
+| Verdict | no_non_major_signal_after_vintage_control |
+| Findings artifact | out/admissibility/2026-04-21_findings.md |
+| Numeric artifact | out/admissibility/2026-04-21_1847Z_vintage_admissibility.json |
 
 ## Different-sin language
 

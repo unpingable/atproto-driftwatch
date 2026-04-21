@@ -135,7 +135,10 @@ def run_backfill(
 ) -> dict:
     """Run the backfill. Returns summary stats dict."""
     conn = sqlite3.connect(db_path)
-    conn.execute("PRAGMA busy_timeout=60000")
+    # 5 min busy_timeout: the main driftwatch container can hold the write
+    # lock for tens of seconds during heavy ingest bursts. Default 60s wasn't
+    # enough; one lock miss crashed a 16h run.
+    conn.execute("PRAGMA busy_timeout=300000")
     conn.execute("PRAGMA journal_mode=WAL")
 
     run_id = run_id or f"plc_export_{time.strftime('%Y%m%d_%H%M%SZ', time.gmtime())}_{uuid.uuid4().hex[:8]}"
@@ -173,22 +176,38 @@ def run_backfill(
         nonlocal genesis_written, pending, pending_dids
         if not pending:
             return
-        try:
-            stats = set_vintage_many(conn, pending, source="plc_export", run_id=run_id)
-            conn.execute(
-                "UPDATE plc_export_runs SET "
-                "last_cursor = ?, ops_processed = ?, dids_seen = ?, "
-                "genesis_ops_written = genesis_ops_written + ? "
-                "WHERE run_id = ?",
-                (last_cursor, ops_processed, dids_seen_count, stats["written"], run_id),
-            )
-            conn.commit()
-            genesis_written += stats["written"]
-            LOG.info("flushed batch=%d written=%d skipped_existing=%d missing_row=%d",
-                     len(pending), stats["written"], stats["skipped_existing"], stats["skipped_missing_row"])
-        finally:
-            pending = []
-            pending_dids = set()
+        # Retry loop for SQLite lock contention against the main driftwatch
+        # container. Each attempt waits up to 5 min via busy_timeout; if that
+        # times out, back off and retry before giving up on the whole run.
+        max_attempts = 6
+        for attempt in range(1, max_attempts + 1):
+            try:
+                stats = set_vintage_many(conn, pending, source="plc_export", run_id=run_id)
+                conn.execute(
+                    "UPDATE plc_export_runs SET "
+                    "last_cursor = ?, ops_processed = ?, dids_seen = ?, "
+                    "genesis_ops_written = genesis_ops_written + ? "
+                    "WHERE run_id = ?",
+                    (last_cursor, ops_processed, dids_seen_count, stats["written"], run_id),
+                )
+                conn.commit()
+                genesis_written += stats["written"]
+                LOG.info("flushed batch=%d written=%d skipped_existing=%d missing_row=%d",
+                         len(pending), stats["written"], stats["skipped_existing"], stats["skipped_missing_row"])
+                break
+            except sqlite3.OperationalError as e:
+                if "locked" not in str(e).lower() or attempt == max_attempts:
+                    raise
+                backoff = min(120, 10 * attempt)
+                LOG.warning("flush: db locked (attempt %d/%d), backing off %ds: %s",
+                            attempt, max_attempts, backoff, e)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+                time.sleep(backoff)
+        pending = []
+        pending_dids = set()
 
     try:
         while True:
