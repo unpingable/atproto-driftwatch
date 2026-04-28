@@ -413,18 +413,26 @@ def classify_evidence(external_links: list = None, embeds: list = None, facets: 
     return "facet"
 
 
-def add_claim_history(authorDid: str, text: str, createdAt: str, post_uri: str, post_cid: Optional[str] = None, confidence: Optional[float] = None, provenance: Optional[str] = None, evidence_hash: Optional[str] = None, evidence_class: Optional[str] = None):
+def add_claim_history_txn(conn, authorDid: str, text: str, createdAt: str, post_uri: str, post_cid: Optional[str] = None, confidence: Optional[float] = None, provenance: Optional[str] = None, evidence_hash: Optional[str] = None, evidence_class: Optional[str] = None):
+    """Transaction-scoped insert: uses the passed conn, does not commit or close."""
     fp, fp_kind = fingerprint_text_with_kind(text)
     createdAt = timeutil.to_utc_iso(createdAt)
     observed_at = timeutil.now_utc().isoformat()
-    conn = get_conn()
     conn.execute(
         "INSERT INTO claim_history (authorDid, claim_fingerprint, createdAt, confidence, provenance, evidence_hash, post_uri, post_cid, fingerprint_version, evidence_class, fp_kind, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (authorDid, fp, createdAt, confidence, provenance or "", evidence_hash or "", post_uri, post_cid or "", FP_VERSION, evidence_class or "none", fp_kind, observed_at),
     )
-    conn.commit()
-    conn.close()
     return fp, fp_kind
+
+
+def add_claim_history(authorDid: str, text: str, createdAt: str, post_uri: str, post_cid: Optional[str] = None, confidence: Optional[float] = None, provenance: Optional[str] = None, evidence_hash: Optional[str] = None, evidence_class: Optional[str] = None):
+    conn = get_conn()
+    try:
+        result = add_claim_history_txn(conn, authorDid, text, createdAt, post_uri, post_cid, confidence, provenance, evidence_hash, evidence_class)
+        conn.commit()
+        return result
+    finally:
+        conn.close()
 
 
 def get_claim_history(authorDid: str, fingerprint: str) -> List[dict]:

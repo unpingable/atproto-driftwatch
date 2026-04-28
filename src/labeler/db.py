@@ -338,6 +338,80 @@ def init_db():
     conn.close()
 
 
+def insert_event_txn(conn, event_uri: str, ctime: Union[str, int, float, datetime.datetime], author: str, raw: dict):
+    """Transaction-scoped insert/update of an event. Uses passed conn, does not commit.
+
+    See insert_event() for behavior. Caller is responsible for transaction control.
+    """
+    raw_json = json.dumps(raw)
+    ctime_dt = timeutil.to_utc_datetime(ctime)
+
+    cur = conn.execute("SELECT raw, ctime FROM events WHERE event_uri = ?", (event_uri,)).fetchall()
+    if not cur:
+        conn.execute(
+            "INSERT INTO events VALUES (?, ?, ?, ?)",
+            (event_uri, ctime_dt.isoformat(), author, raw_json),
+        )
+        try:
+            from .claims import add_claim_history_txn, evidence_hash_from_raw, passes_complexity_gate, classify_evidence
+            from . import queue_stats
+            text = raw.get("text")
+            ext_links = raw.get("externalLinks") or []
+            embeds = raw.get("embeds") or []
+            facets = raw.get("facets") or []
+            if text and passes_complexity_gate(text, ext_links, embeds, facets):
+                evidence_hash = evidence_hash_from_raw(raw)
+                ev_class = classify_evidence(ext_links, embeds, facets)
+                fp, fp_kind = add_claim_history_txn(conn, author, text, ctime_dt.isoformat(), event_uri, raw.get("cid"), None, None, evidence_hash, ev_class)
+                queue_stats.inc("claims_written")
+                queue_stats.inc(f"kind:{fp_kind}")
+                has_link = bool(ext_links)
+                is_reply = bool(raw.get("replyRootUri") or raw.get("replyParentUri"))
+                if _fp_passes_enqueue_gate(fp, author, has_link, is_reply):
+                    _add_recheck_txn(conn, fp)
+                else:
+                    queue_stats.inc("enqueue_gated")
+        except Exception:
+            pass
+        return (True, False)
+
+    existing_raw = cur[0][0]
+    if existing_raw != raw_json:
+        now = timeutil.now_utc().isoformat()
+        conn.execute(
+            "INSERT INTO event_versions VALUES (?, ?, ?)",
+            (event_uri, now, existing_raw),
+        )
+        conn.execute(
+            "UPDATE events SET raw = ?, ctime = ?, author = ? WHERE event_uri = ?",
+            (raw_json, ctime_dt.isoformat(), author, event_uri),
+        )
+        try:
+            from .claims import add_claim_history_txn, evidence_hash_from_raw, passes_complexity_gate, classify_evidence
+            from . import queue_stats
+            text = raw.get("text")
+            ext_links = raw.get("externalLinks") or []
+            embeds = raw.get("embeds") or []
+            facets = raw.get("facets") or []
+            if text and passes_complexity_gate(text, ext_links, embeds, facets):
+                evidence_hash = evidence_hash_from_raw(raw)
+                ev_class = classify_evidence(ext_links, embeds, facets)
+                fp, fp_kind = add_claim_history_txn(conn, author, text, ctime_dt.isoformat(), event_uri, raw.get("cid"), None, None, evidence_hash, ev_class)
+                queue_stats.inc("claims_written")
+                queue_stats.inc(f"kind:{fp_kind}")
+                has_link = bool(ext_links)
+                is_reply = bool(raw.get("replyRootUri") or raw.get("replyParentUri"))
+                if _fp_passes_enqueue_gate(fp, author, has_link, is_reply):
+                    _add_recheck_txn(conn, fp)
+                else:
+                    queue_stats.inc("enqueue_gated")
+        except Exception:
+            pass
+        return (False, True)
+
+    return (False, False)
+
+
 def insert_event(event_uri: str, ctime: Union[str, int, float, datetime.datetime], author: str, raw: dict):
     """Insert or update an event.
 
@@ -347,85 +421,12 @@ def insert_event(event_uri: str, ctime: Union[str, int, float, datetime.datetime
     Returns a tuple (inserted: bool, updated: bool)
     """
     conn = get_conn()
-    raw_json = json.dumps(raw)
-    ctime_dt = timeutil.to_utc_datetime(ctime)
-
-    # check if exists
-    cur = conn.execute("SELECT raw, ctime FROM events WHERE event_uri = ?", (event_uri,)).fetchall()
-    if not cur:
-        conn.execute(
-            "INSERT INTO events VALUES (?, ?, ?, ?)",
-            (event_uri, ctime_dt.isoformat(), author, raw_json),
-        )
+    try:
+        result = insert_event_txn(conn, event_uri, ctime, author, raw)
         conn.commit()
-        # add claim history entry and enqueue fingerprint for recheck (complexity-gated + singleton-gated)
-        try:
-            from .claims import add_claim_history, evidence_hash_from_raw, passes_complexity_gate, classify_evidence
-            from . import queue_stats
-            text = raw.get("text")
-            ext_links = raw.get("externalLinks") or []
-            embeds = raw.get("embeds") or []
-            facets = raw.get("facets") or []
-            if text and passes_complexity_gate(text, ext_links, embeds, facets):
-                evidence_hash = evidence_hash_from_raw(raw)
-                ev_class = classify_evidence(ext_links, embeds, facets)
-                fp, fp_kind = add_claim_history(author, text, ctime_dt.isoformat(), event_uri, raw.get("cid"), None, None, evidence_hash, ev_class)
-                queue_stats.inc("claims_written")
-                queue_stats.inc(f"kind:{fp_kind}")
-                has_link = bool(ext_links)
-                is_reply = bool(raw.get("replyRootUri") or raw.get("replyParentUri"))
-                if _fp_passes_enqueue_gate(fp, author, has_link, is_reply):
-                    _add_recheck(conn, fp)
-                else:
-                    queue_stats.inc("enqueue_gated")
-        except Exception:
-            pass
+        return result
+    finally:
         conn.close()
-        return (True, False)
-
-    # existing: compare raw
-    existing_raw = cur[0][0]
-    if existing_raw != raw_json:
-        now = timeutil.now_utc().isoformat()
-        # store previous version
-        conn.execute(
-            "INSERT INTO event_versions VALUES (?, ?, ?)",
-            (event_uri, now, existing_raw),
-        )
-        # update events table
-        conn.execute(
-            "UPDATE events SET raw = ?, ctime = ?, author = ? WHERE event_uri = ?",
-            (raw_json, ctime_dt.isoformat(), author, event_uri),
-        )
-        conn.commit()
-        # on update, append new claim history version and enqueue fingerprint (complexity-gated + singleton-gated)
-        try:
-            from .claims import add_claim_history, evidence_hash_from_raw, passes_complexity_gate, classify_evidence
-            from . import queue_stats
-            text = raw.get("text")
-            ext_links = raw.get("externalLinks") or []
-            embeds = raw.get("embeds") or []
-            facets = raw.get("facets") or []
-            if text and passes_complexity_gate(text, ext_links, embeds, facets):
-                evidence_hash = evidence_hash_from_raw(raw)
-                ev_class = classify_evidence(ext_links, embeds, facets)
-                fp, fp_kind = add_claim_history(author, text, ctime_dt.isoformat(), event_uri, raw.get("cid"), None, None, evidence_hash, ev_class)
-                queue_stats.inc("claims_written")
-                queue_stats.inc(f"kind:{fp_kind}")
-                has_link = bool(ext_links)
-                is_reply = bool(raw.get("replyRootUri") or raw.get("replyParentUri"))
-                if _fp_passes_enqueue_gate(fp, author, has_link, is_reply):
-                    _add_recheck(conn, fp)
-                else:
-                    queue_stats.inc("enqueue_gated")
-        except Exception:
-            pass
-        conn.close()
-        return (False, True)
-
-    # identical payload -> no-op
-    conn.close()
-    return (False, False)
 
 
 RECHECK_QUEUE_MAX = int(os.getenv("RECHECK_QUEUE_MAX", "10000"))
@@ -493,12 +494,8 @@ def _fp_passes_enqueue_gate(fp: str, author_did: str, has_link: bool, is_reply: 
     return False
 
 
-def _add_recheck(conn, claim_fingerprint: str):
-    """Enqueue a claim fingerprint for recheck.
-
-    Uses INSERT OR IGNORE so duplicate fingerprints are naturally debounced —
-    the queue holds at most one entry per fingerprint at any time.
-    """
+def _add_recheck_txn(conn, claim_fingerprint: str):
+    """Transaction-scoped recheck enqueue. Uses passed conn, does not commit."""
     from . import queue_stats
     queue_stats.inc("enqueue_attempts")
     now = timeutil.now_utc().isoformat()
@@ -530,9 +527,26 @@ def _add_recheck(conn, claim_fingerprint: str):
         queue_stats.inc("enqueue_inserted")
     else:
         queue_stats.inc("enqueue_ignored")
-
     # Cap enforcement is handled by the recheck_queue_fp_cap trigger
+
+
+def _add_recheck(conn, claim_fingerprint: str):
+    """Enqueue a claim fingerprint for recheck and commit on the given conn.
+
+    Uses INSERT OR IGNORE so duplicate fingerprints are naturally debounced —
+    the queue holds at most one entry per fingerprint at any time.
+    """
+    _add_recheck_txn(conn, claim_fingerprint)
     conn.commit()
+
+
+def insert_edges_txn(conn, edges):
+    """Transaction-scoped edge insert. Uses passed conn, does not commit."""
+    if not edges:
+        return
+    conn.executemany(
+        "INSERT INTO edges VALUES (?, ?, ?, ?)", edges
+    )
 
 
 def insert_edges(edges):
@@ -540,11 +554,11 @@ def insert_edges(edges):
     if not edges:
         return
     conn = get_conn()
-    conn.executemany(
-        "INSERT INTO edges VALUES (?, ?, ?, ?)", edges
-    )
-    conn.commit()
-    conn.close()
+    try:
+        insert_edges_txn(conn, edges)
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def upsert_cursor(consumer: str, cursor: Optional[str]):
