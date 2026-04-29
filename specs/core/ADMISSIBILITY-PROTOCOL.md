@@ -2,7 +2,7 @@
 
 **Status**: short procedural artifact, not a doctrine essay.
 **Scope**: observatory claims built on observed cross-population skews.
-**Parent instance**: `docs/VINTAGE-ADMISSIBILITY.md` (hosting-locus / vintage).
+**Parent instance**: `../../docs/VINTAGE-ADMISSIBILITY.md` (hosting-locus / vintage).
 
 ## Purpose
 
@@ -113,7 +113,7 @@ protocol:
    is not stored.
 3. Confounds: account-creation vintage (cohort), activity bias, resolver
    coverage tail, staleness.
-4. Pre-registration: `docs/VINTAGE-ADMISSIBILITY.md` — eligibility
+4. Pre-registration: `../../docs/VINTAGE-ADMISSIBILITY.md` — eligibility
    filters, 100-DID sample floor, 5pp + 1.5× ratio-of-ratios effect
    floor, ≥2-bucket replication requirement.
 5. Control added: account-creation vintage bucket, via PLC /export
@@ -124,7 +124,7 @@ protocol:
    in ≥2 vintage buckets. `pds_host` remains operationally correct; the
    claim built on it did not survive control.
 
-Artifacts: `docs/VINTAGE-ADMISSIBILITY.md`, `out/admissibility/2026-04-21_findings.md`,
+Artifacts: `../../docs/VINTAGE-ADMISSIBILITY.md`, `out/admissibility/2026-04-21_findings.md`,
 `out/admissibility/2026-04-21_1847Z_vintage_admissibility.json`,
 `scripts/vintage_admissibility.py`, `src/labeler/vintage_buckets.py`.
 

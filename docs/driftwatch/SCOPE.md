@@ -2,6 +2,9 @@
 
 *An infotoxin observatory. Measuring information half-life and correction resistance in the wild.*
 
+> **For high-level orientation, start at [`docs/architecture/OVERVIEW.md`](../architecture/OVERVIEW.md).**
+> This document is the single-page summary: objects, output by stage, non-goals, data posture, queue semantics. The architecture tree expands each section into its own doc; this remains as the at-a-glance overview.
+
 ---
 
 ## Objects
@@ -42,7 +45,7 @@ Public labeler registration, live emission, appeals, governance. **Explicit deci
 ## Non-Goals (Stage 0–1)
 
 - No public label emission onto the ATProto network
-- No per-account scoring or "top offenders" views
+- No per-account scoring, "top offenders" views, or per-DID discourse-weather forecasts (volatility, risk class, behavioral prediction). Weather is aggregate system state; per-poster forecasting is dossier production. If the tables can answer dossier-shaped questions, the API still must not.
 - No raw text retention beyond ingest processing
 - No ML classifiers or LLM-in-the-loop decisions
 - No always-on production daemon (yet)
