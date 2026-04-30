@@ -33,13 +33,19 @@ EVENTS_RETENTION_SEC = int(os.getenv("EVENTS_RETENTION_SEC", str(7 * 86400)))  #
 EDGES_RETENTION_SEC = int(os.getenv("EDGES_RETENTION_SEC", str(14 * 86400)))   # 14d
 CLAIM_RETENTION_SEC = int(os.getenv("CLAIM_RETENTION_SEC", str(14 * 86400)))   # 14d
 
-# Batch sizes for UPDATE/DELETE to avoid holding locks too long
-STRIP_BATCH = int(os.getenv("RETENTION_STRIP_BATCH", "5000"))
-DELETE_BATCH = int(os.getenv("RETENTION_DELETE_BATCH", "5000"))
+# Batch sizes for UPDATE/DELETE — kept small so each chunk releases the
+# writer lock quickly. Retention competes with the persistent event-writer
+# thread (consumer.py) for the single SQLite write lock; large chunks
+# starve the writer, which then loses event batches to "database is locked".
+STRIP_BATCH = int(os.getenv("RETENTION_STRIP_BATCH", "1000"))
+DELETE_BATCH = int(os.getenv("RETENTION_DELETE_BATCH", "1000"))
 ARCHIVE_BATCH = 50_000
 
-# Sleep between batches to yield the DB lock to other writers (consumer, longitudinal)
-BATCH_SLEEP_SEC = float(os.getenv("RETENTION_BATCH_SLEEP_SEC", "2.0"))
+# Sleep between batches to yield the writer lock. Tuned long enough that
+# the persistent writer can drain a couple of its own batches between
+# retention chunks. Total pass time grows; that's acceptable — losing
+# events to lock-conflict is not.
+BATCH_SLEEP_SEC = float(os.getenv("RETENTION_BATCH_SLEEP_SEC", "5.0"))
 
 # Archive directory
 ARCHIVE_DIR = pathlib.Path(os.getenv(
@@ -297,12 +303,12 @@ def run_retention_once(conn=None):
         stats["claims_archived"] = -1
         stats["claims_pruned"] = -1
 
-    # 6. WAL checkpoint after bulk operations
-    try:
-        result = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-        stats["wal_checkpoint"] = {"busy": result[0], "log": result[1], "checkpointed": result[2]}
-    except Exception:
-        LOG.exception("WAL checkpoint failed")
+    # 6. WAL truncation is owned by the persistent writer thread (see
+    # consumer.py _maybe_wal_truncate). Retention's chunked DELETE/UPDATE
+    # batches make poor TRUNCATE candidates because they're contended; the
+    # writer's post-commit moment is the cleanest restart point. Calling
+    # TRUNCATE here would also be a single-writer-invariant violation —
+    # mutation paths must converge through the writer thread.
 
     # 6b. Incremental vacuum: reclaim freelist pages without needing temp space.
     # Only has effect if the DB was created/last-vacuumed with
@@ -361,6 +367,12 @@ def run_retention_once(conn=None):
     elapsed = time.monotonic() - t0
     LOG.info("retention pass complete in %.1fs: %s", elapsed,
              {k: v for k, v in stats.items() if k not in ("archive_files", "db_geometry")})
+    if elapsed > DEFAULT_INTERVAL_SEC:
+        LOG.warning(
+            "retention fell behind: pass took %.0fs > interval %ds — "
+            "passes will overlap, sustained writer contention likely",
+            elapsed, DEFAULT_INTERVAL_SEC,
+        )
 
     if own_conn:
         conn.close()

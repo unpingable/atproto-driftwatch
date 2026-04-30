@@ -8,6 +8,7 @@ Jetstream docs: https://docs.bsky.app/blog/jetstream
 
 import os
 import json
+import time
 import asyncio
 import logging
 from concurrent.futures import ThreadPoolExecutor
@@ -36,6 +37,13 @@ CURSOR_SAVE_INTERVAL = int(os.getenv("CURSOR_SAVE_INTERVAL", "500"))
 # most M seconds for the batch to fill. One commit per batch.
 BATCH_MAX_EVENTS = int(os.getenv("BATCH_MAX_EVENTS", "100"))
 BATCH_MAX_WAIT_S = float(os.getenv("BATCH_MAX_WAIT_S", "0.25"))
+
+# Writer-owned WAL truncate. The persistent writer thread calls
+# wal_checkpoint(TRUNCATE) on its own connection right after a successful
+# commit — that's the cleanest moment to attempt a WAL restart, since the
+# writer just released its frame and is least likely to be racing against
+# concurrent readers. Rate-limited so per-batch overhead is bounded.
+WAL_TRUNCATE_INTERVAL_S = float(os.getenv("WAL_TRUNCATE_INTERVAL_S", "30"))
 
 
 def _build_ws_url(base_url: str, cursor: Optional[str] = None) -> str:
@@ -169,6 +177,12 @@ class ATProtoConsumer:
             max_workers=1, thread_name_prefix="dw-writer"
         )
         self._writer_conn = None  # lazily opened inside the writer thread
+        self._last_wal_truncate_mono = 0.0  # writer thread only
+        # Counts events shed by the writer when a batch hits a write-lock
+        # conflict (e.g. retention holding the lock) and rolls back. Tracked
+        # alongside queue-overflow drops so the platform_health gate sees
+        # lock-conflict shedding too — a green recovery flag must not hide it.
+        self._events_lost_to_rollback = 0  # main thread only
 
     @staticmethod
     def _get_queue_depth() -> int:
@@ -191,9 +205,13 @@ class ATProtoConsumer:
 
         One transaction, one commit per batch. On any exception, rolls back
         the entire batch — we'd rather lose a batch than half-write it.
+
+        Returns (written, lost_to_rollback). lost_to_rollback is non-zero
+        only when the batch failed; it must count against intake health so
+        the platform_health gate sees lock-conflict shedding.
         """
         if not batch:
-            return 0
+            return (0, 0)
         conn = self._get_writer_conn()
         try:
             for ev in batch:
@@ -204,14 +222,42 @@ class ATProtoConsumer:
                 edges = extract_edges_from_event(ev)
                 insert_edges_txn(conn, edges)
             conn.commit()
-            return len(batch)
+            self._maybe_wal_truncate(conn)
+            return (len(batch), 0)
         except Exception:
             try:
                 conn.rollback()
             except Exception:
                 LOG.exception("rollback failed after batch error")
             LOG.exception("batch failed; rolled back %d events", len(batch))
-            return 0
+            return (0, len(batch))
+
+    def _maybe_wal_truncate(self, conn):
+        """Attempt PRAGMA wal_checkpoint(TRUNCATE) from the writer thread.
+
+        Called only from inside _process_batch after a successful commit —
+        the writer just released its frame, the least racy moment to attempt
+        a WAL restart. Rate-limited so the cost is bounded.
+
+        Logs only when the result is interesting (busy or non-trivial work
+        done); silent on the typical no-op case.
+        """
+        now = time.monotonic()
+        if now - self._last_wal_truncate_mono < WAL_TRUNCATE_INTERVAL_S:
+            return
+        self._last_wal_truncate_mono = now
+        try:
+            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+            if not row:
+                return
+            busy, log, ckpt = row
+            if busy or log >= 1000:
+                LOG.info(
+                    "wal_truncate: busy=%d log=%d checkpointed=%d",
+                    busy, log, ckpt,
+                )
+        except Exception:
+            LOG.debug("wal_truncate failed", exc_info=True)
 
     async def _drain_queue(self):
         """Background task that drains the event queue without blocking the WS read loop.
@@ -277,12 +323,17 @@ class ATProtoConsumer:
                             break
 
                 try:
-                    written = await loop.run_in_executor(
+                    written, lost = await loop.run_in_executor(
                         self._writer_executor, self._process_batch, batch
                     )
                 except Exception:
                     LOG.exception("failed to process batch")
-                    written = 0
+                    written, lost = 0, 0
+
+                if lost:
+                    # Database-locked rollbacks are intake loss; platform_health
+                    # must see them so the recovery gate cannot hide them.
+                    self._events_lost_to_rollback += lost
 
                 if written:
                     queue_stats.inc("events_in", written)
@@ -326,15 +377,20 @@ class ATProtoConsumer:
                     f"{k[0].upper()}:{round(100*v/total_kinds)}%"
                     for k, v in sorted(kind_counts.items())
                 ) or "n/a"
-                # Snapshot and reset drop counter (before record_window uses it)
+                # Snapshot and reset drop counters (before record_window uses them)
                 dropped = self._events_dropped
                 self._events_dropped = 0
+                rollback_lost = self._events_lost_to_rollback
+                self._events_lost_to_rollback = 0
+                # Both queue-overflow and lock-conflict rollbacks count as
+                # intake loss for health purposes.
+                total_lost = dropped + rollback_lost
 
                 # Platform health watermark
                 backlog = self._event_queue.qsize()
                 health_snap = platform_health.record_window(
                     snap["events_in"], snap["window_secs"], backlog,
-                    dropped=dropped,
+                    dropped=total_lost,
                 )
                 health_state = health_snap["health_state"]
                 coverage_str = (
@@ -371,7 +427,7 @@ class ATProtoConsumer:
                     "STATS window=%.0fs events_in=%d claims=%d "
                     "enq_attempt=%d enq_insert=%d enq_ignore=%d enq_gated=%d "
                     "dequeued=%d queue_depth=%d median_age=%.0fs backlog=%d "
-                    "dropped=%d "
+                    "dropped=%d rollback_lost=%d "
                     "kinds=%s coverage=%s health=%s baseline_eps=%.1f lag=%.1fs "
                     "disk=%s db=%s",
                     snap["window_secs"],
@@ -386,6 +442,7 @@ class ATProtoConsumer:
                     median_age,
                     backlog,
                     dropped,
+                    rollback_lost,
                     kinds_str,
                     coverage_str,
                     health_display,
