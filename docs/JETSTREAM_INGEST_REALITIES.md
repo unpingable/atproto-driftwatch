@@ -89,13 +89,37 @@ Result, immediate post-deploy:
 
 Recovery is not the same as resilience. Specifically:
 
-- **Recheck enqueue is back online** (`_fp_passes_enqueue_gate` was platform-gated during degradation). The `recheck_queue_depth` is now growing as the system catches up. If it runs away rather than plateaus, the recheck pipeline is the next bottleneck — watch it before declaring victory.
+- **Recheck enqueue came back online** (`_fp_passes_enqueue_gate` had been platform-gated during degradation). Through the 24h recovery horizon the queue caught up and stayed plateaued — recheck did not become the next bottleneck. That was an open question at fix-time, not at recovery-stamp time.
 - **Edges have no dedupe and no unique constraint.** The 12.5M edges table includes duplicates. Not a hot-path issue, but worth a deliberate swing later.
 - **Archives produced during the degraded window cannot be backfilled.** The shed events are gone. Stamp the window, condition any quantitative claims derived from it, and move on.
 
 ### What the fix decisively proved
 
 Naive ingest design — read event, write event, write claims, write edges, repeat — produces a self-shedding stream processor on first contact with a real firehose. **The naive design is not a starting point that gets refined; it's a design that silently fails under load while reporting health.** Persistent writer + batched transaction is not a performance optimization. It is correctness infrastructure for any labeler that intends to make claims about the world.
+
+### Recovery stamped 2026-04-29
+
+The fix landed 2026-04-28T09:23 UTC. Recovery was stamped ~27h later, after the criteria-with-horizon held the full 24h window.
+
+Criteria met:
+
+- `drop_frac < 0.05` sustained for 24h — held at **0.0** the entire window
+- `recheck_queue_depth` plateaued rather than ran away
+- No `batch failed` / rollback spam in writer thread logs (`docker compose logs --since 24h labeler` clean)
+- DB/WAL behavior sane at stamp time: WAL **64 MB**, no checkpoint stalls
+- `platform_health=ok`, no `gate_reasons`, `coverage_pct=0.9724`, `events_per_sec=100.5` vs `baseline_eps=103.4`
+- Disk pressure cleared as a separate VACUUM win (44.8% used, 108 GB free)
+
+Criterion deferred (not load-bearing for the 24h rule):
+
+- Archive day-files in `data/archive/claim_history/YYYY-MM-DD.jsonl.gz` returning to ~270 MB/day baseline. The retention pipeline writes archives ~14 days after the day, so the first archive from the recovered window (`2026-04-28.jsonl.gz`) lands ~**2026-05-12**. Until then this criterion is structurally untestable. After that date, if archives don't return to baseline, reopen.
+
+Residual follow-ups carried as non-blocking:
+
+- `facts_export work_size_mb` running ~2.4× snapshot size. By design — work DB is long-lived WAL with retention by `DELETE`; snapshot is `VACUUM INTO`-compacted. Could add `PRAGMA incremental_vacuum` if disk pressure returns. Not warranted now.
+- `resolver.pending` elevated (~332k vs 50k seeded 2026-03-19). Tracked under the resolver seed-queue draining work, not under this incident.
+
+The 2026-04-15..28 window remains loss-conditioned. Don't backfill, don't quote rates from it without flagging.
 
 ## Operational doctrine
 
@@ -110,6 +134,7 @@ These follow from the case but are not specific to it.
 ## Pointers
 
 - Fix commit: `2879058` (`consumer: batched writer thread + persistent SQLite conn`)
-- Watchlist & recovery criteria: `project_driftwatch_degraded_sampling_2026_04.md` (auto-memory, not in repo)
+- Closed incident record + recovery receipts: `project_driftwatch_degraded_sampling_2026_04.md` (auto-memory, not in repo)
+- Durable lesson extracted from this incident: `lesson_self_shedding_queue_boundary.md` (auto-memory)
 - Cross-constellation lesson: `lesson_operationally_up_epistemically_degraded.md` (auto-memory)
 - Normative invariants: `labeler/INGEST_INVARIANTS.md` in the reference labeler repo
