@@ -121,6 +121,24 @@ Residual follow-ups carried as non-blocking:
 
 The 2026-04-15..28 window remains loss-conditioned. Don't backfill, don't quote rates from it without flagging.
 
+### Reopened 2026-04-30: bucket migration
+
+The 2026-04-29 stamp was partially false. By 2026-04-30 the WAL had grown to 28 GB and disk was up ~20 GB/day. The investigation traced this to a **second-order failure** the original recovery vocabulary couldn't see: the batched-writer fix made the writer fast enough to fully compete with the retention loop for SQLite's single write lock. Retention's chunked DELETE/UPDATE batches (5000 rows, 2 s sleep) were running 21–30 minutes per pass on an hourly schedule — effectively continuous. The writer hit `database is locked` repeatedly; ~444 events on 2026-04-30 were lost to silent batch rollbacks. **`drop_frac` stayed at 0.0 because the rollback path had no instrumented bucket.**
+
+That last sentence is the durable lesson. A green recovery signal is structurally inadmissible if any known shedding path has no instrumented loss bucket, OR has a bucket that is currently zero only because the path is not being exercised. Health metrics are conditional admissions about observed buckets, not unconditional claims about reality. When a fix changes throughput characteristics, contention migrates — and so does shedding.
+
+**Containment landed 2026-04-30 (build `7398f7b`):**
+
+- `consumer.py`: `_process_batch` returns `(written, lost)`; lock-conflict rollbacks feed `platform_health` via the dropped bucket; STATS line gains `rollback_lost`. Writer thread runs `wal_checkpoint(TRUNCATE)` post-commit, rate-limited to once per 30 s.
+- `retention.py`: `STRIP_BATCH` and `DELETE_BATCH` lowered 5000 → 1000, `BATCH_SLEEP_SEC` raised 2.0 → 5.0, retention's own TRUNCATE call removed (writer owns it now), fell-behind warning added.
+- `specs/gaps/gap-spec-single-writer-invariant.md` filed: all DB mutations should converge through the persistent writer thread. Architectural follow-up, not implemented.
+
+**Containment evidence (2026-04-30T20:25Z):** WAL 28 GB → 6 MB; `batch failed` lines since deploy: 0; `rollback_lost` per window: 0; `drop_frac`: 0.0 (now under buckets that include lock-conflict). Coverage 100% honest *under observed buckets*.
+
+**Cost paid by the bloat itself:** the 28 GB WAL took ~16 minutes of restart downtime to replay/checkpoint into the main DB on first SQLite open after deploy. The growth was not cosmetic; it had operational consequence the next time the process restarted.
+
+**Status: contained, not closed.** The retention pass that completed at 2026-04-30T20:20Z reported -1 sentinels (contaminated by restart/catchup chaos). The first meaningful post-fix retention validation is the next pass at ~2026-04-30T21:20+ UTC. Until that pass lands clean, recovery is parole, not exoneration.
+
 ## Operational doctrine
 
 These follow from the case but are not specific to it.
@@ -130,6 +148,8 @@ These follow from the case but are not specific to it.
 - **Mark degraded windows.** Don't let them blend into history. Future readers (you, in a month) need to know which artifacts come from sampling rather than coverage.
 - **Recovery requires sustained criteria, not a snapshot.** A clean `drop_frac=0.0` two minutes after a deploy is not recovery. The earlier degradation note stays open until the criteria-with-horizon are met.
 - **VACUUM exposes throughput problems that storage slack was hiding.** This is a feature, not a bug. Plan for the post-VACUUM throughput surprise, not just the post-VACUUM disk-size win.
+- **Recovery is parole, not exoneration.** A green recovery signal is invalid if any known shedding path lacks an instrumented bucket. When a fix changes throughput characteristics, audit for bucket migration — the loss may have moved, not stopped. Coverage and `drop_frac` are conditional admissions about observed buckets; the bucket vocabulary itself must be on the parole list.
+- **WAL growth is operational, not cosmetic.** A bloated WAL costs restart-recovery time linear in WAL size. Letting it grow defers cost to your next deploy or crash, when you can least afford it.
 
 ## Pointers
 
