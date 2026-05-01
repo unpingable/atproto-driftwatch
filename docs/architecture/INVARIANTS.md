@@ -26,6 +26,8 @@ If a future change wants to relax one of these, the right move is to read the *f
 
 **Where it lives.** `consumer.ATProtoConsumer.submit_mutation` (the gate); `retention.run_retention_once_async` (a routed mutation path); `specs/gaps/gap-spec-single-writer-invariant.md`; commit `5850d01`.
 
+**Scar (2026-05-01).** `5850d01` validated the *need* for the single-writer invariant but failed the *scheduling* requirement. Retention chunks of 5000 rows held the writer thread for 30–65 seconds each, blocking the consumer's batches. The ingest queue overflowed; `drop_frac` hit 67%. Loss migrated *again* — from `database is locked` rollbacks (had a bucket: `rollback_lost`) to plain `QueueFull` queue overflow. Retention disabled in production via env override; next build needs work-class priority (ingest > maintenance) and per-chunk wall-time budgets so a single maintenance chunk can't monopolize the writer. Single writer is necessary, not sufficient.
+
 ---
 
 ### 2. Batching is correctness infrastructure
