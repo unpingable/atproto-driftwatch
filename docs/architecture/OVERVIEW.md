@@ -99,6 +99,7 @@ Coverage claims must specify which population. "0.2% coverage" was a real bug fr
 | How does data flow through? | `DATAFLOW.md` (TODO) |
 | What's the boundary against poster surveillance? | `PUBLIC_SURFACES.md` (TODO) |
 | What does the architecture already know can go wrong? | `FAILURE_MODES.md` (TODO) |
+| What rules has runtime forced us to write down? | `INVARIANTS.md` |
 | What's the scope and stage gating? | `../driftwatch/SCOPE.md` |
 | Where to find code for what concept? | `../../THEORY_TO_CODE.md` |
 | What's deferred / non-runtime? | `../../DESIGN_NOTES.md` |
