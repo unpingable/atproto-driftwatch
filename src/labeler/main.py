@@ -13,6 +13,7 @@ from .consumer import ATProtoConsumer
 app = FastAPI(title="Bluesky Labeler MVP")
 
 _consumer_task = None
+_consumer_instance = None
 _label_ingest_task = None
 
 
@@ -25,7 +26,8 @@ async def startup_event():
     if os.getenv("FIREHOSE_AUTO_START") == "1":
         loop = asyncio.get_event_loop()
         consumer = ATProtoConsumer()
-        global _consumer_task
+        global _consumer_task, _consumer_instance
+        _consumer_instance = consumer
         _consumer_task = loop.create_task(consumer.run())
 
     # Optionally start periodic label ingestion when env var is set
@@ -54,11 +56,13 @@ async def startup_event():
         loop = asyncio.get_event_loop()
         loop.create_task(_maint())
 
-    # Retention loop (strip raw JSON, prune old rows)
+    # Retention loop (strip raw JSON, prune old rows). When the consumer
+    # is running, route retention's mutations through its writer thread to
+    # honor the single-writer invariant (no lock contention with ingest).
     if os.environ.get("ENABLE_RETENTION", "").lower() in ("1", "true"):
         from .retention import run_periodic as _ret
         loop = asyncio.get_event_loop()
-        loop.create_task(_ret())
+        loop.create_task(_ret(consumer=_consumer_instance))
 
 
 @app.on_event("shutdown")

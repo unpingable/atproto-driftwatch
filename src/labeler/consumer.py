@@ -232,6 +232,39 @@ class ATProtoConsumer:
             LOG.exception("batch failed; rolled back %d events", len(batch))
             return (0, len(batch))
 
+    async def submit_mutation(self, fn, *args, **kwargs):
+        """Submit a mutation job to run inside the writer thread.
+
+        Single-writer invariant: any code that mutates the labeler DB
+        outside of event-batch processing must route through this method.
+        The writer executor serializes mutation jobs with event-batch jobs
+        (one _process_batch or one mutation runs at a time, never both).
+
+        fn signature: ``fn(writer_conn, *args, **kwargs) -> result``. Runs
+        in self._writer_executor and returns the result via awaitable.
+
+        The writer connection is shared and persistent. fn must:
+          * call conn.commit() (or rollback) before returning
+          * leave the connection in autocommit-ish state (no dangling txn)
+          * not close the connection
+        """
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(
+            self._writer_executor, self._run_mutation, fn, args, kwargs
+        )
+
+    def _run_mutation(self, fn, args, kwargs):
+        """Run a mutation job inside the writer thread."""
+        conn = self._get_writer_conn()
+        return fn(conn, *args, **kwargs)
+
+    def get_ingest_backlog(self) -> int:
+        """Current ingest queue depth. Background mutation paths (e.g.
+        retention) read this for cooperative scheduling — yield more
+        aggressively when ingest is under pressure.
+        """
+        return self._event_queue.qsize()
+
     def _maybe_wal_truncate(self, conn):
         """Attempt PRAGMA wal_checkpoint(TRUNCATE) from the writer thread.
 

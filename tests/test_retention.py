@@ -10,9 +10,15 @@ import pytest
 from labeler import retention
 
 
-def _make_db():
-    """Create an in-memory DB with the tables retention operates on."""
-    conn = sqlite3.connect(":memory:")
+def _make_db(path=":memory:"):
+    """Create a DB with the tables retention operates on.
+
+    Default in-memory; pass a file path for tests that need multiple
+    connections to see the same data (e.g. the writer-thread path).
+    check_same_thread=False so connections can be shared across the
+    asyncio default executor's threads.
+    """
+    conn = sqlite3.connect(path, check_same_thread=False)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("""
         CREATE TABLE events (
@@ -397,3 +403,155 @@ class TestEnvOverrides:
 
         n = retention._prune_table(conn, "events", "ctime", retention.EVENTS_RETENTION_SEC)
         assert n == 1
+
+
+# --- Writer-thread path tests (single-writer invariant) ---
+
+class _StubConsumer:
+    """Minimal stand-in for ATProtoConsumer.
+
+    submit_mutation runs the callable synchronously on a real connection,
+    serializing through the test's event loop. get_ingest_backlog is fixed.
+    """
+
+    def __init__(self, conn, backlog=0):
+        self._conn = conn
+        self._backlog = backlog
+
+    async def submit_mutation(self, fn, *args, **kwargs):
+        return fn(self._conn, *args, **kwargs)
+
+    def get_ingest_backlog(self):
+        return self._backlog
+
+
+def _setup_writer_path_db(tmp_path, monkeypatch):
+    """Set up a file-backed DB and monkey-patch get_conn so the async
+    retention path's short-lived read connections see the same data.
+    Returns (writer_conn, db_path)."""
+    db_path = str(tmp_path / "writer-path.sqlite")
+    conn = _make_db(db_path)
+    from labeler import db as _db
+
+    def _fresh_conn():
+        rc = sqlite3.connect(db_path, check_same_thread=False)
+        rc.execute("PRAGMA journal_mode=WAL")
+        return rc
+
+    monkeypatch.setattr(_db, "get_conn", _fresh_conn)
+    return conn, db_path
+
+
+class TestRunRetentionOnceAsync:
+    def test_strips_via_writer_thread(self, tmp_path, monkeypatch):
+        import asyncio
+
+        monkeypatch.setattr(retention, "ARCHIVE_DIR", tmp_path)
+        monkeypatch.setattr(retention, "STRIP_BATCH", 2)
+        monkeypatch.setattr(retention, "BATCH_SLEEP_SEC", 0.0)
+
+        conn, _ = _setup_writer_path_db(tmp_path, monkeypatch)
+        for i in range(5):
+            conn.execute(
+                "INSERT INTO events VALUES (?, ?, ?, ?)",
+                (f"at://u/post/{i}", _iso(-48 * 3600), "did:a", f'{{"x":{i}}}'),
+            )
+        conn.commit()
+
+        consumer = _StubConsumer(conn)
+        stats = asyncio.run(retention.run_retention_once_async(consumer))
+
+        assert stats["raw_stripped"] == 5
+        assert stats["raw_stripped_chunks"]["failed"] == 0
+        assert stats["raw_stripped_chunks"]["completed"] >= 3  # ceil(5/2) chunks
+
+        # Verify all rows actually stripped
+        nulls = conn.execute(
+            "SELECT COUNT(*) FROM events WHERE raw IS NULL"
+        ).fetchone()[0]
+        assert nulls == 5
+
+    def test_prunes_events_and_edges_via_writer_thread(self, tmp_path, monkeypatch):
+        import asyncio
+
+        monkeypatch.setattr(retention, "ARCHIVE_DIR", tmp_path)
+        monkeypatch.setattr(retention, "DELETE_BATCH", 2)
+        monkeypatch.setattr(retention, "BATCH_SLEEP_SEC", 0.0)
+
+        conn, _ = _setup_writer_path_db(tmp_path, monkeypatch)
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO events VALUES (?, ?, ?, ?)",
+                (f"at://e/{i}", _iso(-10 * 86400), "did:a", None),
+            )
+        for i in range(4):
+            conn.execute(
+                "INSERT INTO edges VALUES (?, ?, ?, ?)",
+                ("did:a", f"did:b{i}", "reply", _iso(-30 * 86400)),
+            )
+        conn.commit()
+
+        consumer = _StubConsumer(conn)
+        stats = asyncio.run(retention.run_retention_once_async(consumer))
+
+        assert stats["events_pruned"] == 3
+        assert stats["edges_pruned"] == 4
+        assert stats["events_pruned_chunks"]["failed"] == 0
+        assert stats["edges_pruned_chunks"]["failed"] == 0
+
+    def test_honest_stats_under_chunk_failure(self, tmp_path, monkeypatch):
+        """A failing chunk increments failed counter; no -1 sentinels.
+
+        Under the single-writer invariant, lock conflicts should not happen
+        in steady state — the writer thread is the sole writer. So a
+        chunk_failed > 0 is a real signal (cron overlap, CLI conflict, bug)
+        rather than a transient. The current design honors that by ending
+        the op on first failure (n=0 < BATCH triggers loop exit), with
+        chunks_failed as the honest counter.
+        """
+        import asyncio
+
+        monkeypatch.setattr(retention, "ARCHIVE_DIR", tmp_path)
+        monkeypatch.setattr(retention, "STRIP_BATCH", 5)
+        monkeypatch.setattr(retention, "BATCH_SLEEP_SEC", 0.0)
+
+        conn, _ = _setup_writer_path_db(tmp_path, monkeypatch)
+        for i in range(10):
+            conn.execute(
+                "INSERT INTO events VALUES (?, ?, ?, ?)",
+                (f"at://x/{i}", _iso(-48 * 3600), "did:a", '{"x":1}'),
+            )
+        conn.commit()
+
+        # First chunk raises; remaining iterations don't run because the
+        # loop exits when n < STRIP_BATCH (n=0 in the except branch).
+        def always_fails(conn, cutoff_iso):
+            raise RuntimeError("simulated lock conflict")
+
+        monkeypatch.setattr(retention, "_strip_raw_chunk", always_fails)
+
+        consumer = _StubConsumer(conn)
+        stats = asyncio.run(retention.run_retention_once_async(consumer))
+
+        chunks = stats["raw_stripped_chunks"]
+        assert chunks["failed"] == 1
+        assert chunks["attempted"] == 1
+        assert chunks["completed"] == 0
+        assert stats["raw_stripped"] == 0
+        # No negative sentinels in any int field.
+        for k, v in stats.items():
+            if isinstance(v, int):
+                assert v >= 0, f"{k} should not be negative; got {v}"
+
+    def test_adaptive_sleep_respects_backlog(self, monkeypatch):
+        """High backlog -> longer sleep. Low backlog -> base sleep."""
+        monkeypatch.setattr(retention, "BATCH_SLEEP_SEC", 1.0)
+        monkeypatch.setattr(retention, "BACKLOG_MED", 100)
+        monkeypatch.setattr(retention, "BACKLOG_HIGH", 500)
+
+        assert retention._adaptive_sleep(lambda: 0) == 1.0
+        assert retention._adaptive_sleep(lambda: 50) == 1.0
+        assert retention._adaptive_sleep(lambda: 200) == 2.0
+        assert retention._adaptive_sleep(lambda: 1000) == 4.0
+        # None get_backlog falls back to base
+        assert retention._adaptive_sleep(None) == 1.0
