@@ -24,6 +24,8 @@ Items deferred from in-flight work. Each entry is filed because forgetting it wo
 
 **Tripwire that escalates this from candidate to required:** any second incident where writer enters sustained kernel I/O wait under normal (non-burst) load.
 
+**Architectural answer filed:** see `specs/gaps/gap-spec-cold-path-parquet-duckdb.md` (filed 2026-05-05). Phased plan to move read-heavy and historical workloads to Parquet/DuckDB while SQLite stays the hot operational store. Most of the bullets above (fewer connections, controlled read concurrency, /health caching, facts/snapshot replication, I/O budgets) are subsumed once Phases 1–6 land.
+
 ---
 
 ## 2026-05-05 (late evening) — longitudinal recheck queue saturation
