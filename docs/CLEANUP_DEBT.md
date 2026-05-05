@@ -4,6 +4,45 @@ Items deferred from in-flight work. Each entry is filed because forgetting it wo
 
 ---
 
+## 2026-05-05 (late evening) — workload contention on marginal storage
+
+**Where:** architecture, not one file.
+
+**Today:** during the retention re-enable evening, the writer thread entered kernel `D`-state on `wait_on_page_bit_common` — page-cache miss on the 93 GB DB. With ~10 SQLite connections open from one process (consumer writer, retention own-conn, longitudinal worker, facts_export source, recheck queries, /health endpoints, etc.), concurrent I/O on the Linode 8 GB / shared block-storage backend serialized at the kernel level. Drops climbed to 99% briefly before recovering when the burst subsided.
+
+**The diagnosis:** *this is no longer SQLite lock contention. This is SQLite workload contention on marginal storage.* All the lock-level fixes from April (single-writer, batched commits, writer-owned WAL truncate) and May (pressure-aware retention scheduler) are correct AND insufficient. The next architectural axis is the storage layer.
+
+**Want (any one of, in priority order):**
+- **Fewer SQLite connections** — collapse the per-subsystem connection pool. Each loop opens its own; many of those reads could share a single read pool. The /health endpoint queries especially should not open fresh connections per request.
+- **Controlled read concurrency** — semaphore around the read path so the writer isn't competing with N readers for kernel page cache.
+- **Health endpoints don't open fresh DB snapshots casually** — make `/health/extended` cache its DB-derived fields with a short TTL. Today every external poll reaches into SQLite.
+- **facts_export against a snapshot/replica**, not the live DB. Today its source connection reads the live labeler.sqlite and pins WAL frames.
+- **Retention and longitudinal as I/O-budgeted jobs** — explicit IOPS budget per loop, not just lock-time budget.
+- **Block-storage reality admitted as a first-class constraint** in the design doctrine — a doc that says "this DB is bigger than RAM, lives on shared volumes, every concurrent reader competes for the OS page cache."
+
+**Why not now:** real architectural work spanning multiple subsystems. Tonight the writer recovered when the post-restart catch-up burst subsided; not an incident demanding immediate code change. But this is the *next* architectural surface to ratify, not the same scheduler debt.
+
+**Tripwire that escalates this from candidate to required:** any second incident where writer enters sustained kernel I/O wait under normal (non-burst) load.
+
+---
+
+## 2026-05-05 (late evening) — longitudinal recheck queue saturation
+
+**Where:** `longitudinal.py`, `/health/extended.queue_depth`.
+
+**Today:** `queue_depth` (recheck_queue row count) has been pinned at **~10,101** through tonight's session. The longitudinal worker is dequeuing zero rows per STATS window (`dequeued=0`). Median dequeue age is ~3394 s — work that should have been processed an hour ago is still queued.
+
+This is **not a tonight problem** — it's been latent for weeks. Tonight just made it visible because we were watching pressure signals carefully.
+
+**Want:** separate cleanup/degradation track. Longitudinal isn't ingest-critical (its outputs feed downstream label decisions, not raw event capture), but if it stays at zero progress indefinitely, fingerprints aren't being rechecked, which is the whole point. Investigate:
+- Is the longitudinal worker actually running? (Tonight we saw it failing on the same `database is locked` errors as retention.)
+- If running, why is dequeued=0? Lock starvation against the writer thread? Worker logic bug?
+- Is the recheck_queue itself sized wrong (10k cap reached, then no flow)?
+
+**Why not now:** distinct system from tonight's retention scheduler work; needs its own diagnostic pass. Park it as a track, don't blend it with retention debt.
+
+---
+
 ## 2026-05-05 — retention scheduler follow-ups
 
 Filed during the retention re-enable + scheduler deploy. The scheduler is doing its job (zero `rollback_lost`, zero `drop_frac` across multiple aborted passes), but observation surfaced known shortcuts.
