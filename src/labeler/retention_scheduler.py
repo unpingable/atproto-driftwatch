@@ -40,9 +40,19 @@ LOG = logging.getLogger("labeler.retention.scheduler")
 # Pre-pass and per-chunk gates. Defaults chosen so that retention runs
 # during typical conditions (~1k–2k backlog windows seen in prod) but
 # bails as soon as the writer is fighting for headroom.
+#
+# NOTE on median_age: an earlier draft gated on
+# ``median_dequeue_age_secs``, but that gauge measures the longitudinal
+# recheck queue's lag — not the live ingest queue's lag. In prod that
+# gauge sits at 800–8500 s as a steady state because longitudinal is
+# perpetually behind; gating retention on it would skip every pass for
+# reasons that have nothing to do with ingest pressure. The signal is
+# still surfaced in ``current_pressure`` for observability, but the
+# scheduler does not gate on it. If we ever instrument live-queue
+# median age (events waiting in self._event_queue before the writer
+# pulls them), wire that in instead.
 QUEUE_BACKLOG_THRESHOLD = int(os.getenv("RETENTION_BACKLOG_THRESHOLD", "1500"))
 QUEUE_DEPTH_THRESHOLD = int(os.getenv("RETENTION_QUEUE_DEPTH_THRESHOLD", "10000"))
-MEDIAN_AGE_THRESHOLD_S = float(os.getenv("RETENTION_MEDIAN_AGE_THRESHOLD_S", "120"))
 STREAM_LAG_THRESHOLD_S = float(os.getenv("RETENTION_STREAM_LAG_THRESHOLD_S", "60"))
 
 # Wall-clock budgets.
@@ -361,7 +371,6 @@ class RetentionScheduler:
             "thresholds": {
                 "backlog": QUEUE_BACKLOG_THRESHOLD,
                 "queue_depth": QUEUE_DEPTH_THRESHOLD,
-                "median_age_s": MEDIAN_AGE_THRESHOLD_S,
                 "stream_lag_s": STREAM_LAG_THRESHOLD_S,
                 "chunk_budget_s": CHUNK_BUDGET_S,
                 "pass_budget_s": PASS_BUDGET_S,
@@ -418,9 +427,6 @@ class RetentionScheduler:
         backlog = snap.get("backlog", 0) or 0
         if backlog > QUEUE_BACKLOG_THRESHOLD:
             return f"backlog={backlog}>{QUEUE_BACKLOG_THRESHOLD}"
-        median_age = snap.get("median_dequeue_age_s", 0.0) or 0.0
-        if median_age > MEDIAN_AGE_THRESHOLD_S:
-            return f"median_age={median_age:.0f}s>{MEDIAN_AGE_THRESHOLD_S:.0f}s"
         stream_lag = snap.get("stream_lag_s", 0.0) or 0.0
         if stream_lag > STREAM_LAG_THRESHOLD_S:
             return f"stream_lag={stream_lag:.0f}s>{STREAM_LAG_THRESHOLD_S:.0f}s"

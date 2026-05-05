@@ -86,7 +86,6 @@ class TestPrePassGate:
         "field,value,expected_marker",
         [
             ("backlog", 9999, "backlog"),
-            ("median_dequeue_age_s", 999.0, "median_age"),
             ("stream_lag_s", 999.0, "stream_lag"),
         ],
     )
@@ -131,6 +130,26 @@ class TestPrePassGate:
         assert "aborted" not in stats
         assert sched.skipped_due_to_pressure == 0
         assert sched.last_pass["completed"] is True
+
+    def test_high_median_age_does_not_gate(self, tmp_path, monkeypatch):
+        """median_dequeue_age_s measures longitudinal recheck lag, not
+        live ingest queue lag. The scheduler must NOT gate on it.
+        """
+        monkeypatch.setattr(retention, "ARCHIVE_DIR", tmp_path)
+        conn = _make_db()
+        conn.execute(
+            "INSERT INTO events VALUES (?, ?, ?, ?)",
+            ("at://x/1", _iso(-48 * 3600), "did:a", '{"x":1}'),
+        )
+        conn.commit()
+
+        # 8520s = 142 minutes — typical prod value with longitudinal behind.
+        stub = _PressureStub(backlog=10, median_dequeue_age_s=8520.0)
+        sched = RetentionScheduler(consumer=stub, sleep_between_s=0)
+        stats = retention.run_retention_once_with_sched(sched, conn=conn)
+
+        assert stats["raw_stripped"] == 1
+        assert sched.skipped_due_to_pressure == 0
 
 
 # ----------------------------------------------------------------------
