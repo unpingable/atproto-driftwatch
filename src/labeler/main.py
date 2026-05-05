@@ -56,13 +56,25 @@ async def startup_event():
         loop = asyncio.get_event_loop()
         loop.create_task(_maint())
 
-    # Retention loop (strip raw JSON, prune old rows). When the consumer
-    # is running, route retention's mutations through its writer thread to
-    # honor the single-writer invariant (no lock contention with ingest).
+    # Retention loop (strip raw JSON, prune old rows). Retention runs on
+    # its own SQLite write connection — pressure-aware scheduler in
+    # retention_scheduler.py gates passes against ingest backlog and
+    # uses rollback_lost as a tripwire. The 5850d01 attempt to route
+    # retention through the writer thread failed acceptance under load
+    # and is preserved as a documented scar in the gap-spec footer.
     if os.environ.get("ENABLE_RETENTION", "").lower() in ("1", "true"):
-        from .retention import run_periodic as _ret
+        from .retention import run_periodic as _ret, BATCH_SLEEP_SEC
+        from .retention_scheduler import RetentionScheduler, NullScheduler
+        if _consumer_instance is not None:
+            sched = RetentionScheduler(
+                consumer=_consumer_instance,
+                sleep_between_s=BATCH_SLEEP_SEC,
+            )
+        else:
+            sched = NullScheduler(sleep_between_s=BATCH_SLEEP_SEC)
+        app.state.retention_scheduler = sched
         loop = asyncio.get_event_loop()
-        loop.create_task(_ret(consumer=_consumer_instance))
+        loop.create_task(_ret(consumer=_consumer_instance, scheduler=sched))
 
 
 @app.on_event("shutdown")
@@ -213,6 +225,17 @@ async def health_extended():
         result["capabilities"] = capabilities
     if disk_info is not None:
         result["disk"] = disk_info
+
+    # Retention scheduler state (if ENABLE_RETENTION is on, the loop has
+    # constructed one; otherwise this key is absent). The scheduler's own
+    # state field rolls up into the top-level `platform_health` only when
+    # disk runway turns critical — see RetentionScheduler.health_state.
+    retention_state = getattr(app.state, "retention_scheduler", None)
+    if retention_state is not None:
+        try:
+            result["retention"] = retention_state.health_state()
+        except Exception:
+            pass
     return result
 
 

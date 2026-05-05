@@ -182,7 +182,12 @@ class ATProtoConsumer:
         # conflict (e.g. retention holding the lock) and rolls back. Tracked
         # alongside queue-overflow drops so the platform_health gate sees
         # lock-conflict shedding too — a green recovery flag must not hide it.
-        self._events_lost_to_rollback = 0  # main thread only
+        self._events_lost_to_rollback = 0  # main thread only; reset per window
+        # Cumulative cousins — never reset. The retention scheduler reads
+        # these as a tripwire: any non-zero delta during a retention pass
+        # means the scheduler is too aggressive and the pass must abort.
+        self._rollback_lost_total = 0
+        self._events_dropped_total = 0
 
     @staticmethod
     def _get_queue_depth() -> int:
@@ -264,6 +269,39 @@ class ATProtoConsumer:
         aggressively when ingest is under pressure.
         """
         return self._event_queue.qsize()
+
+    def get_pressure_snapshot(self) -> dict:
+        """All pressure signals retention reads, sampled at one moment.
+
+        ``rollback_lost_total`` and ``events_dropped_total`` are cumulative
+        and never reset, so the retention scheduler can detect any delta
+        during a pass — that's the tripwire that says "the scheduler is
+        too aggressive, fall back."
+        """
+        backlog = self._event_queue.qsize()
+        try:
+            queue_max = self._event_queue.maxsize
+        except Exception:
+            queue_max = 0
+        try:
+            from . import queue_stats as _qs
+            median_age = _qs._gauges.get("median_dequeue_age_secs", 0.0)
+        except Exception:
+            median_age = 0.0
+        try:
+            from . import platform_health as _ph
+            health_snap = _ph.get_health_snapshot()
+            stream_lag_s = health_snap.get("stream_lag_s", 0.0) or 0.0
+        except Exception:
+            stream_lag_s = 0.0
+        return {
+            "backlog": backlog,
+            "queue_max": queue_max,
+            "median_dequeue_age_s": float(median_age),
+            "stream_lag_s": float(stream_lag_s),
+            "rollback_lost_total": self._rollback_lost_total,
+            "events_dropped_total": self._events_dropped_total,
+        }
 
     def _maybe_wal_truncate(self, conn):
         """Attempt PRAGMA wal_checkpoint(TRUNCATE) from the writer thread.
@@ -367,6 +405,7 @@ class ATProtoConsumer:
                     # Database-locked rollbacks are intake loss; platform_health
                     # must see them so the recovery gate cannot hide them.
                     self._events_lost_to_rollback += lost
+                    self._rollback_lost_total += lost
 
                 if written:
                     queue_stats.inc("events_in", written)
@@ -545,6 +584,7 @@ class ATProtoConsumer:
             self._event_queue.put_nowait(ev)
         except asyncio.QueueFull:
             self._events_dropped += 1
+            self._events_dropped_total += 1
 
     async def run(self):
         """Connect to Jetstream and process messages with reconnect resilience."""

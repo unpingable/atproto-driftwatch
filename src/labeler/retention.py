@@ -13,6 +13,20 @@ Timestamp trust: claim_history uses COALESCE(observed_at, createdAt) for
 retention cutoffs. observed_at is set by our insert path (trusted wall clock);
 createdAt comes from the firehose (untrusted but usually fine). Legacy rows
 without observed_at fall back to createdAt.
+
+Architecture
+------------
+Retention runs on its own SQLite write connection — it does **not** route
+through the consumer's writer thread. The 5850d01 attempt at writer-thread
+routing (commit ``5850d01``, see ``specs/gaps/gap-spec-single-writer-invariant.md``
+footer) failed acceptance under firehose load. The async writer-thread
+helpers below remain in the file as documented historical scar but are not
+wired into ``run_periodic`` from production.
+
+Pressure-aware scheduling lives in ``retention_scheduler.py``. The leaves
+below take an optional ``scheduler`` argument; ``NullScheduler`` is the
+default, giving the same shape as the legacy code. ``run_periodic`` builds
+a ``RetentionScheduler`` when a consumer is provided.
 """
 
 import asyncio
@@ -67,69 +81,67 @@ _CLAIM_COLS = (
 )
 
 
-def _strip_old_raw(conn):
+def _strip_old_raw(conn, scheduler=None):
     """NULL out events.raw for events older than RAW_STRIP_AGE_SEC.
 
     Batched to avoid long-held write locks. Returns total rows stripped.
+    Pass a ``RetentionScheduler`` to enable pressure-aware gating; the
+    default ``NullScheduler`` gives legacy behavior.
     """
+    if scheduler is None:
+        from .retention_scheduler import NullScheduler
+        scheduler = NullScheduler(sleep_between_s=BATCH_SLEEP_SEC)
     cutoff = time.time() - RAW_STRIP_AGE_SEC
     cutoff_iso = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(cutoff))
     total = 0
-
     while True:
-        c = conn.execute(
-            "UPDATE events SET raw = NULL "
-            "WHERE rowid IN ("
-            "  SELECT rowid FROM events "
-            "  WHERE raw IS NOT NULL AND ctime < ? "
-            "  LIMIT ?"
-            ")",
-            (cutoff_iso, STRIP_BATCH),
-        )
-        n = c.rowcount
+        scheduler.before_chunk("raw_strip")
+        t0 = time.monotonic()
+        n = _strip_raw_chunk(conn, cutoff_iso)
+        elapsed = time.monotonic() - t0
+        scheduler.after_chunk("raw_strip", elapsed, n)
         total += n
-        conn.commit()
         if n < STRIP_BATCH:
             break
-        # Yield the DB lock so other writers can get through
-        time.sleep(BATCH_SLEEP_SEC)
-
+        scheduler.sleep_between_chunks()
     return total
 
 
-def _prune_table(conn, table, time_col, retention_sec):
+def _prune_table(conn, table, time_col, retention_sec, scheduler=None):
     """Delete rows older than retention window. Returns rows deleted."""
+    if scheduler is None:
+        from .retention_scheduler import NullScheduler
+        scheduler = NullScheduler(sleep_between_s=BATCH_SLEEP_SEC)
     cutoff = time.time() - retention_sec
     cutoff_iso = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(cutoff))
     total = 0
-
+    op_label = f"prune_{table}"
     while True:
-        c = conn.execute(
-            f"DELETE FROM {table} "
-            f"WHERE rowid IN ("
-            f"  SELECT rowid FROM {table} "
-            f"  WHERE {time_col} < ? "
-            f"  LIMIT ?"
-            f")",
-            (cutoff_iso, DELETE_BATCH),
-        )
-        n = c.rowcount
+        scheduler.before_chunk(op_label)
+        t0 = time.monotonic()
+        n = _prune_table_chunk(conn, table, time_col, cutoff_iso, DELETE_BATCH)
+        elapsed = time.monotonic() - t0
+        scheduler.after_chunk(op_label, elapsed, n)
         total += n
-        conn.commit()
         if n < DELETE_BATCH:
             break
-        time.sleep(BATCH_SLEEP_SEC)
-
+        scheduler.sleep_between_chunks()
     return total
 
 
-def _archive_claim_history(conn) -> dict:
+def _archive_claim_history(conn, scheduler=None) -> dict:
     """Archive old claim_history rows to gzipped JSONL, then delete.
 
     Uses COALESCE(observed_at, createdAt) as the retention timestamp.
     Archives one day at a time for partitioned files.
     Returns {"archived": N, "deleted": N, "files": [...]}
+
+    The scheduler is consulted before starting each day's read+write (a
+    gzip blob, atomic in spirit) and before each delete chunk.
     """
+    if scheduler is None:
+        from .retention_scheduler import NullScheduler
+        scheduler = NullScheduler(sleep_between_s=BATCH_SLEEP_SEC)
     cutoff = time.time() - CLAIM_RETENTION_SEC
     cutoff_iso = time.strftime("%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(cutoff))
 
@@ -160,6 +172,9 @@ def _archive_claim_history(conn) -> dict:
         day_start = f"{day_str}T00:00:00+00:00"
         day_end = f"{day_str}T23:59:59.999999+00:00"
 
+        # Pre-day gate: bail before opening the gzip if pressure has returned.
+        scheduler.before_chunk(f"archive_day_{day_str}")
+
         # Count rows for this day
         count_row = conn.execute(
             f"SELECT COUNT(*) FROM claim_history "
@@ -179,6 +194,7 @@ def _archive_claim_history(conn) -> dict:
         mode = "ab" if archive_path.exists() else "wb"
         written = 0
 
+        t0 = time.monotonic()
         with gzip.open(str(archive_path), mode) as gz:
             offset = 0
             while offset < day_count:
@@ -202,6 +218,7 @@ def _archive_claim_history(conn) -> dict:
                     written += 1
 
                 offset += len(rows)
+        scheduler.after_chunk(f"archive_day_{day_str}", time.monotonic() - t0, written)
 
         # Verify: written count should match day_count (or exceed if appending)
         if written < day_count:
@@ -212,21 +229,18 @@ def _archive_claim_history(conn) -> dict:
         # Delete archived rows
         deleted_day = 0
         while True:
-            c = conn.execute(
-                f"DELETE FROM claim_history "
-                f"WHERE rowid IN ("
-                f"  SELECT rowid FROM claim_history "
-                f"  WHERE {retention_col} >= ? AND {retention_col} <= ? "
-                f"  LIMIT ?"
-                f")",
-                (day_start, day_end, DELETE_BATCH),
+            scheduler.before_chunk(f"delete_archived_{day_str}")
+            tc = time.monotonic()
+            n = _delete_archived_day_chunk(
+                conn, retention_col, day_start, day_end, DELETE_BATCH,
             )
-            n = c.rowcount
+            scheduler.after_chunk(
+                f"delete_archived_{day_str}", time.monotonic() - tc, n,
+            )
             deleted_day += n
-            conn.commit()
             if n < DELETE_BATCH:
                 break
-            time.sleep(BATCH_SLEEP_SEC)
+            scheduler.sleep_between_chunks()
 
         total_archived += written
         total_deleted += deleted_day
@@ -867,17 +881,201 @@ def run_retention_once(conn=None):
     return stats
 
 
-async def run_periodic(consumer=None):
+def run_retention_once_with_sched(scheduler, conn=None) -> dict:
+    """Pressure-aware retention pass.
+
+    Drives the same chunk helpers as ``run_retention_once`` but routes
+    every chunk through ``scheduler.before_chunk`` / ``after_chunk``.
+    Aborts cleanly on ``AbortRetentionPass`` — the chunks already
+    committed remain committed, the rest of the pass is skipped, and the
+    scheduler records the abort reason on its pass record.
+
+    Returns the stats dict (same shape as legacy) plus optional
+    ``aborted=True`` and ``abort_reason`` keys when the pass did not
+    complete fully.
+    """
+    from .db import get_conn
+    from .retention_scheduler import AbortRetentionPass
+
+    if not scheduler.begin_pass():
+        return {"skipped": True, "skip_reason": "pre_pass_pressure"}
+
+    own_conn = conn is None
+    if own_conn:
+        conn = get_conn()
+        conn.execute("PRAGMA busy_timeout=30000")
+
+    t0 = time.monotonic()
+    stats: dict = {}
+    aborted = False
+    abort_reason: str | None = None
+
+    def _run_op(label: str, fn) -> None:
+        nonlocal aborted, abort_reason
+        if aborted:
+            stats[f"{label}_skipped"] = True
+            return
+        try:
+            stats[label] = fn()
+        except AbortRetentionPass as e:
+            aborted = True
+            abort_reason = e.reason
+            stats[f"{label}_partial"] = True
+            LOG.warning("retention aborted during %s: %s", label, e.reason)
+        except Exception:
+            LOG.exception("retention op %s failed", label)
+            stats[label] = -1
+
+    _run_op("raw_stripped",
+            lambda: _strip_old_raw(conn, scheduler=scheduler))
+    _run_op("events_pruned",
+            lambda: _prune_table(conn, "events", "ctime",
+                                  EVENTS_RETENTION_SEC, scheduler=scheduler))
+    _run_op("event_versions_pruned",
+            lambda: _prune_table(conn, "event_versions", "version_ts",
+                                  EVENTS_RETENTION_SEC, scheduler=scheduler))
+    _run_op("edges_pruned",
+            lambda: _prune_table(conn, "edges", "ctime",
+                                  EDGES_RETENTION_SEC, scheduler=scheduler))
+
+    # claim_history is a dict-returning op — handle separately to keep stats shape.
+    if not aborted:
+        try:
+            arch = _archive_claim_history(conn, scheduler=scheduler)
+            stats["claims_archived"] = arch["archived"]
+            stats["claims_pruned"] = arch["deleted"]
+            stats["archive_files"] = arch["files"]
+        except AbortRetentionPass as e:
+            aborted = True
+            abort_reason = e.reason
+            stats["claims_partial"] = True
+            LOG.warning("retention aborted during archive_claims: %s", e.reason)
+        except Exception:
+            LOG.exception("claim_history archive/prune failed")
+            stats["claims_archived"] = -1
+            stats["claims_pruned"] = -1
+    else:
+        stats["claims_skipped"] = True
+
+    # Incremental vacuum — single SQL call, no chunk loop. Skip if aborted.
+    if not aborted:
+        try:
+            mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
+            if mode == 2:
+                fb = conn.execute("PRAGMA freelist_count").fetchone()[0]
+                conn.execute("PRAGMA incremental_vacuum(1000)")
+                fa = conn.execute("PRAGMA freelist_count").fetchone()[0]
+                conn.commit()
+                stats["incremental_vacuum"] = {
+                    "freelist_before": fb,
+                    "freelist_after": fa,
+                    "reclaimed_pages": fb - fa,
+                }
+            else:
+                stats["incremental_vacuum"] = {"mode": mode, "skipped": True}
+        except Exception:
+            LOG.exception("incremental_vacuum failed")
+
+    # DB geometry + retention lag + disk sample for scheduler health.
+    try:
+        page_count = conn.execute("PRAGMA page_count").fetchone()[0]
+        page_size = conn.execute("PRAGMA page_size").fetchone()[0]
+        freelist_count = conn.execute("PRAGMA freelist_count").fetchone()[0]
+        db_size_b = page_count * page_size
+        db_size_mb = round(db_size_b / (1024 * 1024), 1)
+        freelist_mb = round(freelist_count * page_size / (1024 * 1024), 1)
+        from .db import DATA_DIR
+        wal_path = DATA_DIR / "labeler.sqlite-wal"
+        wal_mb = (
+            round(wal_path.stat().st_size / (1024 * 1024), 1)
+            if wal_path.exists() else 0.0
+        )
+        stats["db_geometry"] = {
+            "db_size_mb": db_size_mb,
+            "freelist_mb": freelist_mb,
+            "freelist_pct": round(100 * freelist_count / max(page_count, 1), 1),
+            "wal_mb": wal_mb,
+        }
+        try:
+            from .maintenance import check_disk_pressure
+            dp = check_disk_pressure()
+            free_b = int(dp.get("free_gb", 0) * (1024 ** 3))
+            scheduler.record_disk_sample(db_size_b, free_b)
+        except Exception:
+            pass
+        # Retention lag: oldest events.ctime vs (now - retention window).
+        try:
+            row = conn.execute("SELECT MIN(ctime) FROM events").fetchone()
+            if row and row[0]:
+                from datetime import datetime, timezone
+                oldest = datetime.fromisoformat(
+                    row[0].replace("Z", "+00:00")
+                )
+                now = datetime.now(timezone.utc)
+                age_s = (now - oldest).total_seconds()
+                # Lag = how far past the retention cutoff the oldest row is.
+                # 0 or negative = retention is at-or-below window.
+                lag_s = age_s - EVENTS_RETENTION_SEC
+                scheduler.record_retention_lag(lag_s)
+        except Exception:
+            LOG.debug("retention lag read failed", exc_info=True)
+    except Exception:
+        LOG.exception("db geometry / disk sample failed")
+
+    elapsed = time.monotonic() - t0
+    LOG.info(
+        "retention pass %s in %.1fs: %s",
+        "aborted" if aborted else "complete", elapsed,
+        {k: v for k, v in stats.items()
+         if k not in ("archive_files", "db_geometry")},
+    )
+
+    scheduler.end_pass(stats, completed=not aborted, abort_reason=abort_reason)
+
+    if aborted:
+        stats["aborted"] = True
+        stats["abort_reason"] = abort_reason
+
+    if own_conn:
+        conn.close()
+
+    try:
+        from .bake_gate import record_retention_stats
+        record_retention_stats(stats)
+    except Exception:
+        pass
+
+    return stats
+
+
+async def run_periodic(consumer=None, scheduler=None):
     """Async retention loop.
 
-    If ``consumer`` is provided, retention's mutations route through its
-    persistent writer thread (single-writer invariant per
-    ``specs/gaps/gap-spec-single-writer-invariant.md``). Otherwise falls
-    back to the legacy sync path with its own connection — fine for CLI
-    one-shots, but causes contention with the live consumer.
+    With ``consumer`` set, builds a pressure-aware ``RetentionScheduler``
+    and uses the legacy sync path *with scheduling on top* — retention
+    keeps its own write connection (does NOT route through the writer
+    thread), but every chunk consults pressure signals and the
+    rollback_lost tripwire. See ``retention_scheduler.py``.
+
+    Pass an explicit ``scheduler`` to override (e.g. main.py constructs
+    the scheduler so it can also be exposed on /health/extended).
+
+    Without ``consumer``, falls back to the legacy unscheduled path with
+    a no-op scheduler. Suitable for CLI cold-pass / tests.
     """
+    from .retention_scheduler import RetentionScheduler, NullScheduler
+
     interval = DEFAULT_INTERVAL_SEC
-    mode = "writer-thread" if consumer is not None else "legacy"
+    if scheduler is None:
+        if consumer is not None:
+            scheduler = RetentionScheduler(
+                consumer=consumer,
+                sleep_between_s=BATCH_SLEEP_SEC,
+            )
+        else:
+            scheduler = NullScheduler(sleep_between_s=BATCH_SLEEP_SEC)
+    mode = type(scheduler).__name__
+
     LOG.info(
         "retention loop started, interval=%ds, mode=%s "
         "(raw_strip=%dh, events=%dd, edges=%dd, claims=%dd)",
@@ -885,24 +1083,22 @@ async def run_periodic(consumer=None):
         EVENTS_RETENTION_SEC // 86400, EDGES_RETENTION_SEC // 86400,
         CLAIM_RETENTION_SEC // 86400,
     )
-    if consumer is None:
-        LOG.warning(
-            "retention.run_periodic invoked without consumer — using legacy "
-            "direct-connection path (single-writer invariant violated)"
-        )
 
     loop = asyncio.get_event_loop()
     while True:
         try:
-            if consumer is not None:
-                stats = await run_retention_once_async(consumer)
-            else:
-                stats = await loop.run_in_executor(None, run_retention_once)
+            stats = await loop.run_in_executor(
+                None, run_retention_once_with_sched, scheduler,
+            )
             total = sum(
                 v for v in stats.values() if isinstance(v, int) and v > 0
             )
-            if total > 0:
-                LOG.info("retention: %d total operations", total)
+            if total > 0 or stats.get("aborted") or stats.get("skipped"):
+                LOG.info(
+                    "retention pass: ops=%d aborted=%s skipped=%s",
+                    total, stats.get("aborted", False),
+                    stats.get("skipped", False),
+                )
         except Exception:
             LOG.exception("retention pass failed")
         await asyncio.sleep(interval)
