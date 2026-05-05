@@ -135,6 +135,138 @@ ls -lh /opt/driftwatch/deploy/data/*.sqlite*
 
 ---
 
+## Manual retention pressure relief
+
+Use this **only while `ENABLE_RETENTION=0` is in effect** and disk runway is shrinking faster than the retention scheduler work can land. The playbook is parole, not a long-term operating mode.
+
+Two paths. Pick one.
+
+### Path A — Cold pass (preferred)
+
+Stop the consumer, run retention against a quiet DB, compact via `VACUUM INTO`, restart.
+
+**Trade:** ~60–120 min of downtime. Jetstream cursor + 3 s rewind recovers coverage on restart, provided downtime stays inside the upstream replay window (hours, not days).
+
+**Preconditions** (all must hold):
+
+```bash
+# On VM (root@192.46.223.21)
+df -h /mnt/zonestorage    # need free space ≥ expected compact DB size + 5 GB margin
+ls -lh /mnt/zonestorage/driftwatch/data/labeler.sqlite*    # current DB size
+curl -s http://localhost:8422/health/extended | python3 -c 'import sys,json; d=json.load(sys.stdin); print("rollback_lost-ish drops:", d.get("drop_frac"), "wal_mb:", d.get("wal",{}).get("wal_size_mb"))'
+```
+
+Rule of thumb for compact-DB size: current DB minus expected freelist after raw-strip. With retention disabled N days, expect ~N × 10 GB of raw to NULL out. So compact DB ≈ current − (N × 10 GB). Add 5 GB margin.
+
+**Run:**
+
+```bash
+# 1. Stop the container (keeps data volume)
+ssh -i ~/git/claude/ssh/linode root@192.46.223.21 \
+  "cd /opt/driftwatch/deploy && docker compose -f docker-compose.prod.yml -f docker-compose.override.yml stop driftwatch"
+
+# 2. Run retention as a one-shot, with retention enabled for this run only.
+#    Uses the legacy sync path (consumer is stopped, no contention).
+#    Container exits when run_retention_once returns. Expect 5–30 min.
+ssh -i ~/git/claude/ssh/linode root@192.46.223.21 \
+  "cd /opt/driftwatch/deploy && docker compose -f docker-compose.prod.yml -f docker-compose.override.yml \
+   run --rm -e ENABLE_RETENTION=1 driftwatch python -m labeler.cli driftwatch retention"
+
+# 3. Inspect freelist and decide whether VACUUM INTO will fit.
+ssh -i ~/git/claude/ssh/linode root@192.46.223.21 \
+  "sqlite3 /mnt/zonestorage/driftwatch/data/labeler.sqlite '
+     SELECT
+       page_count * page_size / (1024*1024*1024.0) AS db_gb,
+       freelist_count * page_size / (1024*1024*1024.0) AS freelist_gb,
+       (page_count - freelist_count) * page_size / (1024*1024*1024.0) AS compact_gb
+     FROM (SELECT
+       (SELECT page_count FROM pragma_page_count) AS page_count,
+       (SELECT page_size FROM pragma_page_size) AS page_size,
+       (SELECT freelist_count FROM pragma_freelist_count) AS freelist_count
+     );'"
+
+# 4. Confirm: compact_gb + 5 GB margin <= df-free-gb. If not, STOP. Restart consumer
+#    (skip step 5–7), reassess. The retention pass alone reclaims pages-on-disk via
+#    reuse, just not file size — buys some runway, not a full reset.
+
+# 5. VACUUM INTO. Writes only live pages to a fresh file. Reads main DB; large I/O.
+#    Expect 20–60 min depending on compact size.
+ssh -i ~/git/claude/ssh/linode root@192.46.223.21 \
+  "sqlite3 /mnt/zonestorage/driftwatch/data/labeler.sqlite \
+     \"VACUUM INTO '/mnt/zonestorage/driftwatch/data/labeler.compact.sqlite';\""
+
+# 6. Verify the compact DB integrity before swapping.
+ssh -i ~/git/claude/ssh/linode root@192.46.223.21 \
+  "sqlite3 /mnt/zonestorage/driftwatch/data/labeler.compact.sqlite 'PRAGMA integrity_check;'"
+# Expect single row: 'ok'
+
+# 7. Atomic-ish swap. Keep .bak — do NOT delete until 24 h of healthy operation.
+ssh -i ~/git/claude/ssh/linode root@192.46.223.21 "
+  cd /mnt/zonestorage/driftwatch/data &&
+  mv labeler.sqlite labeler.sqlite.bak &&
+  mv labeler.sqlite-wal labeler.sqlite-wal.bak 2>/dev/null || true &&
+  mv labeler.sqlite-shm labeler.sqlite-shm.bak 2>/dev/null || true &&
+  mv labeler.compact.sqlite labeler.sqlite
+"
+
+# 8. Restart consumer.
+ssh -i ~/git/claude/ssh/linode root@192.46.223.21 \
+  "cd /opt/driftwatch/deploy && docker compose -f docker-compose.prod.yml -f docker-compose.override.yml up -d driftwatch"
+
+# 9. Verify.
+ssh -i ~/git/claude/ssh/linode root@192.46.223.21 \
+  "curl -s http://localhost:8422/health/extended | python3 -m json.tool | head -40"
+```
+
+**Rollback** (any point before step 7 swap is trivial: stop and restart on the original file):
+
+```bash
+# If the compact DB is bad or the restart fails on it, swap back:
+ssh -i ~/git/claude/ssh/linode root@192.46.223.21 "
+  cd /opt/driftwatch/deploy && docker compose -f docker-compose.prod.yml -f docker-compose.override.yml stop driftwatch &&
+  cd /mnt/zonestorage/driftwatch/data &&
+  mv labeler.sqlite labeler.sqlite.bad &&
+  mv labeler.sqlite.bak labeler.sqlite &&
+  mv labeler.sqlite-wal.bak labeler.sqlite-wal 2>/dev/null || true &&
+  mv labeler.sqlite-shm.bak labeler.sqlite-shm 2>/dev/null || true &&
+  cd /opt/driftwatch/deploy && docker compose -f docker-compose.prod.yml -f docker-compose.override.yml up -d driftwatch
+"
+```
+
+After 24 h of clean operation post-swap, delete the `.bak` files.
+
+**Metrics to watch:**
+
+- During retention pass (step 2): docker logs for `archived %s: N rows`, `pruned N events`, `db geometry` — pass should produce non-zero counts and `geometry.freelist_pct > 30%`.
+- During VACUUM INTO (step 5): `df -h /mnt/zonestorage` should show free space dropping by approximately `compact_gb`. If free space drops to <5 GB, abort.
+- After restart (step 9): `wal_size_mb < 50`, `drop_frac=0`, `rollback_lost=0`, `events_per_sec` near baseline. Coverage should reach ~100% within minutes once jetstream cursor catches up.
+- Hour 1–6 post-restart: DB growth rate. Without retention re-enabled, expect ~500 MB/h (= ~12 GB/day). This is a baseline check that the file is honest, not a healthy steady state.
+
+### Path B — Hot pass (downtime not acceptable)
+
+Run the retention CLI while the consumer is up. Uses the legacy sync path on its own connection — contends with the writer at the SQLite lock level. Lost events surface as `rollback_lost`.
+
+```bash
+# One-shot pass, consumer stays up. Expect 20–40 min, lock-contention-bounded.
+# Note: ENABLE_RETENTION isn't read by the one-shot CLI path — the gate is on
+# the loop, not the CLI. The env override below is belt-and-braces only.
+ssh -i ~/git/claude/ssh/linode root@192.46.223.21 \
+  "cd /opt/driftwatch/deploy && docker compose -f docker-compose.prod.yml -f docker-compose.override.yml \
+   exec -e ENABLE_RETENTION=1 driftwatch python -m labeler.cli driftwatch retention"
+```
+
+**Trade:** no downtime, but expect on the order of tens to low hundreds of `rollback_lost` events accumulated during the pass (driftwatch's earlier L1 mode lost ~444/day under continuous retention; a single pass is shorter). Drops are instrumented; coverage during the pass becomes loss-conditioned.
+
+**No VACUUM follow-up.** Path B reclaims pages to the freelist for reuse but does not shrink the file. It buys time against growth rate, not against the absolute disk ceiling. If you need the absolute disk ceiling moved, you need Path A.
+
+### Do not
+
+- Do not run full `VACUUM` on the main DB. It needs ≈ DB-size free space (currently 78 GB needed, 60 GB free). It will fail mid-pass and may corrupt or strand a partial copy. Always use `VACUUM INTO`.
+- Do not re-enable `ENABLE_RETENTION=1` for the loop without the scheduler work landing. That re-introduces the 5850d01 starvation failure, or with the L2-only fallback, sustained `rollback_lost` accumulation.
+- Do not delete the `.bak` files until the new file has had 24 h of clean operation.
+
+---
+
 ## Platform health degraded
 
 **Symptoms:** `platform_health: degraded` in health endpoint.
