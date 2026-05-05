@@ -342,7 +342,11 @@ class RetentionScheduler:
         free_delta = last_free - first_free
         burn_per_s = -free_delta / elapsed_s  # positive = losing space
         if burn_per_s <= 0:
-            return float("inf")
+            # No measurable burn (or net free gain — e.g., after an archive
+            # delete). Returning float('inf') would break JSON serialization
+            # in /health/extended; None means "not currently applicable",
+            # which is the honest answer.
+            return None
         # Brake threshold is 92% used = 8% free of total. Total = used + free
         # at last sample. Approximate.
         # We need the absolute "free at brake" — caller didn't pass it but

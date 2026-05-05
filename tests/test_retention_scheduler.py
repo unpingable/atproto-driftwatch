@@ -384,9 +384,22 @@ class TestDiskRunway:
         assert runway is not None
         assert 3.0 < runway < 4.0
 
-    def test_no_burn_returns_infinite(self):
+    def test_no_burn_returns_none(self):
+        """No measurable burn (or net free gain — e.g., after an archive
+        delete). Must NOT return float('inf'); that would break JSON
+        serialization in /health/extended.
+        """
         sched = RetentionScheduler()
         now = time.time()
         sched._disk_history.append((now - 86400, 50 * 1024**3, 100 * 1024**3))
         sched._disk_history.append((now, 50 * 1024**3, 100 * 1024**3))
-        assert sched.estimate_disk_runway_days() == float("inf")
+        assert sched.estimate_disk_runway_days() is None
+
+    def test_net_free_gain_returns_none(self):
+        """Same protection if disk_free went UP between samples (archive
+        cleanup, WAL checkpoint reclaiming)."""
+        sched = RetentionScheduler()
+        now = time.time()
+        sched._disk_history.append((now - 86400, 100 * 1024**3, 50 * 1024**3))
+        sched._disk_history.append((now, 100 * 1024**3, 60 * 1024**3))
+        assert sched.estimate_disk_runway_days() is None
