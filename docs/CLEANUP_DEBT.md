@@ -4,6 +4,74 @@ Items deferred from in-flight work. Each entry is filed because forgetting it wo
 
 ---
 
+## 2026-05-12 — longitudinal queue: misleading metric + producer-side tax (resolved-in-part)
+
+**Where:** `src/labeler/db.py` (`_add_recheck_txn`, `enqueue_claim_recheck`), `src/labeler/main.py` (`/health/extended.queue_depth`).
+
+**Today:** investigating why `queue_depth` had been pinned ~10–11k for weeks revealed two things:
+
+1. `ENABLE_LONGITUDINAL_RECHECK=0` and `ENABLE_CLAIM_RECHECK=0` in the prod compose override — both consumers are deliberately off (recorded in the override comment: *"76% of stall windows; readers (facts_export, longitudinal, identity) all active concurrently. This is reduction, not an experiment. Re-enable individually after WAL-truncate fix lands."*).
+2. The producers (`_add_recheck_txn` from the consumer event path, `enqueue_claim_recheck` from the longitudinal worker — but the latter is itself off) were not gated symmetrically. The consumer kept enqueueing into `recheck_queue`. The `recheck_queue_fp_cap_hysteresis` trigger (db.py:177) trimmed back to 10k whenever the count crossed 11k. Result: pinned ring buffer, ~700–900 rows trimmed every ~3 min, **on the consumer's writer thread**, producing nothing of downstream value (driftwatch is sealed-lab/detect-only; `facts_export` is also off; no labelwatch path reads recheck output).
+
+A 15-min sample confirmed the oscillation: floor ~10040 → ceiling ~10930 → trim → repeat.
+
+**Fixed today:** producer-side kill switches added to both `_add_recheck_txn` and `enqueue_claim_recheck`. When the corresponding `ENABLE_*` env is not `1`, the function increments a `*_worker_disabled` counter in `queue_stats` and returns early. No queue write, no trigger, no churn. Test fixture (`tests/conftest.py`) now defaults both env vars to `1` so existing tests keep the historical contract.
+
+**Still open (filed, not done):**
+
+- **`queue_depth` is a misleading top-level field in `/health/extended` when the worker is disabled.** It looks like backlog; it's really "snapshot of a queue nobody is draining." Wanted shape (later):
+  ```json
+  "recheck_queue": {
+    "count": 10041,
+    "worker_enabled": false,
+    "cap": 10000,
+    "hysteresis_ceiling": 11000
+  }
+  ```
+  Defer until `/health/extended` gets the broader DB-derived-field cache discussed in the 2026-05-05 workload-contention entry. Until then, the legacy top-level `queue_depth` stays for back-compat.
+- **The 10k stale rows currently in `recheck_queue` will sit there indefinitely** after this fix (no enqueue → no trigger → no drain). Not harmful — they don't grow, no consumer reads them — but if we ever re-enable longitudinal we should `DELETE FROM recheck_queue WHERE scheduled_at < <cutover>` first so the worker starts from a clean slate rather than chewing through days-old fingerprints.
+
+**Why this wasn't tonight's bigger thing:** the larger architectural fix is still the cold-path Parquet/DuckDB plan (`specs/gaps/gap-spec-cold-path-parquet-duckdb.md`). The producer-gating fix is the small, correct local move while that's pending — it removes a hidden tax on the hot writer for a system that is parked-by-design. Re-enabling longitudinal stays gated on the workload-contention work, **not** on this entry.
+
+**Acceptance shape (record for future deploys to this codebase):**
+
+```text
+fix acceptance:        did the patch behave correctly after recovery?
+deploy acceptance:     did applying the patch cause queue-boundary loss?
+platform acceptance:   did the system return to steady state?
+```
+
+These are three different claims. A patch can be "fix-clean" and "deploy-dirty" simultaneously. Tonight's deploy was exactly that shape — see the 2026-05-12 addendum under the 2026-05-05 workload-contention entry for the deploy-side evidence.
+
+Verdict for this entry:
+
+```text
+Producer-gating fix:
+  PASS
+  Evidence:
+    - enq_attempt=0, enq_insert=0 (gate fires)
+    - queue_depth frozen at 10735 across 8 samples
+    - rollback_lost=0
+    - WAL bounded, post-storm health recovered
+
+Deployment envelope:
+  WARN / NOT CLEAN
+  Evidence:
+    - restart-induced WS catch-up burst caused dropped=11677 in one window
+    - rollback_lost=0 only proves writer integrity
+    - "ingest remained clean" criterion denied for the deploy window
+
+Disposition:
+  keep the fix; do not revert
+  see workload-contention entry (2026-05-12 addendum) for the deploy hazard
+```
+
+Keeper line earned tonight:
+
+> **Rollback-clean is not ingest-clean.**
+
+---
+
 ## 2026-05-05 (late evening) — workload contention on marginal storage
 
 **Where:** architecture, not one file.
@@ -25,6 +93,38 @@ Items deferred from in-flight work. Each entry is filed because forgetting it wo
 **Tripwire that escalates this from candidate to required:** any second incident where writer enters sustained kernel I/O wait under normal (non-burst) load.
 
 **Architectural answer filed:** see `specs/gaps/gap-spec-cold-path-parquet-duckdb.md` (filed 2026-05-05). Phased plan to move read-heavy and historical workloads to Parquet/DuckDB while SQLite stays the hot operational store. Most of the bullets above (fewer connections, controlled read concurrency, /health caching, facts/snapshot replication, I/O budgets) are subsumed once Phases 1–6 land.
+
+**2026-05-12 addendum — restart blast radius is consequence-bearing.**
+
+Tonight's deploy of the producer-gating fix triggered the cascade in measurable form. The fix itself is unrelated to the mechanism — restart alone is sufficient.
+
+Sequence:
+
+1. Container restart → cursor rewind on Jetstream → catch-up burst (~3s upstream rewind).
+2. Burst floods the consumer's internal event queue while writer is paying the cost of cold page-cache misses against the 122 GB SQLite.
+3. Writer falls behind → event queue backlog grows → WS reader blocks on `put` → server-side keepalive ping timeout (`websockets ConnectionClosedError 1011`) → reconnect.
+4. Each reconnect re-rewinds the cursor → another catch-up burst → cascade.
+5. Resolved when reads drained enough to let the writer catch up. Storm window: ~13 minutes (15:25 deploy → 15:38 last reconnect → ~15:40 lag back to 0).
+
+Measured cost of the storm:
+
+```text
+dropped=11677  (single 60s STATS window at 15:39)
+rollback_lost=0
+reconnect_count delta: ~9 (88 → 97 over restart + storm)
+```
+
+This is not "restart is forbidden" — it's "restart on the current plant has a known, measurable blast radius, and we should plan deploys against that envelope." Concrete consequences:
+
+- Deploy acceptance should include a queue-boundary loss check, not just a fix-acceptance check. See the 2026-05-12 longitudinal-queue entry above for the tri-class acceptance shape.
+- The next deploy should not happen during a degraded window without explicitly accepting another ~10k events of intake loss.
+- Any work that requires multiple deploy cycles (e.g. iterating on the cold-path plan) should sequence to minimize restart count.
+
+This addendum does **not** raise an architectural escalation beyond what the parent entry already names (Phases 1–6 of the cold-path plan are still the answer). It quantifies the cost of operating with the parent entry unresolved.
+
+Keeper that earned its rent tonight:
+
+> Rollback-clean is not ingest-clean.
 
 ---
 

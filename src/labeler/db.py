@@ -497,6 +497,13 @@ def _fp_passes_enqueue_gate(fp: str, author_did: str, has_link: bool, is_reply: 
 def _add_recheck_txn(conn, claim_fingerprint: str):
     """Transaction-scoped recheck enqueue. Uses passed conn, does not commit."""
     from . import queue_stats
+    # Producer-side kill switch: if the longitudinal worker is disabled,
+    # don't enqueue. Without this, the consumer keeps producing rows that
+    # nobody dequeues; the cap/hysteresis trigger then churns the table on
+    # the writer thread for no downstream value.
+    if os.getenv("ENABLE_LONGITUDINAL_RECHECK", "0") != "1":
+        queue_stats.inc("enqueue_worker_disabled")
+        return
     queue_stats.inc("enqueue_attempts")
     now = timeutil.now_utc().isoformat()
     # Best-effort: enqueue in Redis-backed queue if available
@@ -777,6 +784,15 @@ def insert_quarantine_emit(emit_mode: str, emit_status: str, emit_reason: str, p
 
 
 def enqueue_claim_recheck(authorDid: str, claim_fingerprint: str) -> None:
+    # Producer-side kill switch: symmetric with _add_recheck_txn. If the
+    # claim-recheck consumer is disabled, don't write to its queue table.
+    if os.getenv("ENABLE_CLAIM_RECHECK", "0") != "1":
+        try:
+            from . import queue_stats
+            queue_stats.inc("claim_recheck_worker_disabled")
+        except Exception:
+            pass
+        return
     now = timeutil.now_utc().isoformat()
     conn = get_conn()
     cur = conn.execute(
