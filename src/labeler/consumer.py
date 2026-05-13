@@ -38,12 +38,21 @@ CURSOR_SAVE_INTERVAL = int(os.getenv("CURSOR_SAVE_INTERVAL", "500"))
 BATCH_MAX_EVENTS = int(os.getenv("BATCH_MAX_EVENTS", "100"))
 BATCH_MAX_WAIT_S = float(os.getenv("BATCH_MAX_WAIT_S", "0.25"))
 
-# Writer-owned WAL truncate. The persistent writer thread calls
-# wal_checkpoint(TRUNCATE) on its own connection right after a successful
-# commit — that's the cleanest moment to attempt a WAL restart, since the
-# writer just released its frame and is least likely to be racing against
-# concurrent readers. Rate-limited so per-batch overhead is bounded.
+# Writer-owned WAL truncate. Rate-limited so per-batch overhead is bounded.
 WAL_TRUNCATE_INTERVAL_S = float(os.getenv("WAL_TRUNCATE_INTERVAL_S", "30"))
+
+# When the writer is under intake pressure, attempting wal_checkpoint(TRUNCATE)
+# blocks up to busy_timeout (60s) waiting for readers to release. That blocking
+# IS the failure mode under multi-subsystem reader concurrency: the writer
+# parks in _maybe_wal_truncate while events_dropped grows at the queue
+# boundary. Skip the truncate when intake is backlogged. The writer
+# prioritizes intake over filesystem tidiness.
+WAL_TRUNCATE_PRESSURE_BACKLOG = int(os.getenv("WAL_TRUNCATE_PRESSURE_BACKLOG", "500"))
+
+# In calm windows, prefer PASSIVE checkpoint (non-blocking, no busy wait) and
+# only escalate to TRUNCATE if PASSIVE reports busy=0 (all readers caught up)
+# AND log size justifies the work.
+WAL_TRUNCATE_LOG_FRAMES_MIN = int(os.getenv("WAL_TRUNCATE_LOG_FRAMES_MIN", "5000"))
 
 
 def _build_ws_url(base_url: str, cursor: Optional[str] = None) -> str:
@@ -304,31 +313,57 @@ class ATProtoConsumer:
         }
 
     def _maybe_wal_truncate(self, conn):
-        """Attempt PRAGMA wal_checkpoint(TRUNCATE) from the writer thread.
+        """Maintain WAL size from the writer thread without blocking intake.
 
-        Called only from inside _process_batch after a successful commit —
-        the writer just released its frame, the least racy moment to attempt
-        a WAL restart. Rate-limited so the cost is bounded.
+        Called from _process_batch after a successful commit, rate-limited.
 
-        Logs only when the result is interesting (busy or non-trivial work
-        done); silent on the typical no-op case.
+        Behavior:
+        * If the ingest queue is non-trivially backlogged, skip entirely.
+          Writer prioritizes intake over filesystem tidiness; under reader
+          concurrency, wal_checkpoint(TRUNCATE) blocks the writer up to
+          busy_timeout, which IS the stall mode we are avoiding.
+        * Otherwise issue PASSIVE checkpoint (non-blocking — never waits on
+          readers, just advances the checkpoint frame as far as the live
+          snapshot allows).
+        * Only when PASSIVE reports busy=0 (no reader is pinning frames)
+          AND log frames are large enough to justify the write, escalate
+          to TRUNCATE. busy=0 is the proof that TRUNCATE will not block.
         """
         now = time.monotonic()
         if now - self._last_wal_truncate_mono < WAL_TRUNCATE_INTERVAL_S:
             return
         self._last_wal_truncate_mono = now
+
+        backlog = self._event_queue.qsize()
+        if backlog > WAL_TRUNCATE_PRESSURE_BACKLOG:
+            return
+
         try:
-            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
-            if not row:
-                return
-            busy, log, ckpt = row
-            if busy or log >= 1000:
-                LOG.info(
-                    "wal_truncate: busy=%d log=%d checkpointed=%d",
-                    busy, log, ckpt,
-                )
+            row = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone()
         except Exception:
-            LOG.debug("wal_truncate failed", exc_info=True)
+            LOG.debug("wal_passive failed", exc_info=True)
+            return
+        if not row:
+            return
+        busy, log, ckpt = row
+        if busy or log >= 1000:
+            LOG.info(
+                "wal_passive: busy=%d log=%d checkpointed=%d backlog=%d",
+                busy, log, ckpt, backlog,
+            )
+
+        if busy == 0 and log >= WAL_TRUNCATE_LOG_FRAMES_MIN:
+            try:
+                row2 = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if row2:
+                    b2, l2, c2 = row2
+                    if b2 or l2 >= 1000:
+                        LOG.info(
+                            "wal_truncate: busy=%d log=%d checkpointed=%d",
+                            b2, l2, c2,
+                        )
+            except Exception:
+                LOG.debug("wal_truncate failed", exc_info=True)
 
     async def _drain_queue(self):
         """Background task that drains the event queue without blocking the WS read loop.
