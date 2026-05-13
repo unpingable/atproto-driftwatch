@@ -67,11 +67,29 @@ BATCH_SLEEP_SEC = float(os.getenv("RETENTION_BATCH_SLEEP_SEC", "5.0"))
 BACKLOG_MED = int(os.getenv("RETENTION_BACKLOG_MED", "1000"))
 BACKLOG_HIGH = int(os.getenv("RETENTION_BACKLOG_HIGH", "3000"))
 
-# Archive directory
+# Archive directory (legacy JSONL path; kept for backward compatibility)
 ARCHIVE_DIR = pathlib.Path(os.getenv(
     "RETENTION_ARCHIVE_DIR",
     str(pathlib.Path(__file__).resolve().parents[1] / "data" / "archive"),
 ))
+
+# Parquet capture directory (forward path; written directly by retention)
+PARQUET_DIR = pathlib.Path(os.getenv(
+    "RETENTION_PARQUET_DIR",
+    str(pathlib.Path(__file__).resolve().parents[1] / "data" / "parquet"),
+))
+
+# Forward path toggle. When set, retention writes Parquet partitions instead
+# of gzipped JSONL archives. Default on. The JSONL path is kept reachable for
+# rollback, gated by setting this to "0".
+PARQUET_CAPTURE_ENABLED = os.getenv("ENABLE_RETENTION_PARQUET_CAPTURE", "1") == "1"
+
+try:
+    import pyarrow as _pa  # noqa: F401
+    import pyarrow.parquet as _pq  # noqa: F401
+    _HAS_PYARROW = True
+except ImportError:
+    _HAS_PYARROW = False
 
 # Claim history columns to archive
 _CLAIM_COLS = (
@@ -276,6 +294,325 @@ def _strip_raw_chunk(conn, cutoff_iso):
     n = c.rowcount
     conn.commit()
     return n
+
+
+def _archive_claim_history_to_parquet(conn, scheduler=None) -> dict:
+    """Archive expired claim_history rows to date-partitioned Parquet, then delete.
+
+    Forward path that replaces the JSONL gzip archive in production. Each
+    eligible day becomes one ``date=YYYY-MM-DD/part-00.parquet`` file under
+    PARQUET_DIR/claim_history/. Writes go to ``part-00.parquet.tmp`` and are
+    atomically renamed only after the file's row count matches the source
+    count for that day. Idempotent: skips days whose final partition already
+    has at least the expected row count.
+
+    Returns {"archived": N, "deleted": N, "files": [...]} with the same shape
+    as ``_archive_claim_history``. Receipts are written per partition under
+    PARQUET_DIR/.receipts/retention_capture_YYYY-MM-DD.json.
+
+    Per-day reads are bounded to the partition window. No global scans.
+    """
+    if not _HAS_PYARROW:
+        LOG.error(
+            "ENABLE_RETENTION_PARQUET_CAPTURE=1 but pyarrow not importable; "
+            "skipping claim_history capture this pass"
+        )
+        return {"archived": 0, "deleted": 0, "files": []}
+
+    if scheduler is None:
+        from .retention_scheduler import NullScheduler
+        scheduler = NullScheduler(sleep_between_s=BATCH_SLEEP_SEC)
+
+    cutoff = time.time() - CLAIM_RETENTION_SEC
+    cutoff_iso = time.strftime(
+        "%Y-%m-%dT%H:%M:%S+00:00", time.gmtime(cutoff)
+    )
+    retention_col = "COALESCE(observed_at, createdAt)"
+
+    # No discovery scan. SCAN_DISTINCT_DATE on a 30M-row claim_history holds
+    # a read snapshot for many minutes; even on its own connection it pins
+    # WAL against the live writer (2026-05-08 incident: 28-minute scan, WAL
+    # to 3.3 GB, drop_frac to 12% before we aborted).
+    #
+    # Instead: iterate candidate dates from a fixed lookback window, ordered
+    # oldest-first. For each date, skip if a complete partition already
+    # exists. Otherwise let per-day work figure out via an INDEXED bounded
+    # query whether there are rows to capture. The createdAt column has an
+    # index (idx_claim_history_created); the per-day query uses it.
+    #
+    # Edge case: rows with bogus user-supplied createdAt (year 1997 or 2123,
+    # ~25k of them per maintenance log) are missed by createdAt-based
+    # filtering. They accumulate as garbage and need a separate cleanup
+    # pass. Documented as known leak.
+    import datetime as _dt
+    today = _dt.datetime.now(_dt.timezone.utc).date()
+    cutoff_date = today - _dt.timedelta(seconds=CLAIM_RETENTION_SEC)
+    lookback_days = int(os.getenv("RETENTION_PARQUET_LOOKBACK_DAYS", "21"))
+    earliest_date = cutoff_date - _dt.timedelta(days=lookback_days)
+
+    parquet_root_for_skip = PARQUET_DIR / "claim_history"
+
+    candidate_dates = []
+    d = earliest_date
+    while d <= cutoff_date:
+        existing = parquet_root_for_skip / f"date={d.isoformat()}" / "part-00.parquet"
+        if not existing.exists():
+            candidate_dates.append(d.isoformat())
+        d += _dt.timedelta(days=1)
+
+    if not candidate_dates:
+        LOG.info(
+            "parquet capture: nothing to do (lookback %dd from cutoff %s, "
+            "all partitions present)",
+            lookback_days, cutoff_date.isoformat(),
+        )
+        return {"archived": 0, "deleted": 0, "files": []}
+
+    # Cap per-pass work. Drain backlog across passes.
+    max_days = int(os.getenv("RETENTION_PARQUET_MAX_DAYS_PER_PASS", "1"))
+    if max_days > 0:
+        candidate_dates = candidate_dates[:max_days]
+    LOG.info(
+        "parquet capture: %d candidate date(s) for this pass: %s",
+        len(candidate_dates), ", ".join(candidate_dates),
+    )
+
+    # Build the (day_str,) tuples the per-day loop expects.
+    days_rows = [(d,) for d in candidate_dates]
+
+    parquet_root = PARQUET_DIR / "claim_history"
+    parquet_root.mkdir(parents=True, exist_ok=True)
+    receipts_dir = PARQUET_DIR / ".receipts"
+    receipts_dir.mkdir(parents=True, exist_ok=True)
+
+    pa_schema = _pa.schema([
+        _pa.field("authorDid", _pa.string()),
+        _pa.field("claim_fingerprint", _pa.string()),
+        _pa.field("createdAt", _pa.string()),
+        _pa.field("confidence", _pa.float64()),
+        _pa.field("provenance", _pa.string()),
+        _pa.field("evidence_hash", _pa.string()),
+        _pa.field("post_uri", _pa.string()),
+        _pa.field("post_cid", _pa.string()),
+        _pa.field("fingerprint_version", _pa.string()),
+        _pa.field("evidence_class", _pa.string()),
+        _pa.field("fp_kind", _pa.string()),
+        _pa.field("observed_at", _pa.string()),
+    ])
+
+    total_archived = 0
+    total_deleted = 0
+    files = []
+
+    # Per-day queries use createdAt (indexed) rather than the COALESCE
+    # expression. Bogus-createdAt rows are missed; see comment above.
+    per_day_filter = "createdAt >= ? AND createdAt <= ?"
+
+    for (day_str,) in days_rows:
+        if not day_str:
+            continue
+
+        day_start = f"{day_str}T00:00:00+00:00"
+        day_end = f"{day_str}T23:59:59.999999+00:00"
+
+        scheduler.before_chunk(f"parquet_day_{day_str}")
+
+        count_row = conn.execute(
+            f"SELECT COUNT(*) FROM claim_history WHERE {per_day_filter}",
+            (day_start, day_end),
+        ).fetchone()
+        day_count = count_row[0] if count_row else 0
+
+        if day_count == 0:
+            continue
+
+        out_dir = parquet_root / f"date={day_str}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_path = out_dir / "part-00.parquet"
+        tmp_path = out_dir / "part-00.parquet.tmp"
+
+        # Idempotent: if the final partition exists with at least the expected
+        # row count, just clean up the source rows. Don't re-write.
+        if out_path.exists():
+            try:
+                pf = _pq.ParquetFile(str(out_path))
+                if pf.metadata.num_rows >= day_count:
+                    deleted_day = 0
+                    while True:
+                        scheduler.before_chunk(f"delete_archived_{day_str}")
+                        tc = time.monotonic()
+                        n = _delete_archived_day_chunk(
+                            conn, "createdAt", day_start, day_end, DELETE_BATCH,
+                        )
+                        scheduler.after_chunk(
+                            f"delete_archived_{day_str}", time.monotonic() - tc, n,
+                        )
+                        deleted_day += n
+                        if n < DELETE_BATCH:
+                            break
+                        scheduler.sleep_between_chunks()
+                    total_deleted += deleted_day
+                    files.append(str(out_path))
+                    LOG.info(
+                        "parquet capture %s: existing partition kept (%d rows), deleted %d source rows",
+                        day_str, pf.metadata.num_rows, deleted_day,
+                    )
+                    continue
+            except Exception:
+                LOG.exception(
+                    "parquet inspect failed for %s, will rewrite", out_path,
+                )
+
+        # Clean stale tmp from any previous interrupted run.
+        if tmp_path.exists():
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+
+        t0 = time.monotonic()
+        written = 0
+        batch_pylist = []
+        PYLIST_BATCH = 50_000
+        writer = _pq.ParquetWriter(
+            str(tmp_path), pa_schema, compression="zstd",
+        )
+        day_aborted = False
+        try:
+            cols_sql = ", ".join(_CLAIM_COLS)
+            offset = 0
+            while offset < day_count:
+                # Per-batch scheduler gate: lets the scheduler intervene
+                # mid-day if writer pressure rises. A heavy day (e.g., a
+                # backfill catching up 1M+ postdated rows) without this
+                # would block writer attention for minutes.
+                t_chunk = time.monotonic()
+                try:
+                    scheduler.before_chunk(f"parquet_day_{day_str}_batch")
+                except Exception:
+                    # AbortRetentionPass propagates -- but we want to clean
+                    # up the open writer + tmp file first.
+                    day_aborted = True
+                    raise
+                rows = conn.execute(
+                    f"SELECT {cols_sql} FROM claim_history "
+                    f"WHERE {per_day_filter} "
+                    f"ORDER BY rowid LIMIT ? OFFSET ?",
+                    (day_start, day_end, ARCHIVE_BATCH, offset),
+                ).fetchall()
+                if not rows:
+                    break
+                for row in rows:
+                    record = dict(zip(_CLAIM_COLS, row))
+                    if record["confidence"] is not None:
+                        record["confidence"] = float(record["confidence"])
+                    batch_pylist.append(record)
+                    written += 1
+                    if len(batch_pylist) >= PYLIST_BATCH:
+                        table = _pa.Table.from_pylist(batch_pylist, schema=pa_schema)
+                        writer.write_table(table)
+                        batch_pylist = []
+                offset += len(rows)
+                scheduler.after_chunk(
+                    f"parquet_day_{day_str}_batch",
+                    time.monotonic() - t_chunk, len(rows),
+                )
+                scheduler.sleep_between_chunks()
+            if batch_pylist:
+                table = _pa.Table.from_pylist(batch_pylist, schema=pa_schema)
+                writer.write_table(table)
+        finally:
+            writer.close()
+            if day_aborted and tmp_path.exists():
+                # Tmp will be cleaned on next pass start; nothing else to do.
+                pass
+
+        # Verify file row count matches what we wrote.
+        try:
+            pf = _pq.ParquetFile(str(tmp_path))
+            file_rows = pf.metadata.num_rows
+        except Exception:
+            file_rows = -1
+
+        if written != day_count or file_rows != day_count:
+            LOG.warning(
+                "parquet capture mismatch for %s: source=%d wrote=%d file=%d "
+                "— skipping rename and delete",
+                day_str, day_count, written, file_rows,
+            )
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            continue
+
+        # Atomic rename only after verification.
+        os.replace(str(tmp_path), str(out_path))
+
+        receipt = {
+            "date": day_str,
+            "rows": written,
+            "produced_at": time.strftime(
+                "%Y-%m-%dT%H:%M:%SZ", time.gmtime(),
+            ),
+            "duration_s": round(time.monotonic() - t0, 2),
+            "src_rows": day_count,
+            "dst_path": str(out_path),
+            "dst_bytes": out_path.stat().st_size,
+            "source": "retention_capture",
+        }
+        (receipts_dir / f"retention_capture_{day_str}.json").write_text(
+            json.dumps(receipt, indent=2)
+        )
+
+        # Source rows preserved until receipt validates. Now delete using
+        # the same indexed createdAt filter that drove the capture.
+        deleted_day = 0
+        while True:
+            scheduler.before_chunk(f"delete_archived_{day_str}")
+            tc = time.monotonic()
+            n = _delete_archived_day_chunk(
+                conn, "createdAt", day_start, day_end, DELETE_BATCH,
+            )
+            scheduler.after_chunk(
+                f"delete_archived_{day_str}", time.monotonic() - tc, n,
+            )
+            deleted_day += n
+            if n < DELETE_BATCH:
+                break
+            scheduler.sleep_between_chunks()
+
+        total_archived += written
+        total_deleted += deleted_day
+        files.append(str(out_path))
+        LOG.info(
+            "parquet capture %s: %d rows -> %s, deleted %d source rows in %.1fs",
+            day_str, written, out_path.name, deleted_day,
+            time.monotonic() - t0,
+        )
+
+    return {
+        "archived": total_archived,
+        "deleted": total_deleted,
+        "files": files,
+    }
+
+
+def _archive_and_prune_claim_history(conn, scheduler=None):
+    """Dispatch claim_history archive to the configured cold-path backend.
+
+    Default (PARQUET_CAPTURE_ENABLED=1): write date-partitioned Parquet
+    directly under PARQUET_DIR. Same shape as ``_archive_claim_history`` but
+    different storage format, and runs early in the pass (see
+    ``run_retention_once_with_sched``) so it does not get starved by
+    raw_strip / events_prune budget.
+
+    Rollback (PARQUET_CAPTURE_ENABLED=0 or pyarrow missing): fall back to the
+    legacy gzipped JSONL writer.
+    """
+    if PARQUET_CAPTURE_ENABLED and _HAS_PYARROW:
+        return _archive_claim_history_to_parquet(conn, scheduler=scheduler)
+    return _archive_claim_history(conn, scheduler=scheduler)
 
 
 def _prune_table_chunk(conn, table, time_col, cutoff_iso, batch):
@@ -737,54 +1074,13 @@ def run_retention_once(conn=None):
     t0 = time.monotonic()
     stats = {}
 
-    # 1. Strip raw JSON from old events (24h default)
+    # 1. Archive + prune old claim_history (14d default).
+    # Runs FIRST so the cold-path producer is not starved by raw_strip /
+    # events_prune budget. See run_retention_once_with_sched comment for
+    # background.
     try:
         t = time.monotonic()
-        n = _strip_old_raw(conn)
-        stats["raw_stripped"] = n
-        if n > 0:
-            LOG.info("stripped raw from %d events in %.1fs", n, time.monotonic() - t)
-    except Exception:
-        LOG.exception("raw strip failed")
-        stats["raw_stripped"] = -1
-
-    # 2. Prune old events (7d default)
-    try:
-        t = time.monotonic()
-        n = _prune_table(conn, "events", "ctime", EVENTS_RETENTION_SEC)
-        stats["events_pruned"] = n
-        if n > 0:
-            LOG.info("pruned %d events in %.1fs", n, time.monotonic() - t)
-    except Exception:
-        LOG.exception("events prune failed")
-        stats["events_pruned"] = -1
-
-    # 3. Prune old event_versions (same window as events)
-    try:
-        t = time.monotonic()
-        n = _prune_table(conn, "event_versions", "version_ts", EVENTS_RETENTION_SEC)
-        stats["event_versions_pruned"] = n
-        if n > 0:
-            LOG.info("pruned %d event_versions in %.1fs", n, time.monotonic() - t)
-    except Exception:
-        LOG.exception("event_versions prune failed")
-        stats["event_versions_pruned"] = -1
-
-    # 4. Prune old edges (14d default)
-    try:
-        t = time.monotonic()
-        n = _prune_table(conn, "edges", "ctime", EDGES_RETENTION_SEC)
-        stats["edges_pruned"] = n
-        if n > 0:
-            LOG.info("pruned %d edges in %.1fs", n, time.monotonic() - t)
-    except Exception:
-        LOG.exception("edges prune failed")
-        stats["edges_pruned"] = -1
-
-    # 5. Archive + prune old claim_history (14d default)
-    try:
-        t = time.monotonic()
-        archive_stats = _archive_claim_history(conn)
+        archive_stats = _archive_and_prune_claim_history(conn)
         stats["claims_archived"] = archive_stats["archived"]
         stats["claims_pruned"] = archive_stats["deleted"]
         stats["archive_files"] = archive_stats["files"]
@@ -796,6 +1092,50 @@ def run_retention_once(conn=None):
         LOG.exception("claim_history archive/prune failed")
         stats["claims_archived"] = -1
         stats["claims_pruned"] = -1
+
+    # 2. Strip raw JSON from old events (24h default)
+    try:
+        t = time.monotonic()
+        n = _strip_old_raw(conn)
+        stats["raw_stripped"] = n
+        if n > 0:
+            LOG.info("stripped raw from %d events in %.1fs", n, time.monotonic() - t)
+    except Exception:
+        LOG.exception("raw strip failed")
+        stats["raw_stripped"] = -1
+
+    # 3. Prune old events (7d default)
+    try:
+        t = time.monotonic()
+        n = _prune_table(conn, "events", "ctime", EVENTS_RETENTION_SEC)
+        stats["events_pruned"] = n
+        if n > 0:
+            LOG.info("pruned %d events in %.1fs", n, time.monotonic() - t)
+    except Exception:
+        LOG.exception("events prune failed")
+        stats["events_pruned"] = -1
+
+    # 4. Prune old event_versions (same window as events)
+    try:
+        t = time.monotonic()
+        n = _prune_table(conn, "event_versions", "version_ts", EVENTS_RETENTION_SEC)
+        stats["event_versions_pruned"] = n
+        if n > 0:
+            LOG.info("pruned %d event_versions in %.1fs", n, time.monotonic() - t)
+    except Exception:
+        LOG.exception("event_versions prune failed")
+        stats["event_versions_pruned"] = -1
+
+    # 5. Prune old edges (14d default)
+    try:
+        t = time.monotonic()
+        n = _prune_table(conn, "edges", "ctime", EDGES_RETENTION_SEC)
+        stats["edges_pruned"] = n
+        if n > 0:
+            LOG.info("pruned %d edges in %.1fs", n, time.monotonic() - t)
+    except Exception:
+        LOG.exception("edges prune failed")
+        stats["edges_pruned"] = -1
 
     # 6. WAL truncation is owned by the persistent writer thread (see
     # consumer.py _maybe_wal_truncate). Retention's chunked DELETE/UPDATE
@@ -926,22 +1266,15 @@ def run_retention_once_with_sched(scheduler, conn=None) -> dict:
             LOG.exception("retention op %s failed", label)
             stats[label] = -1
 
-    _run_op("raw_stripped",
-            lambda: _strip_old_raw(conn, scheduler=scheduler))
-    _run_op("events_pruned",
-            lambda: _prune_table(conn, "events", "ctime",
-                                  EVENTS_RETENTION_SEC, scheduler=scheduler))
-    _run_op("event_versions_pruned",
-            lambda: _prune_table(conn, "event_versions", "version_ts",
-                                  EVENTS_RETENTION_SEC, scheduler=scheduler))
-    _run_op("edges_pruned",
-            lambda: _prune_table(conn, "edges", "ctime",
-                                  EDGES_RETENTION_SEC, scheduler=scheduler))
-
-    # claim_history is a dict-returning op — handle separately to keep stats shape.
+    # claim_history archive runs FIRST (2026-05-08). It used to run last and
+    # was systematically starved by raw_strip / events_prune budget under
+    # pressure (skipped for ~2 weeks straight). The cold-path migration treats
+    # claim_history capture as the load-bearing step: Parquet partitions are
+    # the durable cold store the rest of the system increasingly depends on.
+    # Heavier ops follow.
     if not aborted:
         try:
-            arch = _archive_claim_history(conn, scheduler=scheduler)
+            arch = _archive_and_prune_claim_history(conn, scheduler=scheduler)
             stats["claims_archived"] = arch["archived"]
             stats["claims_pruned"] = arch["deleted"]
             stats["archive_files"] = arch["files"]
@@ -954,8 +1287,18 @@ def run_retention_once_with_sched(scheduler, conn=None) -> dict:
             LOG.exception("claim_history archive/prune failed")
             stats["claims_archived"] = -1
             stats["claims_pruned"] = -1
-    else:
-        stats["claims_skipped"] = True
+
+    _run_op("raw_stripped",
+            lambda: _strip_old_raw(conn, scheduler=scheduler))
+    _run_op("events_pruned",
+            lambda: _prune_table(conn, "events", "ctime",
+                                  EVENTS_RETENTION_SEC, scheduler=scheduler))
+    _run_op("event_versions_pruned",
+            lambda: _prune_table(conn, "event_versions", "version_ts",
+                                  EVENTS_RETENTION_SEC, scheduler=scheduler))
+    _run_op("edges_pruned",
+            lambda: _prune_table(conn, "edges", "ctime",
+                                  EDGES_RETENTION_SEC, scheduler=scheduler))
 
     # Incremental vacuum — single SQL call, no chunk loop. Skip if aborted.
     if not aborted:

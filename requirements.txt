@@ -9,3 +9,4 @@ redis==5.3.1
 fakeredis==2.21.3
 pytest==7.4.0
 pytest-asyncio==0.22.0
+pyarrow==24.0.0
