@@ -177,7 +177,11 @@ Filed during the retention re-enable + scheduler deploy. The scheduler is doing 
 
 ---
 
-### 3. Drop `stream_lag` from the retention gate
+### 3. Drop `stream_lag` from the retention gate — RESOLVED 2026-06-02
+
+**Status:** RESOLVED in code 2026-06-02. `STREAM_LAG_THRESHOLD_S` constant + `_evaluate_gate` check removed from `retention_scheduler.py`; `stream_lag_s` key removed from `health_state` thresholds dict; new test `test_high_stream_lag_does_not_gate` asserts 3600s lag does not skip a pass; backport gap-spec updated. VM override removal (`/opt/driftwatch/deploy/docker-compose.override.yml::RETENTION_STREAM_LAG_THRESHOLD_S`) deferred until next deploy.
+
+---
 
 **Where:** `retention_scheduler.py::_evaluate_gate`, the `STREAM_LAG_THRESHOLD_S` block.
 

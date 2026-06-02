@@ -53,7 +53,13 @@ LOG = logging.getLogger("labeler.retention.scheduler")
 # pulls them), wire that in instead.
 QUEUE_BACKLOG_THRESHOLD = int(os.getenv("RETENTION_BACKLOG_THRESHOLD", "1500"))
 QUEUE_DEPTH_THRESHOLD = int(os.getenv("RETENTION_QUEUE_DEPTH_THRESHOLD", "10000"))
-STREAM_LAG_THRESHOLD_S = float(os.getenv("RETENTION_STREAM_LAG_THRESHOLD_S", "60"))
+# NOTE on stream_lag: an earlier draft gated on ``stream_lag_s``, but that
+# signal is jetstream catch-up (``now - latest_event_time``), not a
+# measure of writer pressure. Every container restart inflates it
+# immediately (cursor rewind), which false-tripped the gate on an idle
+# writer. The signal remains observable in ``current_pressure`` and is
+# surfaced by platform_health / summary / /health/extended for its
+# intended purpose; the retention scheduler does not gate on it.
 
 # Wall-clock budgets.
 CHUNK_BUDGET_S = float(os.getenv("RETENTION_CHUNK_BUDGET_S", "3.0"))
@@ -158,8 +164,7 @@ class RetentionScheduler:
        because of us).
     2. Pass wall-clock exceeded ``PASS_BUDGET_S``.
     3. Per-chunk overruns exceed ``CHUNK_OVERRUN_TOLERANCE``.
-    4. Pressure (backlog / queue_depth / median_age / stream_lag) returns
-       above threshold mid-pass.
+    4. Pressure (backlog / queue_depth) returns above threshold mid-pass.
     """
 
     def __init__(
@@ -375,7 +380,6 @@ class RetentionScheduler:
             "thresholds": {
                 "backlog": QUEUE_BACKLOG_THRESHOLD,
                 "queue_depth": QUEUE_DEPTH_THRESHOLD,
-                "stream_lag_s": STREAM_LAG_THRESHOLD_S,
                 "chunk_budget_s": CHUNK_BUDGET_S,
                 "pass_budget_s": PASS_BUDGET_S,
                 "chunk_overrun_tolerance": CHUNK_OVERRUN_TOLERANCE,
@@ -431,9 +435,6 @@ class RetentionScheduler:
         backlog = snap.get("backlog", 0) or 0
         if backlog > QUEUE_BACKLOG_THRESHOLD:
             return f"backlog={backlog}>{QUEUE_BACKLOG_THRESHOLD}"
-        stream_lag = snap.get("stream_lag_s", 0.0) or 0.0
-        if stream_lag > STREAM_LAG_THRESHOLD_S:
-            return f"stream_lag={stream_lag:.0f}s>{STREAM_LAG_THRESHOLD_S:.0f}s"
         # queue_depth is the recheck-queue row count; it's a slower-moving
         # backpressure signal. Surfaced for completeness.
         queue_depth = snap.get("queue_depth", 0) or 0

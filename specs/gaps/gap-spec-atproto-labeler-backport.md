@@ -90,10 +90,12 @@ Backport `retention_scheduler.py` with:
 - pre-pass gate (`begin_pass`)
 - per-chunk gates (`before_chunk` / `after_chunk`)
 - backlog threshold abort
-- stream_lag threshold abort (with explicit doc that this is a hot-patch in driftwatch's case)
+- queue_depth threshold abort
 - chunk overrun tolerance
 - `rollback_lost` tripwire
 - partial-progress receipts
+
+**Do not backport a stream_lag threshold abort.** Driftwatch removed it 2026-06-02 (CLEANUP_DEBT.md #3): `stream_lag_s = now - latest_event_time` is jetstream catch-up, not writer pressure, and false-trips after every restart's cursor rewind. Keep `stream_lag_s` observable in platform_health / summary / /health/extended; just don't gate retention on it.
 
 And the retention pass ordering: **archive op first**, raw_strip / events_prune / event_versions_prune / edges_prune *after*.
 

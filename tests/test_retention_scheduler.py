@@ -86,7 +86,6 @@ class TestPrePassGate:
         "field,value,expected_marker",
         [
             ("backlog", 9999, "backlog"),
-            ("stream_lag_s", 999.0, "stream_lag"),
         ],
     )
     def test_skips_when_pressure_high(self, tmp_path, monkeypatch,
@@ -145,6 +144,33 @@ class TestPrePassGate:
 
         # 8520s = 142 minutes — typical prod value with longitudinal behind.
         stub = _PressureStub(backlog=10, median_dequeue_age_s=8520.0)
+        sched = RetentionScheduler(consumer=stub, sleep_between_s=0)
+        stats = retention.run_retention_once_with_sched(sched, conn=conn)
+
+        assert stats["raw_stripped"] == 1
+        assert sched.skipped_due_to_pressure == 0
+
+    def test_high_stream_lag_does_not_gate(self, tmp_path, monkeypatch):
+        """stream_lag_s measures jetstream catch-up (now - latest_event_time),
+        not writer pressure. Every container restart inflates it
+        immediately (cursor rewind), which used to false-trip the gate on
+        an idle writer. The scheduler must NOT gate on it. stream_lag_s
+        remains observable in platform_health / summary / /health/extended
+        for its intended purpose.
+        """
+        monkeypatch.setattr(retention, "ARCHIVE_DIR", tmp_path)
+        conn = _make_db()
+        conn.execute(
+            "INSERT INTO events VALUES (?, ?, ?, ?)",
+            ("at://x/1", _iso(-48 * 3600), "did:a", '{"x":1}'),
+        )
+        conn.commit()
+
+        # 3600s = the production hot-patched threshold value, which was
+        # itself an admission that the gate was firing for the wrong
+        # reasons. With the gate removed, even multi-hour lag must not
+        # block retention.
+        stub = _PressureStub(backlog=10, stream_lag_s=3600.0)
         sched = RetentionScheduler(consumer=stub, sleep_between_s=0)
         stats = retention.run_retention_once_with_sched(sched, conn=conn)
 
