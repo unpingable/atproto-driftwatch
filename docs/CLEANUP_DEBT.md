@@ -173,7 +173,15 @@ Legacy `run_retention_once` (CLI cold-pass) was left untouched; in that path a `
 
 ---
 
-### 2. Raise retention's `busy_timeout` to match the consumer's
+### 2. Raise retention's `busy_timeout` to match the consumer's — RESOLVED 2026-06-02
+
+**Status:** RESOLVED 2026-06-02. Extracted `RETENTION_BUSY_TIMEOUT_MS` module constant in `retention.py` (default 60000, env-overridable via `RETENTION_BUSY_TIMEOUT_MS`); both `run_retention_once_with_sched` and the legacy `run_retention_once` now apply the same value via `PRAGMA busy_timeout`. Validation harness `tests/test_retention_scheduler.py::TestBusyTimeoutAndLockContentionHarness::test_real_lock_contention_classifies_as_lock_pressure` opens two SQLite connections to a file DB, holds an exclusive write transaction on one, and verifies the other's retention chunk classifies the resulting `OperationalError("database is locked")` as `lock_pressure` (not -1) — proving CLEANUP_DEBT #1 + #2 compose correctly under real OS-level lock contention, not just mocked exceptions.
+
+Documented trade-off (in the module comment block): the scheduler's per-chunk gate fires BETWEEN chunks, not during a chunk's busy-wait. A chunk that waits the full 60s does not let the scheduler bail mid-wait — backlog accumulated during that window is not detected until the next chunk's pre-call gate. The win (fewer pointless aborts during transient contention) outweighs the cost (slightly longer backlog-detection latency under sustained contention).
+
+No VM override change required — the current `/opt/driftwatch/deploy/docker-compose.override.yml` does not set `RETENTION_BUSY_TIMEOUT_MS`, so the new 60s default takes effect automatically on next deploy.
+
+---
 
 **Where:** `retention.py::run_retention_once_with_sched`, the `conn.execute("PRAGMA busy_timeout=30000")` line on the own-conn path.
 

@@ -89,6 +89,25 @@ ARCHIVE_BATCH = 50_000
 # events to lock-conflict is not.
 BATCH_SLEEP_SEC = float(os.getenv("RETENTION_BATCH_SLEEP_SEC", "5.0"))
 
+# Busy timeout for retention's own SQLite write connection. Raised
+# 2026-06-02 from 30000 → 60000 to match the consumer's writer (which
+# uses 60s). The earlier 30s caused spurious soft-aborts on modest
+# writer-thread contention bursts that resolved within 30-60s. The
+# longer wait is acceptable because:
+#   - The scheduler's per-chunk gate fires BETWEEN chunks, not during
+#     a chunk's busy-wait. A chunk that waits the full 60s does not
+#     give the scheduler a chance to bail mid-wait — backlog
+#     accumulated during that window is not detected until the next
+#     chunk's pre-call gate. This is a documented trade-off; the win
+#     is fewer pointless aborts during transient contention.
+#   - A busy-wait that exhausts the timeout still raises
+#     ``sqlite3.OperationalError("database is locked")``, which the
+#     leaves now classify as ``_LockPressure`` (CLEANUP_DEBT #1) —
+#     soft abort with partial-progress preservation, not the -1
+#     real-bug sentinel.
+# See ``CLEANUP_DEBT.md`` #2 for the full design note.
+RETENTION_BUSY_TIMEOUT_MS = int(os.getenv("RETENTION_BUSY_TIMEOUT_MS", "60000"))
+
 # Cooperative scheduling thresholds for the writer-thread path. When ingest
 # backlog grows, retention sleeps longer between chunks so the writer can
 # drain. Multiplies BATCH_SLEEP_SEC.
@@ -1114,7 +1133,7 @@ def run_retention_once(conn=None):
     own_conn = conn is None
     if own_conn:
         conn = get_conn()
-        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute(f"PRAGMA busy_timeout={RETENTION_BUSY_TIMEOUT_MS}")
 
     t0 = time.monotonic()
     stats = {}
@@ -1288,7 +1307,7 @@ def run_retention_once_with_sched(scheduler, conn=None) -> dict:
     own_conn = conn is None
     if own_conn:
         conn = get_conn()
-        conn.execute("PRAGMA busy_timeout=30000")
+        conn.execute(f"PRAGMA busy_timeout={RETENTION_BUSY_TIMEOUT_MS}")
 
     t0 = time.monotonic()
     stats: dict = {}

@@ -302,6 +302,86 @@ class TestLockPressureClassification:
 
 
 # ----------------------------------------------------------------------
+# busy_timeout config + lock-contention harness (CLEANUP_DEBT.md #2).
+# ----------------------------------------------------------------------
+
+
+class TestBusyTimeoutAndLockContentionHarness:
+    """``RETENTION_BUSY_TIMEOUT_MS`` defaults to 60000 (matches the
+    consumer's writer connection). The harness below validates the
+    composed behavior of CLEANUP_DEBT #1 + #2 under REAL OS-level lock
+    contention (two SQLite connections, one holds an exclusive write
+    transaction): the retention chunk waits its busy_timeout, the
+    resulting ``OperationalError("database is locked")`` classifies as
+    lock_pressure (soft abort) instead of the -1 real-bug sentinel.
+
+    The harness uses a SHORT busy_timeout (200ms) for test speed; in
+    production the value is 60000ms. The shape under test is the
+    error-classification path, not the wall-clock value.
+    """
+
+    def test_default_busy_timeout_is_60s(self):
+        """Default RETENTION_BUSY_TIMEOUT_MS matches consumer's 60s."""
+        assert retention.RETENTION_BUSY_TIMEOUT_MS == 60000
+
+    def test_real_lock_contention_classifies_as_lock_pressure(
+        self, tmp_path, monkeypatch,
+    ):
+        """End-to-end: a second connection holds an exclusive write
+        transaction; retention's chunk hits busy_timeout, raises
+        OperationalError("database is locked"), and the scheduler
+        records lock_pressure (not -1). Proves #1 + #2 compose under
+        real lock contention, not just mocked exceptions.
+        """
+        import sqlite3 as _sqlite3
+        monkeypatch.setattr(retention, "ARCHIVE_DIR", tmp_path)
+        monkeypatch.setattr(retention, "BATCH_SLEEP_SEC", 0.0)
+
+        db_path = tmp_path / "harness.sqlite"
+        # _make_db with a file path returns a usable conn AND creates the
+        # schema. Insert old rows so retention has something to attempt.
+        setup_conn = _make_db(str(db_path))
+        for i in range(10):
+            setup_conn.execute(
+                "INSERT INTO events VALUES (?, ?, ?, ?)",
+                (f"at://x/{i}", _iso(-48 * 3600), "did:a", '{"x":1}'),
+            )
+        setup_conn.commit()
+
+        # conn_a: holds an exclusive write transaction for the duration
+        # of the test. SQLite serializes writers, so conn_b's first
+        # UPDATE chunk will block on busy_timeout.
+        conn_a = _sqlite3.connect(str(db_path), isolation_level=None,
+                                  check_same_thread=False)
+        conn_a.execute("BEGIN IMMEDIATE")
+
+        # conn_b: retention's connection. Short busy_timeout for test
+        # speed. In prod this is RETENTION_BUSY_TIMEOUT_MS=60000.
+        conn_b = _sqlite3.connect(str(db_path), check_same_thread=False)
+        conn_b.execute("PRAGMA busy_timeout=200")  # 200ms
+
+        stub = _PressureStub()
+        sched = RetentionScheduler(consumer=stub, sleep_between_s=0)
+        try:
+            stats = retention.run_retention_once_with_sched(sched, conn=conn_b)
+        finally:
+            try:
+                conn_a.execute("COMMIT")
+            except Exception:
+                pass
+            conn_a.close()
+            conn_b.close()
+            setup_conn.close()
+
+        # Strip attempt hit the lock, busy_timeout elapsed, error
+        # classified as lock_pressure instead of -1.
+        assert stats.get("raw_stripped_lock_pressure") is True, stats
+        assert stats["raw_stripped"] != -1
+        # No rows committed because the very first chunk was blocked.
+        assert stats["raw_stripped"] == 0
+
+
+# ----------------------------------------------------------------------
 # Tripwire: rollback_lost mid-pass aborts.
 # ----------------------------------------------------------------------
 
