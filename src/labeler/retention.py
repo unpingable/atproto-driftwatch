@@ -35,9 +35,37 @@ import json
 import logging
 import os
 import pathlib
+import sqlite3
 import time
 
 LOG = logging.getLogger("labeler.retention")
+
+
+class _LockPressure(Exception):
+    """Raised by a retention leaf when a chunk hits ``sqlite3.OperationalError(
+    "database is locked")`` — i.e. busy_timeout elapsed under writer contention.
+
+    Carries the partial row total committed by prior chunks of the same leaf,
+    so the scheduler caller can record honest stats instead of the ``-1``
+    sentinel that conflates "lock pressure" with "actual bug." See
+    ``docs/CLEANUP_DEBT.md`` #1.
+    """
+
+    def __init__(self, partial_total: int):
+        super().__init__(f"lock_pressure (partial={partial_total})")
+        self.partial_total = partial_total
+
+
+def _is_lock_pressure(exc: sqlite3.OperationalError) -> bool:
+    """True when an OperationalError message indicates busy-timeout pressure.
+
+    SQLite raises "database is locked" or "database table is locked" after
+    PRAGMA ``busy_timeout`` elapses with the lock still held by another
+    writer. Other OperationalError messages (syntax, missing table, …)
+    indicate real bugs and must NOT be classified as soft aborts.
+    """
+    msg = str(exc).lower()
+    return "database is locked" in msg or "database table is locked" in msg
 
 DEFAULT_INTERVAL_SEC = int(os.getenv("RETENTION_INTERVAL_SEC", str(3600)))  # 1h
 
@@ -105,6 +133,9 @@ def _strip_old_raw(conn, scheduler=None):
     Batched to avoid long-held write locks. Returns total rows stripped.
     Pass a ``RetentionScheduler`` to enable pressure-aware gating; the
     default ``NullScheduler`` gives legacy behavior.
+
+    Raises ``_LockPressure(total)`` if a chunk hits "database is locked"
+    after busy_timeout. Prior chunks' rows remain committed in the DB.
     """
     if scheduler is None:
         from .retention_scheduler import NullScheduler
@@ -115,7 +146,12 @@ def _strip_old_raw(conn, scheduler=None):
     while True:
         scheduler.before_chunk("raw_strip")
         t0 = time.monotonic()
-        n = _strip_raw_chunk(conn, cutoff_iso)
+        try:
+            n = _strip_raw_chunk(conn, cutoff_iso)
+        except sqlite3.OperationalError as e:
+            if _is_lock_pressure(e):
+                raise _LockPressure(total) from e
+            raise
         elapsed = time.monotonic() - t0
         scheduler.after_chunk("raw_strip", elapsed, n)
         total += n
@@ -126,7 +162,11 @@ def _strip_old_raw(conn, scheduler=None):
 
 
 def _prune_table(conn, table, time_col, retention_sec, scheduler=None):
-    """Delete rows older than retention window. Returns rows deleted."""
+    """Delete rows older than retention window. Returns rows deleted.
+
+    Raises ``_LockPressure(total)`` if a chunk hits "database is locked"
+    after busy_timeout. Prior chunks' deletions remain committed in the DB.
+    """
     if scheduler is None:
         from .retention_scheduler import NullScheduler
         scheduler = NullScheduler(sleep_between_s=BATCH_SLEEP_SEC)
@@ -137,7 +177,12 @@ def _prune_table(conn, table, time_col, retention_sec, scheduler=None):
     while True:
         scheduler.before_chunk(op_label)
         t0 = time.monotonic()
-        n = _prune_table_chunk(conn, table, time_col, cutoff_iso, DELETE_BATCH)
+        try:
+            n = _prune_table_chunk(conn, table, time_col, cutoff_iso, DELETE_BATCH)
+        except sqlite3.OperationalError as e:
+            if _is_lock_pressure(e):
+                raise _LockPressure(total) from e
+            raise
         elapsed = time.monotonic() - t0
         scheduler.after_chunk(op_label, elapsed, n)
         total += n
@@ -1262,6 +1307,17 @@ def run_retention_once_with_sched(scheduler, conn=None) -> dict:
             abort_reason = e.reason
             stats[f"{label}_partial"] = True
             LOG.warning("retention aborted during %s: %s", label, e.reason)
+        except _LockPressure as lp:
+            # Soft abort: busy_timeout elapsed during a chunk. Rows
+            # already committed by prior chunks remain in the DB.
+            # Record the honest partial count + lock_pressure flag;
+            # -1 is reserved for actually-unexpected exceptions.
+            stats[label] = lp.partial_total
+            stats[f"{label}_lock_pressure"] = True
+            LOG.warning(
+                "retention %s lock_pressure: %d rows committed before busy_timeout",
+                label, lp.partial_total,
+            )
         except Exception:
             LOG.exception("retention op %s failed", label)
             stats[label] = -1
@@ -1283,6 +1339,23 @@ def run_retention_once_with_sched(scheduler, conn=None) -> dict:
             abort_reason = e.reason
             stats["claims_partial"] = True
             LOG.warning("retention aborted during archive_claims: %s", e.reason)
+        except sqlite3.OperationalError as e:
+            if _is_lock_pressure(e):
+                # Partial parquet/gzip artifacts on disk are durable and
+                # idempotent-skipped on the next pass; deleted rows from
+                # any completed day remain deleted. Record the lock_pressure
+                # flag without claiming row counts we can't see from outside
+                # the archive call.
+                stats.setdefault("claims_archived", 0)
+                stats.setdefault("claims_pruned", 0)
+                stats["claims_lock_pressure"] = True
+                LOG.warning(
+                    "claim_history archive lock_pressure (partial artifacts on disk)"
+                )
+            else:
+                LOG.exception("claim_history archive/prune failed")
+                stats["claims_archived"] = -1
+                stats["claims_pruned"] = -1
         except Exception:
             LOG.exception("claim_history archive/prune failed")
             stats["claims_archived"] = -1

@@ -149,7 +149,15 @@ This is **not a tonight problem** — it's been latent for weeks. Tonight just m
 
 Filed during the retention re-enable + scheduler deploy. The scheduler is doing its job (zero `rollback_lost`, zero `drop_frac` across multiple aborted passes), but observation surfaced known shortcuts.
 
-### 1. Classify `sqlite3.OperationalError("database is locked")` as soft abort
+### 1. Classify `sqlite3.OperationalError("database is locked")` as soft abort — RESOLVED 2026-06-02
+
+**Status:** RESOLVED 2026-06-02. `_LockPressure` exception added to `retention.py`; `_strip_old_raw` and `_prune_table` catch `OperationalError("database is locked"|"database table is locked")` and re-raise as `_LockPressure(partial_total)`. `_run_op` and the inline archive block in `run_retention_once_with_sched` catch and set `stats[label] = partial_total` + `stats[f"{label}_lock_pressure"] = True`. The `-1` sentinel is now reserved for actually-unexpected exceptions. Four tests in `tests/test_retention_scheduler.py::TestLockPressureClassification` cover both the lock-pressure path and the unexpected-error fallthrough.
+
+Single-classification scope: only `lock_pressure` is distinguished (not the speculative `reader_pinned` / `busy_timeout` sub-classes — the SQLite error message doesn't distinguish, and pre-building the taxonomy would be speculative). When reader-attribution lands (#4), a sub-classification pass can refine this.
+
+Legacy `run_retention_once` (CLI cold-pass) was left untouched; in that path a `_LockPressure` raise will be caught by `except Exception` and still recorded as `-1`. The production path uses `run_retention_once_with_sched`; the legacy path is secondary.
+
+---
 
 **Where:** `retention.py::_run_op` and the leaf functions invoked from it.
 

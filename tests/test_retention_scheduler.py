@@ -179,6 +179,129 @@ class TestPrePassGate:
 
 
 # ----------------------------------------------------------------------
+# Lock-pressure classification (CLEANUP_DEBT.md #1).
+# ----------------------------------------------------------------------
+
+
+class TestLockPressureClassification:
+    """``sqlite3.OperationalError("database is locked")`` is busy_timeout-
+    elapsed soft abort under writer contention. The scheduler must
+    classify it as ``lock_pressure`` (with the partial row count
+    preserved), NOT as the ``-1`` sentinel which is reserved for
+    actually-unexpected exceptions (real bugs). See CLEANUP_DEBT.md #1.
+    """
+
+    def test_raw_strip_lock_pressure_preserves_partial(self, tmp_path, monkeypatch):
+        """Lock-busy mid-strip records the partial row count + lock_pressure flag."""
+        import sqlite3 as _sqlite3
+        monkeypatch.setattr(retention, "ARCHIVE_DIR", tmp_path)
+        monkeypatch.setattr(retention, "STRIP_BATCH", 2)
+        monkeypatch.setattr(retention, "BATCH_SLEEP_SEC", 0.0)
+
+        conn = _make_db()
+        for i in range(20):
+            conn.execute(
+                "INSERT INTO events VALUES (?, ?, ?, ?)",
+                (f"at://x/{i}", _iso(-48 * 3600), "did:a", '{"x":1}'),
+            )
+        conn.commit()
+
+        # _strip_raw_chunk: succeed 3 times, then raise busy-timeout shape.
+        original_chunk = retention._strip_raw_chunk
+        call_count = {"n": 0}
+
+        def hooked_chunk(conn_, cutoff_iso):
+            call_count["n"] += 1
+            if call_count["n"] > 3:
+                raise _sqlite3.OperationalError("database is locked")
+            return original_chunk(conn_, cutoff_iso)
+
+        monkeypatch.setattr(retention, "_strip_raw_chunk", hooked_chunk)
+
+        stub = _PressureStub()
+        sched = RetentionScheduler(consumer=stub, sleep_between_s=0)
+        stats = retention.run_retention_once_with_sched(sched, conn=conn)
+
+        # 3 chunks * STRIP_BATCH=2 = 6 rows stripped before busy-timeout.
+        assert stats["raw_stripped"] == 6, stats
+        assert stats.get("raw_stripped_lock_pressure") is True
+        # Must NOT be the -1 sentinel (reserved for real bugs).
+        assert stats["raw_stripped"] != -1
+
+    def test_unexpected_operational_error_stays_minus_one(self, tmp_path, monkeypatch):
+        """A non-lock OperationalError (real-bug shape) still records -1."""
+        import sqlite3 as _sqlite3
+        monkeypatch.setattr(retention, "ARCHIVE_DIR", tmp_path)
+        monkeypatch.setattr(retention, "STRIP_BATCH", 2)
+        monkeypatch.setattr(retention, "BATCH_SLEEP_SEC", 0.0)
+
+        conn = _make_db()
+        for i in range(10):
+            conn.execute(
+                "INSERT INTO events VALUES (?, ?, ?, ?)",
+                (f"at://x/{i}", _iso(-48 * 3600), "did:a", '{"x":1}'),
+            )
+        conn.commit()
+
+        def bad_chunk(conn_, cutoff_iso):
+            raise _sqlite3.OperationalError("no such table: nonexistent")
+
+        monkeypatch.setattr(retention, "_strip_raw_chunk", bad_chunk)
+
+        stub = _PressureStub()
+        sched = RetentionScheduler(consumer=stub, sleep_between_s=0)
+        stats = retention.run_retention_once_with_sched(sched, conn=conn)
+
+        assert stats["raw_stripped"] == -1
+        assert "raw_stripped_lock_pressure" not in stats
+
+    def test_archive_lock_pressure_sets_flag(self, tmp_path, monkeypatch):
+        """Lock-busy in claim_history archive sets claims_lock_pressure flag;
+        does NOT record -1 sentinels. Partial parquet/gzip artifacts on disk
+        are durable and idempotent-skipped on the next pass.
+        """
+        import sqlite3 as _sqlite3
+        monkeypatch.setattr(retention, "ARCHIVE_DIR", tmp_path)
+        conn = _make_db()
+
+        def hooked_archive(conn_, scheduler=None):
+            raise _sqlite3.OperationalError("database is locked")
+
+        monkeypatch.setattr(
+            retention, "_archive_and_prune_claim_history", hooked_archive,
+        )
+
+        stub = _PressureStub()
+        sched = RetentionScheduler(consumer=stub, sleep_between_s=0)
+        stats = retention.run_retention_once_with_sched(sched, conn=conn)
+
+        assert stats.get("claims_lock_pressure") is True
+        # setdefault(...,0) — not -1.
+        assert stats["claims_archived"] == 0
+        assert stats["claims_pruned"] == 0
+
+    def test_archive_unexpected_error_stays_minus_one(self, tmp_path, monkeypatch):
+        """A non-lock exception in archive still records -1 sentinels."""
+        monkeypatch.setattr(retention, "ARCHIVE_DIR", tmp_path)
+        conn = _make_db()
+
+        def hooked_archive(conn_, scheduler=None):
+            raise RuntimeError("unexpected bug")
+
+        monkeypatch.setattr(
+            retention, "_archive_and_prune_claim_history", hooked_archive,
+        )
+
+        stub = _PressureStub()
+        sched = RetentionScheduler(consumer=stub, sleep_between_s=0)
+        stats = retention.run_retention_once_with_sched(sched, conn=conn)
+
+        assert stats["claims_archived"] == -1
+        assert stats["claims_pruned"] == -1
+        assert "claims_lock_pressure" not in stats
+
+
+# ----------------------------------------------------------------------
 # Tripwire: rollback_lost mid-pass aborts.
 # ----------------------------------------------------------------------
 
