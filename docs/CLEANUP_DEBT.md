@@ -195,7 +195,7 @@ No VM override change required — the current `/opt/driftwatch/deploy/docker-co
 
 ### 3. Drop `stream_lag` from the retention gate — RESOLVED 2026-06-02
 
-**Status:** RESOLVED in code 2026-06-02. `STREAM_LAG_THRESHOLD_S` constant + `_evaluate_gate` check removed from `retention_scheduler.py`; `stream_lag_s` key removed from `health_state` thresholds dict; new test `test_high_stream_lag_does_not_gate` asserts 3600s lag does not skip a pass; backport gap-spec updated. VM override removal (`/opt/driftwatch/deploy/docker-compose.override.yml::RETENTION_STREAM_LAG_THRESHOLD_S`) deferred until next deploy.
+**Status:** RESOLVED 2026-06-04. Code shipped 2026-06-02 (commit `08281a7`): `STREAM_LAG_THRESHOLD_S` constant + `_evaluate_gate` check removed from `retention_scheduler.py`; `stream_lag_s` key removed from `health_state` thresholds dict; new test `test_high_stream_lag_does_not_gate` asserts 3600s lag does not skip a pass; backport gap-spec updated. VM verified clean 2026-06-04: deployed container at `GIT_SHA=08281a7`, `docker-compose.override.yml` has no `RETENTION_STREAM_LAG_THRESHOLD_S` entry, live container env has no `RETENTION_*` vars set.
 
 ---
 
