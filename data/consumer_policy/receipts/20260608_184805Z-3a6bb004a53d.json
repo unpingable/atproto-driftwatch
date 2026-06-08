@@ -1,0 +1,34 @@
+{
+  "consumer_id": "driftwatch",
+  "policy_version": "external_advisory_caveats-v1.0.0",
+  "policy_artifact_ref": "driftwatch/scripts/consumer_policy/policy.py",
+  "action_taken": "advisory_caveat_roster_admission",
+  "emitted_at": "2026-06-08T18:48:05Z",
+  "input_packet": {
+    "evidence_source": "derived/derived-39549897-did-plc-e4elbtctnfqocyfcml6h2lf7-fringe-media.evidence.json",
+    "labeler_did": "did:plc:e4elbtctnfqocyfcml6h2lf7",
+    "labeler_handle": "skywatch.blue",
+    "label_value": "fringe-media",
+    "input_hash": "ddaf736fbf48c7789edc99c5fd542dfe4337e49a85fd5edc98998aba9b48fb50"
+  },
+  "inherited_caveats": [
+    "non_global_provenance"
+  ],
+  "roster_entry": {
+    "labeler_did": "did:plc:e4elbtctnfqocyfcml6h2lf7",
+    "labeler_handle": "skywatch.blue",
+    "label_value": "fringe-media",
+    "target_uri": "at://did:plc:5gy2ohzlg2iszo25tziw4ixz/app.bsky.feed.post/3mns4v565o22a",
+    "target_did": null,
+    "admitted_at": "2026-06-08T18:48:05Z",
+    "input_packet_hash": "ddaf736fbf48c7789edc99c5fd542dfe4337e49a85fd5edc98998aba9b48fb50",
+    "input_evidence_source": "derived/derived-39549897-did-plc-e4elbtctnfqocyfcml6h2lf7-fringe-media.evidence.json",
+    "inherited_caveats": [
+      "non_global_provenance"
+    ],
+    "policy_version": "external_advisory_caveats-v1.0.0"
+  },
+  "discipline_note": "consumer_scope is opt_in:driftwatch; this admission does NOT promote the underlying emitter_declared finding to global_platform. non_global_provenance is inherited and must be preserved by any downstream consumer that consults this roster.",
+  "receipt_sha256": "3a6bb004a53de7c30401daa737da577b76526478e550a6251f29cf1d13519168",
+  "receipt_path": "data/consumer_policy/receipts/20260608_184805Z-3a6bb004a53d.json"
+}

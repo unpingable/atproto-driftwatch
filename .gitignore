@@ -3,7 +3,11 @@ __pycache__/
 .env
 deploy/.env.prod
 deploy/.env
-data/
+# data/* (not data/) so the dir is traversable; specific subdirs can be
+# un-ignored. Bundle G: data/consumer_policy/ holds the consumer-policy
+# roster + receipts that Labelwatch's specimen-003 cites by sha.
+data/*
+!data/consumer_policy/
 *.db
 *.sqlite
 *.pyc

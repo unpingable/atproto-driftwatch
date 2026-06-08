@@ -1,0 +1,30 @@
+[
+  {
+    "labeler_did": "did:plc:e4elbtctnfqocyfcml6h2lf7",
+    "labeler_handle": "skywatch.blue",
+    "label_value": "fringe-media",
+    "target_uri": "at://did:plc:5gy2ohzlg2iszo25tziw4ixz/app.bsky.feed.post/3mns4v565o22a",
+    "target_did": null,
+    "admitted_at": "2026-06-08T18:48:05Z",
+    "input_packet_hash": "ddaf736fbf48c7789edc99c5fd542dfe4337e49a85fd5edc98998aba9b48fb50",
+    "input_evidence_source": "derived/derived-39549897-did-plc-e4elbtctnfqocyfcml6h2lf7-fringe-media.evidence.json",
+    "inherited_caveats": [
+      "non_global_provenance"
+    ],
+    "policy_version": "external_advisory_caveats-v1.0.0"
+  },
+  {
+    "labeler_did": "did:plc:newitj5jo3uel7o4mnf3vj2o",
+    "labeler_handle": "xblock.aendra.dev",
+    "label_value": "twitter-screenshot",
+    "target_uri": "at://did:plc:tvl7y7k63baq2mr6isfjjibp/app.bsky.feed.post/3mcpldqcgik2m",
+    "target_did": null,
+    "admitted_at": "2026-06-08T18:48:27Z",
+    "input_packet_hash": "13b17c7b56d75bbebe0e81d3ee113fa1287ea083493e5716138813018362325d",
+    "input_evidence_source": "derived/derived-39552057-did-plc-newitj5jo3uel7o4mnf3vj2o-twitter-screenshot.evidence.json",
+    "inherited_caveats": [
+      "non_global_provenance"
+    ],
+    "policy_version": "external_advisory_caveats-v1.0.0"
+  }
+]

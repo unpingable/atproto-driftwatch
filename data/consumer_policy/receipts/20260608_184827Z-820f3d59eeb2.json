@@ -1,0 +1,34 @@
+{
+  "consumer_id": "driftwatch",
+  "policy_version": "external_advisory_caveats-v1.0.0",
+  "policy_artifact_ref": "driftwatch/scripts/consumer_policy/policy.py",
+  "action_taken": "advisory_caveat_roster_admission",
+  "emitted_at": "2026-06-08T18:48:27Z",
+  "input_packet": {
+    "evidence_source": "derived/derived-39552057-did-plc-newitj5jo3uel7o4mnf3vj2o-twitter-screenshot.evidence.json",
+    "labeler_did": "did:plc:newitj5jo3uel7o4mnf3vj2o",
+    "labeler_handle": "xblock.aendra.dev",
+    "label_value": "twitter-screenshot",
+    "input_hash": "13b17c7b56d75bbebe0e81d3ee113fa1287ea083493e5716138813018362325d"
+  },
+  "inherited_caveats": [
+    "non_global_provenance"
+  ],
+  "roster_entry": {
+    "labeler_did": "did:plc:newitj5jo3uel7o4mnf3vj2o",
+    "labeler_handle": "xblock.aendra.dev",
+    "label_value": "twitter-screenshot",
+    "target_uri": "at://did:plc:tvl7y7k63baq2mr6isfjjibp/app.bsky.feed.post/3mcpldqcgik2m",
+    "target_did": null,
+    "admitted_at": "2026-06-08T18:48:27Z",
+    "input_packet_hash": "13b17c7b56d75bbebe0e81d3ee113fa1287ea083493e5716138813018362325d",
+    "input_evidence_source": "derived/derived-39552057-did-plc-newitj5jo3uel7o4mnf3vj2o-twitter-screenshot.evidence.json",
+    "inherited_caveats": [
+      "non_global_provenance"
+    ],
+    "policy_version": "external_advisory_caveats-v1.0.0"
+  },
+  "discipline_note": "consumer_scope is opt_in:driftwatch; this admission does NOT promote the underlying emitter_declared finding to global_platform. non_global_provenance is inherited and must be preserved by any downstream consumer that consults this roster.",
+  "receipt_sha256": "820f3d59eeb2d21d358378326c389d8c8e5c652f9dd62021124a866394eeed1e",
+  "receipt_path": "data/consumer_policy/receipts/20260608_184827Z-820f3d59eeb2.json"
+}
