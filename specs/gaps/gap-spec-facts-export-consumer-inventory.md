@@ -286,3 +286,80 @@ B as standing follow-up." All three are valid.
 - [x] Open questions for Phase 3 enumerated.
 
 The user can ratify (or amend) Path A/B without a second discovery pass.
+
+## Ratification — 2026-06-10
+
+**Decision: A now → B later, with bogus-timestamp quarantine pulled into A.**
+
+Phase 3 produces a compatibility `facts.sqlite` snapshot from Parquet via
+DuckDB. Labelwatch consumes it unchanged through the existing ATTACH path.
+Path B (direct Parquet/DuckDB consumption by labelwatch) is filed as
+Phase 3.5 / standing follow-up after snapshot writer behavior is observed.
+
+### Doctrine framing (load-bearing)
+
+> Parquet is authoritative past.
+> DuckDB is the question engine.
+> `facts.sqlite` is a compatibility projection/cache, not the source of custody.
+
+This phrasing matters. Without it, a future re-read of Phase 3 will mistake
+the snapshot for canonical state and the cold-path doctrine slips. Cite this
+framing in the Phase 3 slice spec and the writer module's header.
+
+### Amendment: bogus-timestamp quarantine is in-scope for Phase 3
+
+Open question #4 (bogus timestamp policy) is **resolved at the writer
+boundary, not deferred**. Phase 1 carries ~25k bogus-year rows; labelwatch's
+lag calc would treat a 1997 `created_epoch` as 25 years of lag — silently
+wrong, not loudly wrong. Silent wrong is the failure mode the doctrine is
+trying to prevent.
+
+Policy:
+
+```
+valid_created_epoch:
+  >= 2020-01-01
+  <= generated_at + 1 day
+```
+
+Rows outside the band are excluded from `uri_fingerprint` and counted in
+the receipt. No silent pass-through.
+
+### Why A and not B (preserved for review)
+
+- Inventory shows labelwatch reads 2 of 5 facts tables, 7 of 12 columns,
+  with the consumer footprint localized to `hosting.py` and `scan.py`.
+  Small surface, well-localized — exactly the shape where the compatibility
+  snapshot is cheap and the consumer rewrite is the optional follow-up.
+- B bundles producer migration + consumer migration + new runtime failure
+  modes + the `tmp_candidate_uris` JOIN rewrite. Shipping all four in one
+  slice means a DuckDB issue blocks both observatories.
+- The `tmp_candidate_uris` JOIN against `drift.uri_fingerprint` is the
+  Path B site to learn cheaply about. Phase 3.5 spike targets that JOIN
+  first; if it works, identity facts is paperwork; if it doesn't, we
+  learned at low cost.
+
+### What this ratification does NOT authorize
+
+- No direct labelwatch DuckDB dependency.
+- No `scan.py` rewrite.
+- No drop of the three currently-unread tables (`fingerprint_hourly`,
+  `fingerprint_bounds`, `meta`) without a separate decision. Preserve only
+  if cheap; explicit decision required to drop.
+- No new labelwatch consumer contract.
+
+### Phase 3 slice handle
+
+Filed as a sibling spec: see `gap-spec-facts-export-duckdb-snapshot-001.md`
+for scope, manifest fields, acceptance tests, and non-goals. That spec
+inherits this ratification verbatim.
+
+### Open questions parked (still parked, narrowed)
+
+1. Retention of compatibility snapshot — still open, default to atomic
+   rename + last-good-on-disk semantics until a manifest cadence is
+   needed.
+2. DuckDB vs pyarrow writer — defer to Phase 3 implementer; either is
+   acceptable as long as the manifest is emitted.
+3. `tmp_candidate_uris` JOIN — parked for Phase 3.5, not blocking Phase 3.
+4. Bogus timestamp policy — **resolved above**, no longer open.
