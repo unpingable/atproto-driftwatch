@@ -17,6 +17,14 @@ path list, and a null partition window.
 SQLite producer stored source ``claim_history.rowid`` there; Parquet does not
 carry that rowid. V0 writes a deterministic scan ordinal derived from sorted
 partition/file order and in-file scan order.
+
+Forward note for Phase 3.5 (`gap-spec-facts-export-duckdb-snapshot-001.md
+§ Phase 3.5 handle`): V0 ``rowid_src`` is a producer-local scan ordinal,
+NOT ``claim_history.rowid``. Labelwatch consumers must not treat it as
+stable source-table identity (per the consumer inventory, labelwatch
+does not read this column at all). If Phase 3.5 surfaces a need for
+stable source identity, rename or replace this column then; do not
+back-fit semantics into the V0 field.
 """
 
 from __future__ import annotations
@@ -119,7 +127,13 @@ def _ensure_snapshot_schema(conn: sqlite3.Connection) -> None:
 
 
 def _copy_identity(identity_source_path: pathlib.Path, out_conn: sqlite3.Connection) -> int:
-    source = sqlite3.connect(str(identity_source_path))
+    # Open the identity DB read-only via the SQLite URI form. If the snapshot
+    # writer ever runs against the live ``labeler.sqlite``, a read-only
+    # connection prevents accidental contention with the writer's hot path.
+    source = sqlite3.connect(
+        f"file:{identity_source_path}?mode=ro",
+        uri=True,
+    )
     try:
         rows = source.execute(
             """
@@ -186,14 +200,16 @@ def _read_uri_rows(
                 SELECT
                     post_uri,
                     claim_fingerprint AS fingerprint,
-                    CAST(epoch(try_cast(createdAt AS TIMESTAMPTZ)) AS BIGINT) AS created_epoch,
-                    row_number() OVER () AS row_in_file
+                    CAST(epoch(try_cast(createdAt AS TIMESTAMPTZ)) AS BIGINT) AS created_epoch
                 FROM read_parquet({_duckdb_literal(str(path))})
                 WHERE post_uri IS NOT NULL
                   AND claim_fingerprint IS NOT NULL
             """
-            for post_uri, fingerprint, created_epoch, row_in_file in con.execute(sql).fetchall():
-                rowid_src = ordinal_base + int(row_in_file)
+            rows_this_file = con.execute(sql).fetchall()
+            for local_idx, (post_uri, fingerprint, created_epoch) in enumerate(rows_this_file):
+                # rowid_src is a contiguous scan ordinal across files in
+                # sorted partition order — see module docstring.
+                rowid_src = ordinal_base + local_idx + 1
                 if (
                     created_epoch is None
                     or created_epoch < _BOGUS_MIN_EPOCH
@@ -207,11 +223,12 @@ def _read_uri_rows(
                     int(created_epoch),
                     rowid_src,
                 )
-            ordinal_base += int(
-                con.execute(
-                    f"SELECT COUNT(*) FROM read_parquet({_duckdb_literal(str(path))})"
-                ).fetchone()[0]
-            )
+            # Advance the ordinal by the kept-row count. We dropped the
+            # separate `SELECT COUNT(*) FROM read_parquet(...)` rescan
+            # the V0 writer originally used to advance from the unfiltered
+            # row total — that was a second pass over the same file for no
+            # consumer-visible benefit (labelwatch does not read rowid_src).
+            ordinal_base += len(rows_this_file)
     finally:
         con.close()
 
