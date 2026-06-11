@@ -80,6 +80,10 @@ def main():
     dwsummary = dwsub.add_parser("summary", help="human-readable summary of current state")
     dwsummary.add_argument("--hours", type=int, default=1, help="lookback window in hours (default: 1 for interactive use)")
     dwsummary.add_argument("--top", type=int, default=10, help="top N clusters")
+    dwfacts = dwsub.add_parser("facts-snapshot", help="build DuckDB-backed facts.sqlite snapshot")
+    dwfacts.add_argument("--parquet-root", default=None, help="root containing claim_history/date=*/part-*.parquet")
+    dwfacts.add_argument("--identity-db", default=None, help="SQLite DB containing actor_identity_current")
+    dwfacts.add_argument("--out", default=None, help="output facts.sqlite path")
 
     args = parser.parse_args()
     if args.cmd == "quarantine" and args.qcmd == "list":
@@ -247,6 +251,14 @@ def main():
         report = cluster_report(conn=conn, top_n=args.top, hours=args.hours)
         conn.close()
         print(format_summary(report))
+    elif args.cmd == "driftwatch" and args.dwcmd == "facts-snapshot":
+        from .facts_export_duckdb_snapshot import export_snapshot_once
+        manifest = export_snapshot_once(
+            parquet_root=args.parquet_root,
+            identity_source_path=args.identity_db,
+            output_path=args.out,
+        )
+        print(json.dumps(manifest, indent=2, sort_keys=True))
     else:
         parser.print_help()
 

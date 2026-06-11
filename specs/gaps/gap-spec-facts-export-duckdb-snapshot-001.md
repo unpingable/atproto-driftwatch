@@ -23,20 +23,28 @@ Phase 2.5 decision in `gap-spec-facts-export-consumer-inventory.md`.
 
 Cite this in the writer module's header. The line is not decoration — it
 is the difference between Path A as a doctrinally-impure-adapter (correct)
-and Path A as "see, SQLite forever" (incorrect re-read by a future goblin).
+and Path A as "see, SQLite forever" (incorrect re-read by a future maintainer).
 
 ## Premise
 
 Phase 2.5 ratified `A now → B later`. Phase 3 is the implementation of A.
 
-Produce a fresh `facts.sqlite` at retention time by reading Parquet (via
-DuckDB) and writing SQLite. Labelwatch consumes it unchanged via the
-existing ATTACH path. No labelwatch changes are in scope.
+Produce a fresh `facts.sqlite` at retention time by materializing the V0
+consumer facts projection. `uri_fingerprint` is derived from existing
+`claim_history` Parquet through DuckDB. `actor_identity_facts` is derived
+from Driftwatch SQLite `actor_identity_current` for V0, matching today's
+projection. DuckDB/Parquet are introduced here as snapshot/materialization
+machinery; this phase does not require pre-existing identity Parquet.
+Labelwatch consumes the output unchanged via the existing ATTACH path. No
+labelwatch changes are in scope.
 
 ## Scope (what the slice produces)
 
-1. **Reader:** open the existing Parquet partitions written by Phase 1 /
-   Phase 3.5 (see `gap-spec-cold-path-phase-3.5-forward-parquet-capture.md`).
+1. **Reader:** open the existing cold-path Parquet partitions where they
+   already exist. For V0 this means `claim_history` partitions written by
+   Phase 1 / Phase 3.5 (see
+   `gap-spec-cold-path-phase-3.5-forward-parquet-capture.md`). Identity
+   facts use the SQLite source split called out above.
 2. **Writer:** materialize a fresh `facts.sqlite.tmp` with the schemas
    labelwatch consumes (per the inventory).
 3. **Populate at least:**
@@ -113,9 +121,9 @@ Acceptance test 5 below asserts this.
 
 | Doctrine | Phase 3 posture |
 |---|---|
-| Hot/cold separation | Snapshot writes from Parquet, not from hot SQLite. |
+| Hot/cold separation | `uri_fingerprint` writes from Parquet; V0 identity facts use the current SQLite projection until an identity cold-path stream exists. |
 | Single-writer invariant on hot DB | Unaffected; no hot DB writes here. |
-| Custody | Parquet is canonical; manifest documents the projection. |
+| Custody | Parquet is canonical for `claim_history`; the V0 manifest documents the mixed-source projection. |
 | Detect-only structural constraint | No labels emitted; this is a derived artifact. |
 | Aggregate-first | `uri_fingerprint` is per-URI but that's the existing contract, not new surface. |
 
@@ -127,8 +135,9 @@ Acceptance test 5 below asserts this.
    byte-for-byte (8 columns, types, primary key).
 3. `uri_fingerprint` schema matches current consumer contract byte-for-byte
    (4 columns, types, primary key + `idx_uri_fp` index).
-4. Row counts match fixture Parquet input after policy filters
-   (identity-side: no filter; uri-side: minus bogus-epoch quarantine).
+4. Row counts match fixtures: identity rows come from the SQLite
+   `actor_identity_current` fixture without filtering; URI rows come from
+   Parquet after bogus-epoch quarantine filters.
 5. Bogus `created_epoch` rows (year < 2020 OR > generated_at + 1 day) are
    quarantined and counted in the manifest. Fixture includes at least one
    row at year=1997 and one at year=2199.
@@ -136,10 +145,10 @@ Acceptance test 5 below asserts this.
    `facts.sqlite`. (Run `scan.py` derive pass against the snapshot in a
    test fixture; assert it does not raise and `lag_sec_claimed` falls
    within sensible bounds.)
-7. Missing or empty Parquet input produces a controlled empty snapshot
-   (manifest with row_counts: 0) **or** a refusal with a documented exit
-   code — not partial junk. Choose at implementation time; document in
-   the writer header.
+7. Missing or empty Parquet input produces a controlled identity-only
+   snapshot: identity row counts come from SQLite, URI row count is 0,
+   quarantine count is 0, input paths are empty, and partition window is
+   null — not partial junk. Document this in the writer header.
 8. Manifest records input Parquet paths, output path, per-table row
    counts, and quarantine counts. JSON parses; required fields present.
 
@@ -164,10 +173,11 @@ If the snapshot writer misbehaves in production:
 2. The last successfully-renamed `facts.sqlite` stays in place (atomic
    rename guarantee). Labelwatch continues consuming it; mtime ages but
    that is the existing failure mode (`snapshot=0` + caveat, no 5xx).
-3. The pre-Phase-3 producer (the SQLite-backed `facts_export.py`) is
-   **not** the rollback target — it depends on the hot DB scan path that
-   the cold-path doctrine retired. Rollback to "last good snapshot until
-   diagnosis" is the only supported state.
+3. The pre-Phase-3 URI producer path (the SQLite-backed `facts_export.py`)
+   is **not** the rollback target — it depends on the hot claim-history scan
+   path that the cold-path doctrine retired. V0 identity still deliberately
+   uses the current SQLite identity projection. Rollback to "last good
+   snapshot until diagnosis" is the only supported state.
 4. Diagnosis happens against the manifest + the writer log, not against
    the consumer.
 
