@@ -175,6 +175,58 @@ If the trend witness shows the floor is bounded and tolerable, this stays a cand
 If it shows the tail growing, this is the threshold the surplus-capacity fix should
 restore.
 
+## First read — 2026-06-25 (20.5h, 22 hourly samples)
+
+Span `2026-06-24T19:35Z → 2026-06-25T16:07Z`. Mean flow **1,152 attempts/hr vs
+1,150 new/hr** — drain and inflow matched to within noise.
+
+| metric | start → end | Δ (20.5h) |
+|---|---|---|
+| `pending_total` | 323,807 → 323,742 | −65 (flat) |
+| `oldest_pending_hours` | 249.99 → 249.70 | −0.29 (pinned ~10.4d) |
+| `pending_gt_24h` | 297,206 → 296,102 | −1,104 |
+| `pending_gt_72h` | 232,641 → 242,512 | **+9,871 (+481/h)** |
+| `pending_gt_168h` | 108,810 → 110,817 | **+2,007 (+98/h)** |
+
+Floor is **held, not frozen**: 20.5h of wall-clock elapsed; a frozen floor would have
+*gained* +20.5h of age, but `oldest_pending_hours` moved −0.29h. The sweep advances
+the front ~1h of `first_seen` per wall-clock hour — holds the ~10.4d lag constant,
+never closes it.
+
+Verdict — the nasty middle case (not broken enough to touch, not healthy enough to
+ignore):
+
+- **Headline health:** stable (count flat, no leak)
+- **Coverage lag:** bounded (~10.4d floor held)
+- **Staleness distribution:** worsening (>72h +481/h, >7d +98/h)
+- **Capacity verdict:** matched, **no surplus**
+- **Action:** observe longer; do **not** tune blindly
+
+Sharp read: **the resolver is behaving correctly under the wrong capacity envelope.**
+Fair sweep, stable floor, no leak — but zero slack, so the mid-distribution mass ages
+into uglier buckets faster than the front drains. Green dashboard, asbestos in the
+walls.
+
+Caveat on the >7d growth: much of it is likely the **original 3–7d mass (123,859 rows,
+first_seen ≈ 2026-06-17..21) crossing the 7-day line**, which finishes ≈ **2026-06-28**.
+That is a wave, not necessarily a permanent slope. Re-read ≈ **2026-06-29** (after the
+wave should have cleared) to distinguish transient from linear decay.
+
+### Tripwires (added now, so the next read isn't a judgment call)
+
+1. **`pending_gt_168h` still rising after ≈2026-06-28** (old 3–7d wave should have
+   crossed) → not transient; **file the fix.**
+2. **`oldest_pending_hours` rising materially above ~250h** → floor no longer held;
+   **fix sooner.**
+3. **`pending_total` also rising** → capacity is no longer merely "no surplus," it is
+   **losing**; fix is not optional.
+
+Fix preference holds: **dedicated backlog lane beats a `BATCH_SIZE` bump** — a
+`BATCH_SIZE` bump is aspirin (treats the symptom blindly); the backlog lane is
+diagnosis-aware (keeps fresh resolution stable while the tail drains on its own
+budget). Bump `BATCH_SIZE` only if the *whole* resolver turns out to be uniformly
+underprovisioned (i.e. fresh resolution itself starts lagging), not just the tail.
+
 ## Sampler output
 
 `/mnt/zonestorage/driftwatch/data/resolver_pending_samples.jsonl` on the VM,
