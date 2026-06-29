@@ -227,6 +227,80 @@ diagnosis-aware (keeps fresh resolution stable while the tail drains on its own
 budget). Bump `BATCH_SIZE` only if the *whole* resolver turns out to be uniformly
 underprovisioned (i.e. fresh resolution itself starts lagging), not just the tail.
 
+## Second read — 2026-06-29 11:10 EDT (115.5h, 117 samples)
+
+Resolved the open question the first read left: **the >7d growth was not a clean
+transient wave, and the floor did not hold.** Two of the three pre-registered
+tripwires tripped.
+
+**Provenance of this read.** The observation-only backstop
+(`scripts/resolver_second_read_check.sh`) fired from its date-guarded cron at
+**11:10 EDT / 15:10 UTC**, pulled the sampler JSONL read-only, and wrote
+`reports/resolver-pending-second-read-2026-06-29.txt` (**117 rows**, series end
+`2026-06-29T15:07Z`). For the interpretation below I then pulled the live series
+directly (**118 rows, 116.5h**, end `2026-06-29T16:07Z`) — one hour newer; the two
+agree within an hour of drift. The cron did exactly its job: observe, compute blunt
+deltas, write the artifact, change nothing. It did **not** edit docs, commit, decide,
+or touch resolver config.
+
+| metric | first read (06-25T16:07) | second read (06-29T16:07) | Δ over ~96h |
+|---|---|---|---|
+| `pending_total` | 323,742 | **301,962** | **−21,780** (was flat; now draining) |
+| `oldest_pending_hours` | 249.70 (10.4d) | **264.49 (11.0d)** | **+14.79h** (floor slid up) |
+| `pending_gt_72h` | 242,512 | 237,174 | −5,338 (flat) |
+| `pending_gt_168h` | 110,817 | **132,292** | **+21,475** (still climbing) |
+
+### Tripwire verdict
+
+| wire | condition | result |
+|---|---|---|
+| **T1** | `pending_gt_168h` still rising after the ~06-28 wave-crossing | **TRIP** |
+| **T2** | `oldest_pending_hours` materially above ~250h (>256h) | **TRIP** |
+| **T3** | `pending_total` also rising (capacity *losing*, not merely no-surplus) | **pass** |
+
+### Interpretation
+
+- **Total count is draining because inflow dipped, not because capacity improved.**
+  The resolver is still pinned at its ~1,200/hr ceiling; mean `new_pending` fell
+  1,117/h (day 0) → 880/h (day 4). The fixed budget gained surplus only because
+  arrivals dropped below it. **The falling total is not evidence that the problem
+  solved itself; it is evidence that arrivals temporarily fell below the fixed
+  resolver ceiling.** It reverses the moment inflow climbs back.
+- **The aged tail kept worsening on both axes that measure coverage.** `gt168` grew
+  +21,475, and its windowed growth did **not** decelerate through the predicted
+  06-28 wave-crossing: +69 → +204 → +241 → +50 → **+473/h** (last window steepest).
+  `gt72` is flat while `gt168` swells — the middle cohorts are waterfalling across
+  the 7-day line faster than the oldest-first front drains them out. This is
+  **sustained slow degradation, not a one-time wave.**
+- **The oldest floor slid** 249.70h → 264.49h (+14.79h over 116.5h wall-clock). The
+  front advances only ~0.88h per real hour, so it is losing ground on the floor —
+  slowly, but directionally.
+
+### Decision flip: candidate → warranted
+
+The first read pre-registered the decision rule *"`oldest_pending_hours` rises **or**
+the >7d cohort grows → add resolver surplus capacity"* and three tripwires so this
+read would not be a judgment call. **Both rule conditions fired and T1+T2 tripped**;
+the disambiguating window (does the wave clear by 06-28?) resolved toward *sustained*.
+The forcing case for the fix is therefore **met**. The dedicated-backlog-lane fix
+moves from **candidate** to **warranted**.
+
+**Warranted is not urgent.** This remains a low-priority coverage defect on an
+emit-disabled observatory: no user impact, count actually improving, fresh resolution
+keeping pace. The response is **spec the lane now, build after ratification** — not
+an incident, not a `BATCH_SIZE` bump, not a scheduler change today. T3 passing is
+load-bearing here: fresh flow keeps up when inflow dips, so the rot is in the sediment
+layer, which argues for a *separate tail lane*, not a global knob. Design captured in
+`specs/gaps/gap-spec-resolver-backlog-lane.md`.
+
+### Caveat (not yet decomposed)
+
+The inflow drop that produced the draining total is **not** decomposed: organic
+Jetstream identity-event dip vs. a paused/finished `labelwatch_seed` import wave are
+both consistent with the numbers. The drain is real; its driver is exogenous and
+unexplained. Decomposing the pending pool by source population is the first
+pre-implementation requirement in the backlog-lane spec.
+
 ## Sampler output
 
 `/mnt/zonestorage/driftwatch/data/resolver_pending_samples.jsonl` on the VM,
