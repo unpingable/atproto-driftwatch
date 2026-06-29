@@ -48,7 +48,29 @@ resolution stays priority and stable.
 - No Labelwatch dashboard or facts-export change (facts custody is a *separate*
   border — see `gap-spec-facts-snapshot-manifest.md`).
 
-## Pre-implementation requirement: tail composition decomposition
+## Pre-implementation requirement: tail composition decomposition — DONE 2026-06-29
+
+**Status: satisfied.** Slice 1 shipped the read-only report
+(`src/labeler/resolver_tail_composition.py`, commit `31293a6`) and it was run
+read-only against prod on 2026-06-29 (receipt:
+`reports/resolver-tail-composition-2026-06-29.json`). Result (pending pool 301,765):
+
+- **100% `identity_source='live'`** — 0 `labelwatch_seed`, 0 `both`. The aged tail is
+  organic live-observed identities; the seed-import-wave hypothesis is **refuted**.
+- **100% never-attempted** — pure under-capacity sediment, no poison.
+- **`>336h` bucket = 0** (oldest 264h) — bounded under 14d (the 2026-06-14 reset
+  horizon), not an unbounded leak.
+- All quarantine candidates 0; terminal poison negligible (`error=42`,
+  `not_found=749`, both outside the pending pool).
+
+**This confirms the lane is a pure opportunistic-throughput drain.** No source
+separation is needed for *this* tail (it is single-population). The decomposition
+machinery stays as the standing instrument: if `labelwatch_seed` sediment or attempted
+failures appear later, the report shows it before the lane is built/changed.
+
+----
+
+Original requirement (retained as the standing instrument contract):
 
 **Before the lane is built, decompose the pending pool.** The second read proves the
 tail is worsening; it does *not* prove what the tail is made of. Implementing a drain
@@ -107,6 +129,13 @@ Initial cap must be **conservative and configurable**. The cap's *type*
 (opportunistic / reserved / additive) must be a named config value, not implicit.
 
 ## Quarantine / dead-letter class
+
+**Empty against 2026-06-29 data — instrument-only.** The composition report found
+zero poison in the pending pool (100% never-attempted; quarantine candidates all 0).
+So the quarantine class is **correct-but-currently-a-no-op**: the lane can drain the
+present tail without quarantine wired first. Build it when attempted/error rows appear
+(the composition report is the tripwire), not as a prerequisite for the first drain.
+The design below stands for that eventuality.
 
 The backlog lane must **not** become a retirement home for immortal failures. Items
 that cannot resolve must leave the normal oldest-first lane into a **visible, counted,
@@ -197,10 +226,10 @@ Once the lane is live, judge it by the aged-tail axes, never the total:
 
 ## Open questions
 
-1. **Source decomposition (blocking):** what fraction of the >168h tail is
-   `labelwatch_seed` vs. `live`? Seed-driven sediment may have different SLO than
-   live-observed identities, and the inflow drop driving the current drain is
-   undecomposed.
+1. ~~**Source decomposition (blocking):** what fraction of the >168h tail is
+   `labelwatch_seed` vs. `live`?~~ **ANSWERED 2026-06-29: 100% `live`, 0
+   `labelwatch_seed`.** The tail is single-population; no per-source SLO split needed
+   for the current drain. Re-open only if seed sediment appears in the report.
 2. **Opportunistic detection:** how does the lane *measure* headroom — observed
    inflow below ceiling for N consecutive cycles, or a queue-depth signal on the fresh
    lane? Needs a concrete, cheap signal.

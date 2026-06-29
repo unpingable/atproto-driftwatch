@@ -293,13 +293,38 @@ load-bearing here: fresh flow keeps up when inflow dips, so the rot is in the se
 layer, which argues for a *separate tail lane*, not a global knob. Design captured in
 `specs/gaps/gap-spec-resolver-backlog-lane.md`.
 
-### Caveat (not yet decomposed)
+### Composition — decomposed 2026-06-29 (read-only tail-composition report)
 
-The inflow drop that produced the draining total is **not** decomposed: organic
-Jetstream identity-event dip vs. a paused/finished `labelwatch_seed` import wave are
-both consistent with the numbers. The drain is real; its driver is exogenous and
-unexplained. Decomposing the pending pool by source population is the first
-pre-implementation requirement in the backlog-lane spec.
+The second read's open caveat ("inflow drop not decomposed: organic Jetstream dip vs.
+a `labelwatch_seed` import wave") is now **answered**, by the Slice-1 read-only report
+(`src/labeler/resolver_tail_composition.py`, run read-only against prod; receipt at
+`reports/resolver-tail-composition-2026-06-29.json`). Pending pool = 301,765:
+
+| dimension | result | reading |
+|---|---|---|
+| source population | **100% `live`** (0 `labelwatch_seed`, 0 `both`) | **seed-import-wave hypothesis refuted** — the pool is organic live-observed identities, not a seed backlog |
+| attempt status | **100% never-attempted** | pure under-capacity sediment, **not poison/failures** |
+| `>336h` bucket | **0** (oldest 264h ≈ 11.0d) | accumulation is **bounded under 14d** — corroborates the 2026-06-14 reset-horizon floor (the scar), not an unbounded leak |
+| quarantine candidates | **all 0** | nothing to quarantine in the pending pool |
+| terminal poison (excluded from pending) | `error=42`, `not_found=749` | negligible; lives outside the pending pool |
+
+**Correction to the second read:** the draining total being driven by a finishing
+`labelwatch_seed` import is **ruled out** — there are zero seed rows in the pool. The
+drain is organic inflow weather against the fixed ceiling, exactly as the verbatim
+guardrail states; the *composition* it drained from was entirely live.
+
+**Consequence for the fix:** the backlog lane is a **pure opportunistic-throughput
+drain**. The quarantine/dead-letter machinery in the spec is correct but currently a
+**no-op** (no poison to isolate as of 2026-06-29) — it is instrument-only until
+attempted/error rows appear in the pool. Draining does not depend on wiring quarantine
+first.
+
+Schema gaps the report surfaced (not inferred): no attempt-count column (only
+attempted-vs-never is computable), so the quarantine `attempts>=3` and
+`repeated_timeout` rules and the 1/2-3/4+ attempt buckets are **unavailable**;
+`retry/requeue` is not a real `identity_source`; `deleted_or_unavailable` is not
+separable from `did_doc_missing`. These are the next open questions if the lane ever
+needs attempt-level discrimination.
 
 ## Sampler output
 
