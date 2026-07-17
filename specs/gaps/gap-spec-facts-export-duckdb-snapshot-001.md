@@ -198,6 +198,31 @@ artifact, (b) snapshot writer cost outgrowing its budget, or (c) explicit
 ratification that the snapshot is becoming the kind of lie the doctrine
 was meant to prevent.
 
+## Status — 2026-07-16 campaign night
+
+Local half of the slice is **complete**; deploy half is **staged, not
+executed** (operator constraint: nothing deployed tonight).
+
+Done (receipts in-repo):
+- Writer + CLI shipped earlier (`7f29b8c`, `20d753c`).
+- Acceptance tests 1–5, 7, 8: `tests/test_facts_export_duckdb_snapshot.py`
+  (+ cross-partition dedup case, `46d5394`).
+- Acceptance test 6: `tests/test_facts_snapshot_labelwatch_attach.py`
+  (`59aa520`) — the REAL labelwatch derive pass against a writer-produced
+  snapshot, including proof the quarantine keeps the 29-year-lag class out
+  of `derived_label_fp`. Skips when the sibling checkout is absent.
+- Offline parity receipts: `tests/test_facts_snapshot_parity.py` — legacy
+  vs writer on identical logical rows, divergence exactly = quarantine.
+- Operate/cutover runbook: `docs/RUNBOOK.md` § "Facts snapshot writer".
+- Prod image gap closed: `deploy/requirements.prod.txt` now carries
+  duckdb (writer would have crashed on the VM without it).
+
+Remaining (deploy-gated, next VM window):
+- Declare NQ maintenance windows, run one-shot, verify manifest + labelwatch
+  `facts_sync` pickup, install cron after a boring cycle (runbook checklist).
+- Exit-criterion cleanup: retire legacy `facts_work.sqlite`.
+- Live parity observation: manifest row counts vs current facts.sqlite.
+
 ## Acceptance for this spec
 
 - [x] Scope concrete (5 numbered scope items).
