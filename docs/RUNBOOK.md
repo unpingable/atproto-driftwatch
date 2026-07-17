@@ -82,6 +82,78 @@ ls -lh /opt/driftwatch/deploy/data/facts*.sqlite*
 **Fix:** Check logs for specific error. If schema mismatch, deploy migration.
 If disk, free space. If corrupt working DB, delete and restart.
 
+> **Note:** the legacy in-app facts export is parked (incident-era reduction).
+> Its replacement is the Phase 3 snapshot writer below. This section stays as
+> the runbook for whatever legacy cycles still exist.
+
+---
+
+## Facts snapshot writer (Phase 3, DuckDB-backed) — deploy + operate
+
+> Parquet is authoritative past. DuckDB is the question engine.
+> `facts.sqlite` is a compatibility projection/cache, not the source of custody.
+
+Spec: `specs/gaps/gap-spec-facts-export-duckdb-snapshot-001.md`. The writer
+materializes a labelwatch-compatible `facts.sqlite` from claim_history
+Parquet partitions (`uri_fingerprint`) + the live SQLite identity projection
+(`actor_identity_facts`), with atomic rename and a manifest sidecar.
+
+**One-shot (in container):**
+```bash
+docker exec driftwatch python -m labeler.cli driftwatch facts-snapshot \
+  --parquet-root /app/data/parquet \
+  --identity-db /app/data/labeler.sqlite \
+  --out /app/data/facts.sqlite
+# prints the manifest JSON; also written to /app/data/facts.sqlite.manifest.json
+```
+
+**Production cadence:** host cron, hourly. Cron is the on/off switch — the
+rollback path is "disable the cron", so do not bury the invocation inside the
+app process.
+```cron
+17 * * * * docker exec driftwatch python -m labeler.cli driftwatch facts-snapshot --parquet-root /app/data/parquet --identity-db /app/data/labeler.sqlite --out /app/data/facts.sqlite >> /var/log/driftwatch-facts-snapshot.log 2>&1
+```
+
+**Deploy checklist (first cutover):**
+1. **Declare the disturbance first** (declaration precedes effect; NQ rejects
+   retro-dating):
+   ```bash
+   /opt/notquery/nq-monitor maintenance declare --db /opt/notquery/nq.db \
+     --host labelwatch-host --kind error_shift --start now --end now+30m \
+     --reason "driftwatch facts-snapshot cutover" --declared-by labelwatch-claude
+   ```
+   Repeat per disturbed kind (`service_status`, `log_silence`) if the deploy
+   restarts services.
+2. Run the one-shot manually. Sanity-check the manifest:
+   - `row_counts.actor_identity_facts` ≈ actor_identity_current count
+   - `row_counts.uri_fingerprint` > 0 (unless Parquet coverage is empty —
+     then the writer publishes a controlled identity-only snapshot, by design)
+   - `uri_fingerprint_rows_quarantined_bogus_created_epoch` ≈ the known ~25k
+     bogus-timestamp population, not ≈ the whole table
+3. Watch labelwatch pick it up: `journalctl -u labelwatch | grep facts_sync` —
+   next scan should log a fresh mtime and nonzero `snapshot=` once candidate
+   URIs exist. Missing/stale facts degrade to a coverage caveat, never a 5xx.
+4. Only after a boring cycle: install the cron.
+5. Exit-criterion cleanup: remove or quarantine the legacy
+   `facts_work.sqlite` (the working DB of the parked in-app exporter) so the
+   old path can't half-wake.
+
+**Rollback:** disable the cron. The last successfully renamed `facts.sqlite`
+stays in place; labelwatch keeps consuming it and surfaces staleness as a
+caveat. Do NOT re-enable the legacy in-app exporter as a rollback — it
+depends on the hot claim-history scan path the cold-path doctrine retired.
+Diagnosis runs against the manifest + writer log, not against the consumer.
+
+**Symptoms → causes:**
+- Manifest missing / stale while cron installed → check cron log; writer
+  raises before rename on any failure, so a stale-but-valid snapshot is the
+  expected failure shape.
+- `uri_fingerprint` row count drops sharply between manifests → Parquet
+  partitions missing (check `input_partition_window` in the manifest against
+  `ls /app/data/parquet/claim_history/`).
+- Quarantine count spikes → upstream timestamp hygiene regressed; the writer
+  is doing its job. Check `specs/gaps/gap-spec-event-time-hygiene.md`.
+
 ---
 
 ## Resolver stall
