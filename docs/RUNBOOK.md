@@ -100,21 +100,35 @@ Parquet partitions (`uri_fingerprint`) + the live SQLite identity projection
 
 **One-shot (in container):**
 ```bash
-docker exec driftwatch python -m labeler.cli driftwatch facts-snapshot \
+docker exec \
+  -e DRIFTWATCH_FACTS_DUCKDB_MEMORY_LIMIT=1500MB \
+  -e DRIFTWATCH_FACTS_DUCKDB_TEMP_DIR=/app/data/duckdb-spill \
+  driftwatch python -m labeler.cli driftwatch facts-snapshot \
   --parquet-root /app/data/parquet \
   --identity-db /app/data/labeler.sqlite \
   --out /app/data/facts.sqlite
 # prints the manifest JSON; also written to /app/data/facts.sqlite.manifest.json
 ```
 
-**Production cadence:** host cron, hourly. Cron is the on/off switch — the
-rollback path is "disable the cron", so do not bury the invocation inside the
-app process. `flock -n` skips a run when the previous one is still going
-(slow runs must not stack); the writer's PID-suffixed tmp files are the
-second layer — even without the lock, overlap degrades to last-writer-wins
-of *complete* snapshots, never a partial publish.
+**Production cadence:** host cron, **daily** (not hourly). The cold Parquet
+partitions only change at retention cadence — roughly one new day-partition
+per pass — so re-reading all history hourly is wasted work; the writer scans
+the whole tree each run (~50 min at 202M rows). Cron is the on/off switch —
+the rollback path is "disable the cron", so do not bury the invocation inside
+the app process. `flock -n` skips a run when the previous one is still going;
+the writer's PID-suffixed tmp files are the second layer — even without the
+lock, overlap degrades to last-writer-wins of *complete* snapshots, never a
+partial publish.
+
+**Memory (load-bearing):** the dedup runs inside DuckDB with a bounded
+`memory_limit` and spills to disk — RSS does NOT grow with history depth
+(measured: 625 MB RSS on an 8M-row tree under a 512 MB limit; the naive
+prior version OOM'd). Tune via env: `DRIFTWATCH_FACTS_DUCKDB_MEMORY_LIMIT`
+(default `2GB`), `DRIFTWATCH_FACTS_DUCKDB_THREADS` (default `2`),
+`DRIFTWATCH_FACTS_DUCKDB_TEMP_DIR` (spill dir; put it on the big volume, NOT
+the root fs). On the 7.8 GB VM use `1500MB` + a spill dir on zonestorage.
 ```cron
-17 * * * * flock -n /run/lock/driftwatch-facts-snapshot.lock docker exec driftwatch python -m labeler.cli driftwatch facts-snapshot --parquet-root /app/data/parquet --identity-db /app/data/labeler.sqlite --out /app/data/facts.sqlite >> /var/log/driftwatch-facts-snapshot.log 2>&1
+17 4 * * * flock -n /run/lock/driftwatch-facts-snapshot.lock docker exec -e DRIFTWATCH_FACTS_DUCKDB_MEMORY_LIMIT=1500MB -e DRIFTWATCH_FACTS_DUCKDB_THREADS=2 -e DRIFTWATCH_FACTS_DUCKDB_TEMP_DIR=/app/data/duckdb-spill driftwatch python -m labeler.cli driftwatch facts-snapshot --parquet-root /app/data/parquet --identity-db /app/data/labeler.sqlite --out /app/data/facts.sqlite >> /var/log/driftwatch-facts-snapshot.log 2>&1
 ```
 
 **Deploy checklist (first cutover):**
@@ -160,10 +174,15 @@ Diagnosis runs against the manifest + writer log, not against the consumer.
 - Quarantine count spikes → upstream timestamp hygiene regressed; the writer
   is doing its job. Check `specs/gaps/gap-spec-event-time-hygiene.md`.
 - `duration_seconds` trending up across manifests → the V0 writer re-reads
-  ALL partitions every run, so runtime grows with cold history. Watch-item:
-  when it stops fitting comfortably inside the hourly slot, that's the
-  forcing case for an incremental/windowed reader — file it then, don't
-  pre-build it.
+  ALL partitions every run (two streaming scans of the whole tree), so
+  runtime grows with cold history. Watch-item: when it stops fitting the
+  daily slot, that's the forcing case for an incremental/windowed reader
+  (only re-read partitions newer than the last manifest window) — file it
+  then, don't pre-build it.
+- Writer killed / OOM → check the `memory_limit` env is actually reaching
+  the container (`docker exec driftwatch env | grep DUCKDB`) and the spill
+  dir exists and is on the big volume. DuckDB spills there; if it points at
+  a full or missing fs the aggregate can't spill and will OOM.
 
 ---
 

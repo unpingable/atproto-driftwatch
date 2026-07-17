@@ -15,16 +15,21 @@ path list, and a null partition window.
 
 ``rowid_src`` is a compatibility-only field in this writer. The historical
 SQLite producer stored source ``claim_history.rowid`` there; Parquet does not
-carry that rowid. V0 writes a deterministic scan ordinal derived from sorted
-partition/file order and in-file scan order.
+carry that rowid. V0 writes a deterministic ordinal — ``row_number()`` over
+the deduped rows ordered by ``post_uri``.
 
 Forward note for Phase 3.5 (`gap-spec-facts-export-duckdb-snapshot-001.md
-§ Phase 3.5 handle`): V0 ``rowid_src`` is a producer-local scan ordinal,
+§ Phase 3.5 handle`): V0 ``rowid_src`` is a producer-local ordinal,
 NOT ``claim_history.rowid``. Labelwatch consumers must not treat it as
 stable source-table identity (per the consumer inventory, labelwatch
 does not read this column at all). If Phase 3.5 surfaces a need for
 stable source identity, rename or replace this column then; do not
 back-fit semantics into the V0 field.
+
+Memory: the dedup + quarantine run inside DuckDB (streaming hash-aggregate,
+spills to ``temp_directory`` at ``memory_limit``), so RAM is bounded by the
+result set, not by history depth. This replaced a Python-dict accumulation
+that OOM'd on the production tree (202M rows). See ``_duckdb_runtime_config``.
 """
 
 from __future__ import annotations
@@ -180,66 +185,139 @@ def _duckdb_literal(value: str) -> str:
     return "'" + value.replace("'", "''") + "'"
 
 
-def _read_uri_rows(
+def _duckdb_runtime_config() -> tuple[str, int, str | None]:
+    """Memory limit, thread count, spill directory for the dedup query.
+
+    Production reality forced this: the V0 writer accumulated every parquet
+    row into a Python dict and OOM'd on the real tree (202M rows → ~15-21GB
+    on a 7.8GB box). The dedup now runs inside DuckDB, which streams the
+    hash-aggregate and spills partitions to ``temp_directory`` when it hits
+    ``memory_limit`` — bounded RAM regardless of history depth. Defaults are
+    conservative for a small shared VM; override via env for a bigger host.
+    """
+    mem = os.getenv("DRIFTWATCH_FACTS_DUCKDB_MEMORY_LIMIT", "2GB")
+    try:
+        threads = int(os.getenv("DRIFTWATCH_FACTS_DUCKDB_THREADS", "2"))
+    except ValueError:
+        threads = 2
+    temp_dir = os.getenv("DRIFTWATCH_FACTS_DUCKDB_TEMP_DIR") or None
+    return mem, max(1, threads), temp_dir
+
+
+_STREAM_BATCH = 100_000
+
+
+def _populate_uri_fingerprints(
+    out_conn: sqlite3.Connection,
     parquet_paths: list[pathlib.Path],
     generated_epoch: int,
-) -> tuple[list[tuple[str, str, int, int]], int, int | None, int | None]:
+) -> tuple[int, int, int | None, int | None]:
+    """Dedup claim_history Parquet into ``out_conn.uri_fingerprint``, streamed.
+
+    Returns (written, quarantined, min_epoch, max_epoch).
+
+    Neither DuckDB nor Python ever holds the full row set:
+    - DuckDB does the dedup as a streaming hash-aggregate that spills to
+      ``temp_directory`` under ``memory_limit`` (``preserve_insertion_order``
+      is off — the output PK makes order irrelevant and preserving it forces
+      DuckDB to buffer, which is exactly what OOM'd at scale).
+    - The deduped result is pulled with ``fetchmany`` and inserted into SQLite
+      in ``_STREAM_BATCH`` chunks; at most one batch lives in Python.
+
+    This is the fix for the production tree (202M rows on a 7.8GB box): the
+    prior implementation accumulated a Python dict of every URI and then
+    materialized the whole result via fetchall + executemany — unbounded on
+    both the dedup and the insert side.
+
+    Dedup rule: one fingerprint per post_uri, greatest ``created_epoch`` wins
+    (most recent claim). Reproduces the V0 "later partition wins" outcome —
+    later date ⇒ larger createdAt — and the pinned cross-partition/duplicate
+    test expectations, without depending on physical scan order.
+    """
     if not parquet_paths:
-        return [], 0, None, None
+        return 0, 0, None, None
 
     import duckdb
 
     valid_max_epoch = generated_epoch + 86_400
-    dedup: dict[str, tuple[int, str, int, int]] = {}
-    quarantined = 0
-    ordinal_base = 0
+    mem_limit, threads, temp_dir = _duckdb_runtime_config()
+    path_list = "[" + ", ".join(_duckdb_literal(str(p)) for p in parquet_paths) + "]"
+
+    # Reusable projection: null-filtered, createdAt → epoch. Inlined into both
+    # the quarantine-count scan and the dedup scan rather than materialized as
+    # a temp table (a 202M-row temp table in an in-memory DuckDB would itself
+    # OOM). Two bounded streaming scans of the parquet, no full materialization.
+    classified = f"""
+        SELECT
+            post_uri,
+            claim_fingerprint AS fingerprint,
+            CAST(epoch(try_cast(createdAt AS TIMESTAMPTZ)) AS BIGINT) AS created_epoch
+        FROM read_parquet({path_list})
+        WHERE post_uri IS NOT NULL
+          AND claim_fingerprint IS NOT NULL
+    """
 
     con = duckdb.connect(database=":memory:")
+    written = 0
+    min_epoch: int | None = None
+    max_epoch: int | None = None
     try:
-        for file_index, path in enumerate(parquet_paths):
-            sql = f"""
-                SELECT
-                    post_uri,
-                    claim_fingerprint AS fingerprint,
-                    CAST(epoch(try_cast(createdAt AS TIMESTAMPTZ)) AS BIGINT) AS created_epoch
-                FROM read_parquet({_duckdb_literal(str(path))})
-                WHERE post_uri IS NOT NULL
-                  AND claim_fingerprint IS NOT NULL
-            """
-            rows_this_file = con.execute(sql).fetchall()
-            for local_idx, (post_uri, fingerprint, created_epoch) in enumerate(rows_this_file):
-                # rowid_src is a contiguous scan ordinal across files in
-                # sorted partition order — see module docstring.
-                rowid_src = ordinal_base + local_idx + 1
-                if (
-                    created_epoch is None
-                    or created_epoch < _BOGUS_MIN_EPOCH
-                    or created_epoch > valid_max_epoch
-                ):
-                    quarantined += 1
-                    continue
-                dedup[str(post_uri)] = (
-                    file_index,
-                    str(fingerprint),
-                    int(created_epoch),
-                    rowid_src,
-                )
-            # Advance the ordinal by the kept-row count. We dropped the
-            # separate `SELECT COUNT(*) FROM read_parquet(...)` rescan
-            # the V0 writer originally used to advance from the unfiltered
-            # row total — that was a second pass over the same file for no
-            # consumer-visible benefit (labelwatch does not read rowid_src).
-            ordinal_base += len(rows_this_file)
+        con.execute(f"SET threads TO {threads}")
+        con.execute(f"SET memory_limit = {_duckdb_literal(mem_limit)}")
+        con.execute("SET preserve_insertion_order = false")
+        if temp_dir:
+            os.makedirs(temp_dir, exist_ok=True)
+            con.execute(f"SET temp_directory = {_duckdb_literal(temp_dir)}")
+
+        quarantined = con.execute(
+            f"""
+            SELECT COUNT(*) FROM ({classified})
+            WHERE created_epoch IS NULL
+               OR created_epoch < ?
+               OR created_epoch > ?
+            """,
+            [_BOGUS_MIN_EPOCH, valid_max_epoch],
+        ).fetchone()[0]
+
+        cur = con.execute(
+            f"""
+            SELECT
+                post_uri,
+                arg_max(fingerprint, created_epoch) AS fingerprint,
+                max(created_epoch) AS created_epoch
+            FROM ({classified})
+            WHERE created_epoch IS NOT NULL
+              AND created_epoch >= ?
+              AND created_epoch <= ?
+            GROUP BY post_uri
+            """,
+            [_BOGUS_MIN_EPOCH, valid_max_epoch],
+        )
+
+        insert = (
+            "INSERT INTO uri_fingerprint (post_uri, fingerprint, created_epoch, rowid_src) "
+            "VALUES (?, ?, ?, ?)"
+        )
+        while True:
+            batch = cur.fetchmany(_STREAM_BATCH)
+            if not batch:
+                break
+            out_rows = []
+            for post_uri, fingerprint, created_epoch in batch:
+                ce = int(created_epoch)
+                written += 1
+                # rowid_src: compatibility-only running ordinal, never read by
+                # labelwatch (see module docstring). Not a source rowid.
+                out_rows.append((str(post_uri), str(fingerprint), ce, written))
+                if min_epoch is None or ce < min_epoch:
+                    min_epoch = ce
+                if max_epoch is None or ce > max_epoch:
+                    max_epoch = ce
+            out_conn.executemany(insert, out_rows)
     finally:
         con.close()
 
-    rows = [
-        (post_uri, fingerprint, created_epoch, rowid_src)
-        for post_uri, (_file_index, fingerprint, created_epoch, rowid_src) in dedup.items()
-    ]
-    rows.sort(key=lambda r: r[0])
-    epochs = [row[2] for row in rows]
-    return rows, quarantined, (min(epochs) if epochs else None), (max(epochs) if epochs else None)
+    return written, int(quarantined), min_epoch, max_epoch
 
 
 def _write_manifest_atomic(manifest_path: pathlib.Path, manifest: dict[str, Any]) -> None:
@@ -306,17 +384,14 @@ def export_snapshot_once(
 
     parquet_paths = _resolve_parquet_paths(parquet_root_path)
     input_paths = [str(p) for p in parquet_paths]
-    uri_rows, quarantined, min_epoch, max_epoch = _read_uri_rows(parquet_paths, generated_epoch)
 
     conn = sqlite3.connect(str(tmp_path))
     try:
         conn.execute("PRAGMA journal_mode=DELETE")
         _ensure_snapshot_schema(conn)
         identity_count = _copy_identity(identity_path, conn)
-        conn.executemany(
-            "INSERT INTO uri_fingerprint (post_uri, fingerprint, created_epoch, rowid_src) "
-            "VALUES (?, ?, ?, ?)",
-            uri_rows,
+        uri_written, quarantined, min_epoch, max_epoch = _populate_uri_fingerprints(
+            conn, parquet_paths, generated_epoch
         )
         conn.commit()
 
@@ -329,7 +404,7 @@ def export_snapshot_once(
         }
         if row_counts["actor_identity_facts"] != identity_count:
             raise RuntimeError("actor_identity_facts row count verification failed")
-        if row_counts["uri_fingerprint"] != len(uri_rows):
+        if row_counts["uri_fingerprint"] != uri_written:
             raise RuntimeError("uri_fingerprint row count verification failed")
     except Exception:
         conn.close()

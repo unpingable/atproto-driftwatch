@@ -344,6 +344,40 @@ def test_missing_parquet_publishes_controlled_identity_only_snapshot(tmp_path):
     assert manifest["uri_fingerprint_max_created_epoch_written"] is None
 
 
+def test_low_memory_limit_and_spill_dir_still_correct(tmp_path, monkeypatch):
+    """Dedup runs inside DuckDB with a bounded memory_limit + on-disk spill;
+    a tight limit must not change consumer-visible output (this is the
+    property that keeps the writer from OOMing the production tree — 202M
+    rows on a 7.8GB box, 2026-07-17)."""
+    identity_db = _make_identity_db(tmp_path / "identity.sqlite")
+    parquet_root = tmp_path / "parquet"
+    _write_claim_parquet(parquet_root)
+    spill = tmp_path / "duckdb-spill"
+    monkeypatch.setenv("DRIFTWATCH_FACTS_DUCKDB_MEMORY_LIMIT", "256MB")
+    monkeypatch.setenv("DRIFTWATCH_FACTS_DUCKDB_THREADS", "1")
+    monkeypatch.setenv("DRIFTWATCH_FACTS_DUCKDB_TEMP_DIR", str(spill))
+    out = tmp_path / "facts.sqlite"
+
+    manifest = export_snapshot_once(
+        parquet_root=parquet_root,
+        identity_source_path=identity_db,
+        output_path=out,
+        generated_at=GENERATED_AT,
+    )
+
+    assert spill.exists()  # temp_directory was configured
+    conn = sqlite3.connect(str(out))
+    rows = conn.execute(
+        "SELECT post_uri, fingerprint FROM uri_fingerprint ORDER BY post_uri"
+    ).fetchall()
+    conn.close()
+    # Same result as the default-memory run: dedup keeps latest fingerprint,
+    # bogus epochs quarantined.
+    assert rows == [("at://did:a/post/1", "fp_new"), ("at://did:b/post/2", "fp_b")]
+    assert manifest["row_counts"]["uri_fingerprint"] == 2
+    assert manifest["uri_fingerprint_rows_quarantined_bogus_created_epoch"] == 2
+
+
 def test_overlapping_run_tmps_are_isolated(tmp_path):
     """PID-suffixed tmps: a concurrent run's fresh tmp is never touched;
     a crashed run's stale orphan is swept. Overlap can no longer publish
