@@ -25,6 +25,18 @@ from labeler.retention_scheduler import (
 from tests.test_retention import _make_db, _iso, _insert_claim
 
 
+@pytest.fixture(autouse=True)
+def _isolate_artifact_dirs(tmp_path, monkeypatch):
+    """Keep retention passes out of the repo's real data/ tree.
+
+    Same hygiene as tests/test_retention.py: with pyarrow installed the
+    Parquet forward path mkdirs PARQUET_DIR (default: src/data/parquet)
+    unconditionally, so unredirected runs litter the repo.
+    """
+    monkeypatch.setattr(retention, "ARCHIVE_DIR", tmp_path / "archive")
+    monkeypatch.setattr(retention, "PARQUET_DIR", tmp_path / "parquet")
+
+
 class _PressureStub:
     """Minimal stand-in for ATProtoConsumer's pressure surface.
 

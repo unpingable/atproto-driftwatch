@@ -10,6 +10,22 @@ import pytest
 from labeler import retention
 
 
+@pytest.fixture(autouse=True)
+def _isolate_artifact_dirs(tmp_path, monkeypatch):
+    """Keep every retention test out of the repo's real data/ tree.
+
+    run_retention_once dispatches to the Parquet forward path whenever
+    PARQUET_CAPTURE_ENABLED and pyarrow are both present, and that path
+    mkdirs PARQUET_DIR (default: src/data/parquet) unconditionally. Without
+    this redirect, running the suite in a pyarrow-equipped env silently
+    creates artifact dirs inside the repo — and tests written against the
+    legacy JSONL path flip behavior depending on which env installed what
+    (caught 2026-07-16: test_full_pass failed only when pyarrow imports).
+    """
+    monkeypatch.setattr(retention, "ARCHIVE_DIR", tmp_path / "archive")
+    monkeypatch.setattr(retention, "PARQUET_DIR", tmp_path / "parquet")
+
+
 def _make_db(path=":memory:"):
     """Create a DB with the tables retention operates on.
 
@@ -323,6 +339,11 @@ class TestArchiveClaimHistory:
 
 class TestRunRetentionOnce:
     def test_full_pass(self, tmp_path, monkeypatch):
+        # Pin the legacy JSONL archive path: this test's expectations
+        # (single-pass archive of a 20-day-old claim) describe legacy
+        # semantics. The Parquet forward path drains one candidate date
+        # per pass and is covered by test_full_pass_parquet_capture.
+        monkeypatch.setattr(retention, "PARQUET_CAPTURE_ENABLED", False)
         monkeypatch.setattr(retention, "ARCHIVE_DIR", tmp_path)
         conn = _make_db()
         # Old event with raw (should strip + eventually prune)
@@ -364,6 +385,41 @@ class TestRunRetentionOnce:
         assert "at://u/post/keep" in uris
         assert "at://u/post/strip" in uris  # stripped but not old enough to prune
         assert "at://u/post/prune" not in uris
+
+    @pytest.mark.skipif(not retention._HAS_PYARROW, reason="pyarrow not installed")
+    def test_full_pass_parquet_capture(self, monkeypatch):
+        """Forward-path counterpart of test_full_pass: with Parquet capture
+        enabled, an old claim lands in a date partition + receipt, then is
+        pruned from claim_history."""
+        monkeypatch.setattr(retention, "PARQUET_CAPTURE_ENABLED", True)
+        # Uncap days-per-pass so the single fixture date is captured in one
+        # pass regardless of where it falls in the candidate window.
+        monkeypatch.setenv("RETENTION_PARQUET_MAX_DAYS_PER_PASS", "0")
+        conn = _make_db()
+
+        old_ts = _iso(-20 * 86400)
+        day_str = old_ts[:10]
+        _insert_claim(conn, "fp1", old_ts, observed_at=old_ts)
+        conn.commit()
+
+        stats = retention.run_retention_once(conn=conn)
+
+        assert stats["claims_archived"] == 1
+        assert stats["claims_pruned"] == 1
+        part = retention.PARQUET_DIR / "claim_history" / f"date={day_str}" / "part-00.parquet"
+        assert part.exists(), f"expected partition at {part}"
+        import pyarrow.parquet as pq
+        table = pq.read_table(part)
+        assert table.num_rows == 1
+        assert table.column("claim_fingerprint").to_pylist() == ["fp1"]
+        receipt_path = retention.PARQUET_DIR / ".receipts" / f"retention_capture_{day_str}.json"
+        assert receipt_path.exists(), f"expected receipt at {receipt_path}"
+        receipt = json.loads(receipt_path.read_text())
+        assert receipt["rows"] == 1
+        assert receipt["src_rows"] == 1
+        assert receipt["date"] == day_str
+        # Source rows are pruned only after the partition is published
+        assert conn.execute("SELECT COUNT(*) FROM claim_history").fetchone()[0] == 0
 
     def test_empty_db(self, tmp_path, monkeypatch):
         monkeypatch.setattr(retention, "ARCHIVE_DIR", tmp_path)
