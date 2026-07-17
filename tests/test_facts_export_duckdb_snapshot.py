@@ -246,6 +246,56 @@ def test_snapshot_schema_counts_quarantine_manifest_and_attach(tmp_path):
     local.close()
 
 
+def test_cross_partition_dedup_later_date_wins(tmp_path):
+    """A post_uri appearing in two date partitions resolves to the later
+    partition's row — matching legacy dedup (highest rowid ≈ latest
+    ingestion) under the writer's sorted-partition scan order."""
+    identity_db = _make_identity_db(tmp_path / "identity.sqlite")
+    parquet_root = tmp_path / "parquet"
+    dup_uri = "at://did:a/post/dup"
+
+    def row(fp, created):
+        return {
+            "authorDid": "did:a",
+            "claim_fingerprint": fp,
+            "createdAt": created,
+            "confidence": 0.9,
+            "provenance": "test",
+            "evidence_hash": f"eh:{fp}",
+            "post_uri": dup_uri,
+            "post_cid": f"cid:{fp}",
+            "fingerprint_version": "v1",
+            "evidence_class": "none",
+            "fp_kind": "claim",
+            "observed_at": created,
+        }
+
+    _write_claim_parquet(
+        parquet_root, date_str="2026-06-08",
+        rows=[row("fp_day1", "2026-06-08T10:00:00+00:00")],
+    )
+    _write_claim_parquet(
+        parquet_root, date_str="2026-06-09",
+        rows=[row("fp_day2", "2026-06-09T10:00:00+00:00")],
+    )
+    out = tmp_path / "facts.sqlite"
+
+    manifest = export_snapshot_once(
+        parquet_root=parquet_root,
+        identity_source_path=identity_db,
+        output_path=out,
+        generated_at=GENERATED_AT,
+    )
+
+    assert manifest["input_partition_window"] == {"min": "2026-06-08", "max": "2026-06-09"}
+    conn = sqlite3.connect(str(out))
+    rows = conn.execute(
+        "SELECT post_uri, fingerprint FROM uri_fingerprint"
+    ).fetchall()
+    conn.close()
+    assert rows == [(dup_uri, "fp_day2")]
+
+
 def test_missing_parquet_publishes_controlled_identity_only_snapshot(tmp_path):
     identity_db = _make_identity_db(tmp_path / "identity.sqlite")
     out = tmp_path / "facts.sqlite"
