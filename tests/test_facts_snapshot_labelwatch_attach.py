@@ -38,6 +38,16 @@ labelwatch_scan = pytest.importorskip(
     "labelwatch.scan",
     reason="labelwatch sibling checkout not available",
 )
+# Guard against exercising a stray installed/cached labelwatch instead of
+# the sibling checkout this receipt is about. (sys.path stays prepended for
+# the session — intra-labelwatch lazy imports must keep resolving — but the
+# module origin is pinned.)
+if not str(labelwatch_scan.__file__).startswith(str(_LABELWATCH_SRC)):
+    pytest.skip(
+        f"labelwatch imported from {labelwatch_scan.__file__}, "
+        f"not the sibling checkout {_LABELWATCH_SRC}",
+        allow_module_level=True,
+    )
 from labelwatch import db as lw_db  # noqa: E402
 from labelwatch.config import Config as LwConfig  # noqa: E402
 from labelwatch.scan import _sync_driftwatch_facts  # noqa: E402

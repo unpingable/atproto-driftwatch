@@ -2,7 +2,9 @@
 
 import datetime as dt
 import json
+import os
 import sqlite3
+import time
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -192,7 +194,8 @@ def test_snapshot_schema_counts_quarantine_manifest_and_attach(tmp_path):
     )
 
     assert out.exists()
-    assert not (tmp_path / "facts.sqlite.tmp").exists()
+    assert not list(tmp_path.glob("facts.sqlite.tmp*")), "writer tmp leaked"
+    assert not list(tmp_path.glob("facts.sqlite.manifest.json.tmp*")), "manifest tmp leaked"
     manifest_path = tmp_path / "facts.sqlite.manifest.json"
     assert json.loads(manifest_path.read_text()) == manifest
 
@@ -248,13 +251,26 @@ def test_snapshot_schema_counts_quarantine_manifest_and_attach(tmp_path):
 
 def test_cross_partition_dedup_later_date_wins(tmp_path):
     """A post_uri appearing in two date partitions resolves to the later
-    partition's row — matching legacy dedup (highest rowid ≈ latest
-    ingestion) under the writer's sorted-partition scan order."""
+    partition's row.
+
+    Precise semantics being pinned: latest createdAt-day partition wins;
+    within a day, file scan order (which is rowid order — the capture's
+    per-day SELECT is ORDER BY rowid). This matches legacy's
+    highest-rowid-wins EXCEPT for backdated corrections: a row ingested
+    later but carrying an older createdAt lands in an older partition and
+    loses here while winning under legacy. Known, accepted V0 divergence —
+    partition date is the writer's only ordering signal across days.
+
+    The older partition carries a control row so this test fails if that
+    partition is silently never read (vacuous-pass hazard flagged by codex
+    review, 2026-07-16).
+    """
     identity_db = _make_identity_db(tmp_path / "identity.sqlite")
     parquet_root = tmp_path / "parquet"
     dup_uri = "at://did:a/post/dup"
+    control_uri = "at://did:a/post/only-day1"
 
-    def row(fp, created):
+    def row(uri, fp, created):
         return {
             "authorDid": "did:a",
             "claim_fingerprint": fp,
@@ -262,7 +278,7 @@ def test_cross_partition_dedup_later_date_wins(tmp_path):
             "confidence": 0.9,
             "provenance": "test",
             "evidence_hash": f"eh:{fp}",
-            "post_uri": dup_uri,
+            "post_uri": uri,
             "post_cid": f"cid:{fp}",
             "fingerprint_version": "v1",
             "evidence_class": "none",
@@ -272,11 +288,14 @@ def test_cross_partition_dedup_later_date_wins(tmp_path):
 
     _write_claim_parquet(
         parquet_root, date_str="2026-06-08",
-        rows=[row("fp_day1", "2026-06-08T10:00:00+00:00")],
+        rows=[
+            row(dup_uri, "fp_day1", "2026-06-08T10:00:00+00:00"),
+            row(control_uri, "fp_control", "2026-06-08T11:00:00+00:00"),
+        ],
     )
     _write_claim_parquet(
         parquet_root, date_str="2026-06-09",
-        rows=[row("fp_day2", "2026-06-09T10:00:00+00:00")],
+        rows=[row(dup_uri, "fp_day2", "2026-06-09T10:00:00+00:00")],
     )
     out = tmp_path / "facts.sqlite"
 
@@ -290,10 +309,15 @@ def test_cross_partition_dedup_later_date_wins(tmp_path):
     assert manifest["input_partition_window"] == {"min": "2026-06-08", "max": "2026-06-09"}
     conn = sqlite3.connect(str(out))
     rows = conn.execute(
-        "SELECT post_uri, fingerprint FROM uri_fingerprint"
+        "SELECT post_uri, fingerprint FROM uri_fingerprint ORDER BY post_uri"
     ).fetchall()
     conn.close()
-    assert rows == [(dup_uri, "fp_day2")]
+    # Control row proves the older partition was read at all; dup row proves
+    # the later partition's version won.
+    assert rows == [
+        (dup_uri, "fp_day2"),
+        (control_uri, "fp_control"),
+    ]
 
 
 def test_missing_parquet_publishes_controlled_identity_only_snapshot(tmp_path):
@@ -320,6 +344,33 @@ def test_missing_parquet_publishes_controlled_identity_only_snapshot(tmp_path):
     assert manifest["uri_fingerprint_max_created_epoch_written"] is None
 
 
+def test_overlapping_run_tmps_are_isolated(tmp_path):
+    """PID-suffixed tmps: a concurrent run's fresh tmp is never touched;
+    a crashed run's stale orphan is swept. Overlap can no longer publish
+    another run's partial file (codex review finding, 2026-07-16)."""
+    identity_db = _make_identity_db(tmp_path / "identity.sqlite")
+    out = tmp_path / "facts.sqlite"
+
+    fresh = tmp_path / "facts.sqlite.tmp.99999"
+    fresh.write_text("other run in progress")
+    stale = tmp_path / "facts.sqlite.tmp.11111"
+    stale.write_text("crashed run leftover")
+    old = time.time() - 7200
+    os.utime(stale, (old, old))
+
+    export_snapshot_once(
+        parquet_root=tmp_path / "missing-parquet",
+        identity_source_path=identity_db,
+        output_path=out,
+        generated_at=GENERATED_AT,
+    )
+
+    assert out.exists()
+    assert fresh.exists(), "live concurrent tmp must not be touched"
+    assert fresh.read_text() == "other run in progress"
+    assert not stale.exists(), "stale orphan tmp must be swept"
+
+
 def test_manifest_failure_leaves_no_final_snapshot(tmp_path, monkeypatch):
     identity_db = _make_identity_db(tmp_path / "identity.sqlite")
     out = tmp_path / "facts.sqlite"
@@ -340,4 +391,4 @@ def test_manifest_failure_leaves_no_final_snapshot(tmp_path, monkeypatch):
         )
 
     assert not out.exists()
-    assert not (tmp_path / "facts.sqlite.tmp").exists()
+    assert not list(tmp_path.glob("facts.sqlite.tmp*")), "writer tmp leaked on failure"

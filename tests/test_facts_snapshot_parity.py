@@ -3,9 +3,16 @@
 Phase 3 exit criterion (gap-spec-log-structured-artifact-system § Phase 3)
 requires "output parity acceptable." This is the offline half of that
 receipt: identical logical claim/identity rows through both producers must
-yield identical consumer-visible output, EXCEPT the one ratified divergence —
-the snapshot writer quarantines bogus ``created_epoch`` rows that the legacy
-producer passes through silently.
+yield identical consumer-visible output, modulo exactly two documented
+divergences, pinned by these tests:
+
+1. **Quarantine** (writer-only filter): bogus ``created_epoch`` rows are
+   excluded by the snapshot writer; legacy passes future-dated ones through.
+2. **Retention horizon** (legacy-only filter): legacy prunes
+   ``uri_fingerprint`` rows older than 30 days; the snapshot carries the
+   full Parquet-retained history. Consumer impact is bounded: labelwatch's
+   derive JOIN is driven by candidate URIs from recent label events (72h
+   overlap window), so extra old rows are dead weight, not wrong answers.
 
 Parity here is defined by the consumer inventory
 (gap-spec-facts-export-consumer-inventory.md), not by byte equality:
@@ -64,12 +71,14 @@ GOOD_EPOCH_1 = NOW_EPOCH - 5 * 86_400
 GOOD_EPOCH_2 = NOW_EPOCH - 5 * 86_400 + 3_600
 GOOD_EPOCH_3 = NOW_EPOCH - 4 * 86_400
 BOGUS_EPOCH = 7_226_582_400  # 2199-01-01: > generated_at + 1d → quarantined
+HORIZON_EPOCH = NOW_EPOCH - 45 * 86_400  # valid, but beyond legacy's 30d prune
 
 CLAIM_ROWS = [
     ("at://did:a/app.bsky.feed.post/1", "fp_old", GOOD_EPOCH_1),
     ("at://did:a/app.bsky.feed.post/1", "fp_new", GOOD_EPOCH_2),  # dup: wins
     ("at://did:b/app.bsky.feed.post/2", "fp_b", GOOD_EPOCH_3),
     ("at://did:future/app.bsky.feed.post/3", "fp_bogus", BOGUS_EPOCH),
+    ("at://did:c/app.bsky.feed.post/4", "fp_horizon", HORIZON_EPOCH),
 ]
 
 
@@ -194,19 +203,23 @@ def outputs(tmp_path, monkeypatch):
     _make_parquet(parquet_root)
 
     # Legacy producer. Freeze its notion of "now" so the 30-day retention
-    # prune can't eat fixture rows as the wall clock advances.
+    # prune bites deterministically (HORIZON row pruned, good rows kept).
+    # `legacy.time` is the global time module, so the patch is process-wide —
+    # bound it with monkeypatch.context() to exactly the legacy export call
+    # instead of leaking a frozen clock across the whole fixture.
     import labeler.facts_export as legacy
 
-    monkeypatch.setattr(legacy.time, "time", lambda: float(NOW_EPOCH))
     legacy_facts = tmp_path / "legacy" / "facts.sqlite"
     legacy_facts.parent.mkdir()
     source_factory = lambda: sqlite3.connect(str(hot_db))  # noqa: E731
-    export_once(
-        source_factory,
-        facts_path=str(legacy_facts),
-        work_path=str(tmp_path / "legacy" / "facts_work.sqlite"),
-        force_snapshot=True,
-    )
+    with monkeypatch.context() as m:
+        m.setattr(legacy.time, "time", lambda: float(NOW_EPOCH))
+        export_once(
+            source_factory,
+            facts_path=str(legacy_facts),
+            work_path=str(tmp_path / "legacy" / "facts_work.sqlite"),
+            force_snapshot=True,
+        )
 
     # Snapshot writer.
     snapshot_facts = tmp_path / "snapshot" / "facts.sqlite"
@@ -219,19 +232,27 @@ def outputs(tmp_path, monkeypatch):
     return legacy_facts, snapshot_facts, manifest
 
 
-def test_uri_fingerprint_parity_modulo_quarantine(outputs):
+def test_uri_fingerprint_parity_modulo_documented_divergences(outputs):
     legacy_facts, snapshot_facts, manifest = outputs
     legacy_rows = _consumer_visible_uri_rows(legacy_facts)
     snapshot_rows = _consumer_visible_uri_rows(snapshot_facts)
 
     bogus_row = ("at://did:future/app.bsky.feed.post/3", "fp_bogus", BOGUS_EPOCH)
+    horizon_row = ("at://did:c/app.bsky.feed.post/4", "fp_horizon", HORIZON_EPOCH)
 
-    # The ratified divergence, stated exactly: legacy leaks the bogus row,
-    # the snapshot quarantines it. Everything else is identical.
+    # Divergence 1 — quarantine: legacy leaks the future-dated row, the
+    # snapshot excludes it and counts it in the manifest.
     assert bogus_row in legacy_rows
     assert bogus_row not in snapshot_rows
-    assert legacy_rows - {bogus_row} == snapshot_rows
     assert manifest["uri_fingerprint_rows_quarantined_bogus_created_epoch"] == 1
+
+    # Divergence 2 — retention horizon: legacy's 30d prune drops the old-but-
+    # valid row; the snapshot carries the full Parquet-retained history.
+    assert horizon_row not in legacy_rows
+    assert horizon_row in snapshot_rows
+
+    # And NOTHING else differs.
+    assert legacy_rows - {bogus_row} == snapshot_rows - {horizon_row}
 
     # Dedup semantics agree: latest row for the duplicated post_uri won in both.
     dup = [r for r in snapshot_rows if r[0] == "at://did:a/app.bsky.feed.post/1"]

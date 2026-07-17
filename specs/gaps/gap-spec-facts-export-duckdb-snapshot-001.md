@@ -212,7 +212,19 @@ Done (receipts in-repo):
   snapshot, including proof the quarantine keeps the 29-year-lag class out
   of `derived_label_fp`. Skips when the sibling checkout is absent.
 - Offline parity receipts: `tests/test_facts_snapshot_parity.py` — legacy
-  vs writer on identical logical rows, divergence exactly = quarantine.
+  vs writer on identical logical rows. Exactly two pinned divergences:
+  quarantine (writer-only filter) and retention horizon (legacy prunes >30d;
+  snapshot carries full Parquet history — consumer impact bounded by the
+  72h candidate window).
+- Known V0 dedup edge (accepted): cross-day dedup follows createdAt
+  partition order, not ingestion order — a backdated correction loses to
+  the original here while winning under legacy rowid dedup. Pinned in
+  `test_cross_partition_dedup_later_date_wins`.
+- Post-review hardening (codex adversarial pass, same night): PID-suffixed
+  writer/manifest tmps + stale-tmp sweep (overlapping runs can no longer
+  publish a partial file), `flock -n` on the cron line, publication-failure
+  retention tests (rename failure ⇒ no prune; verification mismatch ⇒
+  skip + clean tmp).
 - Operate/cutover runbook: `docs/RUNBOOK.md` § "Facts snapshot writer".
 - Prod image gap closed: `deploy/requirements.prod.txt` now carries
   duckdb (writer would have crashed on the VM without it).

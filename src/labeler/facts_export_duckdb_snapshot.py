@@ -39,8 +39,9 @@ import time
 from typing import Any
 
 
-WRITER_VERSION = "0.1.0"
+WRITER_VERSION = "0.1.1"
 _BOGUS_MIN_EPOCH = 1_577_836_800  # 2020-01-01T00:00:00Z
+_STALE_TMP_MAX_AGE_S = 3_600  # orphaned .tmp.<pid> files older than this are swept
 
 
 def _default_parquet_root() -> pathlib.Path:
@@ -242,9 +243,29 @@ def _read_uri_rows(
 
 
 def _write_manifest_atomic(manifest_path: pathlib.Path, manifest: dict[str, Any]) -> None:
-    tmp_path = manifest_path.with_name(manifest_path.name + ".tmp")
+    # PID-suffixed tmp: overlapping writer runs must never rename each
+    # other's partially-written files into place. See _sweep_stale_tmps.
+    tmp_path = manifest_path.with_name(f"{manifest_path.name}.tmp.{os.getpid()}")
     tmp_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     os.replace(str(tmp_path), str(manifest_path))
+
+
+def _sweep_stale_tmps(out_path: pathlib.Path) -> None:
+    """Remove orphaned .tmp.<pid> files left by crashed/killed prior runs.
+
+    Only sweeps tmps older than _STALE_TMP_MAX_AGE_S so a concurrent live
+    run's in-progress tmp is never touched. (Concurrent runs should be
+    prevented at the invocation layer — flock in the cron line, see
+    RUNBOOK — but the writer must not corrupt output even without it.)
+    """
+    cutoff = time.time() - _STALE_TMP_MAX_AGE_S
+    for pattern in (f"{out_path.name}.tmp.*", f"{out_path.name}.manifest.json.tmp.*"):
+        for stale in out_path.parent.glob(pattern):
+            try:
+                if stale.stat().st_mtime < cutoff:
+                    stale.unlink()
+            except OSError:
+                continue
 
 
 def _count(conn: sqlite3.Connection, table: str) -> int:
@@ -273,8 +294,13 @@ def export_snapshot_once(
     out_path = pathlib.Path(output_path) if output_path is not None else _default_output_path()
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    tmp_path = out_path.with_name(out_path.name + ".tmp")
+    # PID-suffixed tmp: a fixed ".tmp" name lets an overlapping run unlink or
+    # rename THIS run's partial file into production. With unique names each
+    # run only ever renames its own complete output; overlap degrades to
+    # last-writer-wins of complete snapshots.
+    tmp_path = out_path.with_name(f"{out_path.name}.tmp.{os.getpid()}")
     manifest_path = out_path.with_name(out_path.name + ".manifest.json")
+    _sweep_stale_tmps(out_path)
     if tmp_path.exists():
         tmp_path.unlink()
 

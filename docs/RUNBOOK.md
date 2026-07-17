@@ -109,9 +109,12 @@ docker exec driftwatch python -m labeler.cli driftwatch facts-snapshot \
 
 **Production cadence:** host cron, hourly. Cron is the on/off switch — the
 rollback path is "disable the cron", so do not bury the invocation inside the
-app process.
+app process. `flock -n` skips a run when the previous one is still going
+(slow runs must not stack); the writer's PID-suffixed tmp files are the
+second layer — even without the lock, overlap degrades to last-writer-wins
+of *complete* snapshots, never a partial publish.
 ```cron
-17 * * * * docker exec driftwatch python -m labeler.cli driftwatch facts-snapshot --parquet-root /app/data/parquet --identity-db /app/data/labeler.sqlite --out /app/data/facts.sqlite >> /var/log/driftwatch-facts-snapshot.log 2>&1
+17 * * * * flock -n /run/lock/driftwatch-facts-snapshot.lock docker exec driftwatch python -m labeler.cli driftwatch facts-snapshot --parquet-root /app/data/parquet --identity-db /app/data/labeler.sqlite --out /app/data/facts.sqlite >> /var/log/driftwatch-facts-snapshot.log 2>&1
 ```
 
 **Deploy checklist (first cutover):**
@@ -130,6 +133,9 @@ app process.
      then the writer publishes a controlled identity-only snapshot, by design)
    - `uri_fingerprint_rows_quarantined_bogus_created_epoch` ≈ the known ~25k
      bogus-timestamp population, not ≈ the whole table
+   - snapshot `uri_fingerprint` count ≥ legacy facts.sqlite count is EXPECTED:
+     legacy pruned rows older than 30 days; the snapshot carries the full
+     Parquet-retained history (documented divergence, parity tests pin it)
 3. Watch labelwatch pick it up: `journalctl -u labelwatch | grep facts_sync` —
    next scan should log a fresh mtime and nonzero `snapshot=` once candidate
    URIs exist. Missing/stale facts degrade to a coverage caveat, never a 5xx.
@@ -153,6 +159,11 @@ Diagnosis runs against the manifest + writer log, not against the consumer.
   `ls /app/data/parquet/claim_history/`).
 - Quarantine count spikes → upstream timestamp hygiene regressed; the writer
   is doing its job. Check `specs/gaps/gap-spec-event-time-hygiene.md`.
+- `duration_seconds` trending up across manifests → the V0 writer re-reads
+  ALL partitions every run, so runtime grows with cold history. Watch-item:
+  when it stops fitting comfortably inside the hourly slot, that's the
+  forcing case for an incremental/windowed reader — file it then, don't
+  pre-build it.
 
 ---
 

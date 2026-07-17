@@ -421,6 +421,61 @@ class TestRunRetentionOnce:
         # Source rows are pruned only after the partition is published
         assert conn.execute("SELECT COUNT(*) FROM claim_history").fetchone()[0] == 0
 
+    @pytest.mark.skipif(not retention._HAS_PYARROW, reason="pyarrow not installed")
+    def test_parquet_capture_rename_failure_preserves_source(self, monkeypatch):
+        """If the atomic rename fails, NO source rows are deleted and no
+        partition is published. Publication-before-prune is the invariant;
+        the file-exists + source-empty assertions in the happy-path test
+        alone can't prove ordering (codex review, 2026-07-16)."""
+        monkeypatch.setattr(retention, "PARQUET_CAPTURE_ENABLED", True)
+        monkeypatch.setenv("RETENTION_PARQUET_MAX_DAYS_PER_PASS", "0")
+        conn = _make_db()
+        old_ts = _iso(-20 * 86400)
+        day_str = old_ts[:10]
+        _insert_claim(conn, "fp1", old_ts, observed_at=old_ts)
+        conn.commit()
+
+        real_replace = retention.os.replace
+
+        def failing_replace(src, dst):
+            if str(dst).endswith(".parquet"):
+                raise OSError("injected rename failure")
+            return real_replace(src, dst)
+
+        monkeypatch.setattr(retention.os, "replace", failing_replace)
+        stats = retention.run_retention_once(conn=conn)
+
+        assert stats["claims_archived"] == -1  # error surfaced, not silent
+        assert conn.execute("SELECT COUNT(*) FROM claim_history").fetchone()[0] == 1
+        part = retention.PARQUET_DIR / "claim_history" / f"date={day_str}" / "part-00.parquet"
+        assert not part.exists()
+
+    @pytest.mark.skipif(not retention._HAS_PYARROW, reason="pyarrow not installed")
+    def test_parquet_capture_verification_mismatch_skips_rename_and_delete(
+        self, monkeypatch
+    ):
+        """If post-write verification can't confirm the row count, the day is
+        skipped: tmp removed, nothing renamed, nothing deleted, no error."""
+        monkeypatch.setattr(retention, "PARQUET_CAPTURE_ENABLED", True)
+        monkeypatch.setenv("RETENTION_PARQUET_MAX_DAYS_PER_PASS", "0")
+        conn = _make_db()
+        old_ts = _iso(-20 * 86400)
+        day_str = old_ts[:10]
+        _insert_claim(conn, "fp1", old_ts, observed_at=old_ts)
+        conn.commit()
+
+        def broken_parquet_file(path):
+            raise RuntimeError("injected verification failure")
+
+        monkeypatch.setattr(retention._pq, "ParquetFile", broken_parquet_file)
+        stats = retention.run_retention_once(conn=conn)
+
+        assert stats["claims_archived"] == 0
+        assert conn.execute("SELECT COUNT(*) FROM claim_history").fetchone()[0] == 1
+        day_dir = retention.PARQUET_DIR / "claim_history" / f"date={day_str}"
+        assert not (day_dir / "part-00.parquet").exists()
+        assert not (day_dir / "part-00.parquet.tmp").exists(), "tmp not cleaned"
+
     def test_empty_db(self, tmp_path, monkeypatch):
         monkeypatch.setattr(retention, "ARCHIVE_DIR", tmp_path)
         conn = _make_db()
