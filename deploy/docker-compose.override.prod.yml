@@ -1,0 +1,78 @@
+services:
+  driftwatch:
+    environment:
+      # Retention re-enabled 2026-05-05 with the pressure-aware scheduler
+      # (commit f86287c). Retention runs on its own write connection
+      # (NOT through the writer thread). The scheduler gates passes on
+      # backlog / stream_lag and uses rollback_lost as a tripwire.
+      # 2026-07-27 post-recovery (see /tank/nfs/driftwatch-recovery/2026-07-27/
+      # RECEIPT.md): fresh ~1.8GiB DB on an empty 196G volume. Retention
+      # re-enabled and all windows set to 30d as a growth-curve experiment
+      # (operator jbeck). Watch maintenance.log daily size line + df; if
+      # steady-state ingest exceeds ~6GB/day the 30d windows will not fit
+      # the volume and must be revisited BEFORE the runway closes.
+      ENABLE_RETENTION: "1"
+      # 2026-08-20 ingest was disabled here while retention drained; restored
+      # 2026-08-21 after convergence (events 37 rows / edges 9 rows remaining,
+      # live data 17.97 GiB, freelist 174.75 GiB, WAL clean, page_count never
+      # grew past 50,518,271). Value now matches .env.prod; kept explicit as a
+      # marker of the drain phase.
+      FIREHOSE_AUTO_START: "1"
+      # 2026-08-20 RECOVERY — the 30d growth-curve experiment is REVERTED.
+      # It was falsified: observed ingest ran ~12.1 GB/day against the
+      # experiment note own ~6 GB/day tripwire, and the 196G volume filled
+      # on 2026-08-12, fourteen days before any 30d window became
+      # age-eligible. Driftwatch was blind 2026-08-12..08-20.
+      #
+      # events/edges restored to the pre-experiment values (3d / 7d).
+      # These are PURE DELETES: they free pages inside labeler.sqlite and
+      # consume no filesystem space.
+      #
+      # CLAIM_RETENTION_SEC deliberately LEFT AT 30d for now. Claim pruning
+      # archives to Parquet on this same volume BEFORE deleting (~250 MB per
+      # day-partition); dropping it to 7d would try to write ~2.2 GiB into
+      # ~3.0 GiB of root-reserve headroom. Restore it to 604800 only after
+      # events/edges have drained and real headroom exists.
+      # Do NOT set ENABLE_RETENTION_PARQUET_CAPTURE=0 on this build (70109c8)
+      # as a workaround: that activates the legacy JSONL writer which deletes
+      # with a positional predicate unrelated to what it archived.
+      RAW_STRIP_AGE_SEC: "21600"
+      EVENTS_RETENTION_SEC: "259200"
+      EDGES_RETENTION_SEC: "604800"
+      CLAIM_RETENTION_SEC: "2592000"
+      # Chunk shape — small enough that the writer rarely waits long.
+      RETENTION_STRIP_BATCH: "1000"
+      RETENTION_DELETE_BATCH: "1000"
+      # Writer-contention guard. Temporarily 0.25s during the 2026-08-20/21
+      # drain (no writer to protect); restored to 2.0 on ingest resume.
+      RETENTION_BATCH_SLEEP_SEC: "2.0"
+      # ---- emergency disk-pressure tuning (2026-05-05 evening) ----
+      # Catch-up tuning: 4 days of skipped retention left ~13M events
+      # of stale raw to NULL out + several days of overdue prunes.
+      # Wider per-pass budget, shorter interval, and a chunk budget
+      # matched to observed prune_events wall time (25-31 s under live
+      # writer contention). Keep tolerance at default 3 — overruns
+      # remain a real signal, not a crutch.
+      #
+      # Drop these back to defaults once retention_lag_s drops below
+      # ~3600 and disk_runway_days stays above 5 for an hour.
+      #   defaults: RETENTION_INTERVAL_SEC=3600, RETENTION_PASS_BUDGET_S=600,
+      #             RETENTION_CHUNK_BUDGET_S=3
+      RETENTION_INTERVAL_SEC: "900"
+      RETENTION_PASS_BUDGET_S: "1800"
+      RETENTION_CHUNK_BUDGET_S: "35"
+      # ---- containment toggles (2026-05-08) ----
+      # Disabling heavy concurrent readers to relieve writer WAL-truncate
+      # contention. Watcher captures showed writer in _maybe_wal_truncate
+      # 76%% of stall windows; readers (facts_export, longitudinal,
+      # identity) all active concurrently. This is reduction, not an
+      # experiment. Re-enable individually after WAL-truncate fix lands.
+      ENABLE_FACTS_EXPORT: "false"
+      ENABLE_LONGITUDINAL_RECHECK: "0"
+      ENABLE_CLAIM_RECHECK: "0"
+      # Backfill mode 2026-05-08: process up to 14 candidate dates per pass.
+      # Most are empty (skipped instantly via indexed count query); only days
+      # with rows do real work. Drop back to '1' for steady-state operation
+      # after backfill is drained.
+      RETENTION_PARQUET_MAX_DAYS_PER_PASS: "1"
+
