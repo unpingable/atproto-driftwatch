@@ -145,6 +145,50 @@ async def health_extended():
     except Exception:
         disk_info = None
 
+    # Space-reclamation capability and recovery capacity.
+    #
+    # Reported here rather than only inside retention stats because both are
+    # properties of the database, not of any particular retention pass. Before
+    # this existed, a database structurally incapable of reclaiming space
+    # emitted {"mode": 0, "skipped": true} once per pass into a stats blob
+    # nobody consumed, and looked exactly like a pass with no work to do.
+    reclaim_info = None
+    recovery_info = None
+    try:
+        from .maintenance import (
+            AUTO_VACUUM_INCREMENTAL, db_geometry, recovery_capacity_state,
+        )
+        gconn = get_conn()
+        try:
+            geo = db_geometry(gconn)
+            can_reclaim = geo["auto_vacuum"] == AUTO_VACUUM_INCREMENTAL
+            reclaim_info = {
+                "auto_vacuum": geo["auto_vacuum"],
+                "auto_vacuum_name": {0: "NONE", 1: "FULL", 2: "INCREMENTAL"}.get(
+                    geo["auto_vacuum"], str(geo["auto_vacuum"])
+                ),
+                "can_reclaim_in_place": can_reclaim,
+                "page_count": geo["page_count"],
+                "freelist_count": geo["freelist_count"],
+                "freelist_bytes": geo["freelist_bytes"],
+                "freelist_pct": geo["freelist_pct"],
+                "live_bytes": geo["live_bytes"],
+            }
+            if not can_reclaim:
+                reclaim_info["state"] = "mode_incompatible"
+                reclaim_info["state_reason"] = (
+                    "auto_vacuum=%s: freelist pages can never be returned to the "
+                    "filesystem in place; a VACUUM INTO rebuild is required"
+                    % reclaim_info["auto_vacuum_name"]
+                )
+            else:
+                reclaim_info["state"] = "ok"
+            recovery_info = recovery_capacity_state(gconn)
+        finally:
+            gconn.close()
+    except Exception:
+        pass
+
     # WAL size (main DB)
     wal_info = {}
     try:
@@ -225,6 +269,10 @@ async def health_extended():
         result["capabilities"] = capabilities
     if disk_info is not None:
         result["disk"] = disk_info
+    if reclaim_info is not None:
+        result["reclaim"] = reclaim_info
+    if recovery_info is not None:
+        result["recovery_capacity"] = recovery_info
 
     # Retention scheduler state (if ENABLE_RETENTION is on, the loop has
     # constructed one; otherwise this key is absent). The scheduler's own
