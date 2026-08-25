@@ -121,3 +121,40 @@ class TestDiskRunway:
 # Phase 2B/2C — absolute pressure must drive the brake, without writing to
 # the volume whose exhaustion it signals.
 # ---------------------------------------------------------------------------
+
+
+class TestObservedGrowthRate:
+    """Phase 6: the ~6GB/day tripwire existed only as a comment telling an
+    operator to read maintenance.log by hand. The number is now published."""
+
+    def test_reports_growth_in_bytes_per_day(self):
+        now = time.time()
+        s = _sched_with_history([
+            (now - DAY, 100 * GIB, 50 * GIB),
+            (now, 112 * GIB, 38 * GIB),
+        ])
+        assert s.observed_db_growth_bytes_per_day() == pytest.approx(12 * GIB, rel=0.01)
+        assert s.health_state()["db_growth_gb_per_day"] == pytest.approx(12.0, rel=0.01)
+
+    def test_incident_growth_rate_is_visible(self):
+        """~12.1 GB/day — roughly 2x the written ~6GB/day stop condition."""
+        now = time.time()
+        s = _sched_with_history([
+            (now - 5 * DAY, 100 * GIB, 96 * GIB),
+            (now, 160.5 * GIB, 35.5 * GIB),
+        ])
+        assert s.health_state()["db_growth_gb_per_day"] == pytest.approx(12.1, abs=0.1)
+
+    def test_shrinking_db_reports_negative_growth(self):
+        now = time.time()
+        s = _sched_with_history([
+            (now - DAY, 190 * GIB, 5 * GIB),
+            (now, 60 * GIB, 135 * GIB),
+        ])
+        assert s.observed_db_growth_bytes_per_day() < 0
+
+    def test_insufficient_history_is_none(self):
+        assert _sched_with_history([]).observed_db_growth_bytes_per_day() is None
+        assert _sched_with_history(
+            [(time.time(), 1, 1)]
+        ).observed_db_growth_bytes_per_day() is None

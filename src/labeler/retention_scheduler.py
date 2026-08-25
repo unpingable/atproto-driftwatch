@@ -389,6 +389,33 @@ class RetentionScheduler:
             return None
         return last_free / burn_per_s / 86400.0
 
+    def observed_db_growth_bytes_per_day(self) -> Optional[float]:
+        """Measured growth of the database file, in bytes/day.
+
+        The 2026-07-27 growth-curve experiment carried a written stop condition
+        — "if steady-state ingest exceeds ~6GB/day the 30d windows will not fit
+        the volume and must be revisited BEFORE the runway closes" — but it
+        existed only as a comment instructing an operator to watch
+        maintenance.log and df by hand. Repository history confirms it never had
+        an executable form. Actual growth ran ~12.1 GB/day, roughly twice the
+        stated tripwire, and the volume filled on 2026-08-12.
+
+        This does not re-implement the tripwire as a gate: the condition that
+        actually matters (will the volume fill, and can we still rebuild) is
+        enforced directly by disk runway and the recovery-capacity invariant,
+        both of which measure space rather than a proxy for it. What was missing
+        was the number itself, so it is published here instead of living in a
+        log line a human was expected to read daily.
+        """
+        if len(self._disk_history) < 2:
+            return None
+        first_ts, first_db, _ = self._disk_history[0]
+        last_ts, last_db, _ = self._disk_history[-1]
+        elapsed_s = last_ts - first_ts
+        if elapsed_s <= 0:
+            return None
+        return (last_db - first_db) / elapsed_s * 86400.0
+
     # ------------------------------------------------------------------
     # /health/extended surface.
     # ------------------------------------------------------------------
@@ -418,6 +445,11 @@ class RetentionScheduler:
         }
         last_free = self._disk_history[-1][2] if self._disk_history else None
         out["disk_free_bytes"] = last_free
+        growth = self.observed_db_growth_bytes_per_day()
+        out["db_growth_bytes_per_day"] = growth
+        out["db_growth_gb_per_day"] = (
+            round(growth / (1024 ** 3), 2) if growth is not None else None
+        )
         # Lightweight derived health-state for /health/extended.
         if last_free is not None and last_free <= DISK_RUNWAY_MIN_FREE_BYTES:
             # Absolute exhaustion outranks every other signal, and is reported
