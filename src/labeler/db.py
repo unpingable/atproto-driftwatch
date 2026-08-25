@@ -46,8 +46,25 @@ def init_db():
         except Exception:
             pass
 
-    # SQLite performance: WAL + normal sync
+    # SQLite maintenance policy + performance.
+    #
+    # auto_vacuum=INCREMENTAL is set BEFORE any table is created, because that
+    # is the only moment SQLite honours it. On an existing database the pragma
+    # is a silent no-op unless followed by a full VACUUM — which is exactly the
+    # behaviour we want here: fresh databases get mode 2, and pre-existing
+    # mode-0 databases (including the current production labeler.sqlite) are
+    # left untouched rather than being implicitly rebuilt at import time.
+    #
+    # 2026-08-25: this was previously unset, so every database inherited
+    # SQLite's default of auto_vacuum=NONE. Retention's DELETEs then parked
+    # freed pages on the freelist forever with no way to return them to the
+    # filesystem — 135.6 GiB of trapped pages by the time the volume filled.
+    # The mode is now an explicit policy rather than an inherited default.
     if os.getenv("DB_BACKEND", "sqlite").lower() == "sqlite":
+        try:
+            conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        except Exception:
+            pass
         try:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
