@@ -122,3 +122,45 @@ class TestBrakeDoesNotDependOnMaintenanceLoop:
 # ---------------------------------------------------------------------------
 # Phase 3 — auto_vacuum must be explicit policy, not an inherited default.
 # ---------------------------------------------------------------------------
+
+
+class TestBrakeDisarmIsLoud:
+    """Disarming is a legitimate operational choice; being silent about it is
+    what caused the incident."""
+
+    def _full_disk(self, monkeypatch, tmp_path):
+        import shutil as _sh
+
+        class _Full:
+            total, used, free = 200 * GIB, 200 * GIB, 0
+        monkeypatch.setattr(M, "DATA_DIR", tmp_path)
+        monkeypatch.setattr(_sh, "disk_usage", lambda p: _Full)
+
+    def test_disarmed_brake_does_not_pause_ingest(self, monkeypatch, tmp_path):
+        self._full_disk(monkeypatch, tmp_path)
+        monkeypatch.setenv("DISK_BRAKE_ENABLED", "0")
+        assert M.is_disk_pressure() is False
+
+    def test_disarmed_brake_still_reports_it_would_engage(self, monkeypatch, tmp_path):
+        self._full_disk(monkeypatch, tmp_path)
+        monkeypatch.setenv("DISK_BRAKE_ENABLED", "0")
+        info = M.check_disk_pressure()
+        assert info["level"] == "critical"
+        assert info["emergency_brake"] is False
+        assert info["brake_would_engage"] is True
+        assert info["brake_armed"] is False
+        assert "NOT being paused" in info["brake_disarmed_warning"]
+
+    def test_armed_by_default(self, monkeypatch, tmp_path):
+        self._full_disk(monkeypatch, tmp_path)
+        monkeypatch.delenv("DISK_BRAKE_ENABLED", raising=False)
+        assert M.is_disk_pressure() is True
+        assert M.brake_state()["armed"] is True
+
+    def test_brake_state_distinguishes_disarmed_from_not_engaged(
+            self, monkeypatch, tmp_path):
+        self._full_disk(monkeypatch, tmp_path)
+        monkeypatch.setenv("DISK_BRAKE_ENABLED", "0")
+        M.is_disk_pressure()
+        st = M.brake_state()
+        assert st["would_engage"] is True and st["engaged"] is False

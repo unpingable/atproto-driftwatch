@@ -59,6 +59,24 @@ _BRAKE = {"engaged": False, "since": None, "reason": None}
 _LAST_SAMPLE = {"at": 0.0, "result": None}
 
 
+def _brake_armed() -> bool:
+    """Is the brake allowed to actually stop ingest?
+
+    Deliberately re-read each call so the setting can be flipped without a
+    restart. Disarming is a real operational choice — on a volume that is
+    already full the brake engages immediately and cannot release until the
+    database is rebuilt, which means a total observation blackout for the
+    duration. An operator may legitimately prefer degraded ingest to none.
+
+    What disarming must NOT be is silent. The original defect was precisely
+    that: ENABLE_MAINTENANCE=false disabled the only path that armed the brake,
+    and nothing anywhere said so. A disarmed brake therefore still evaluates
+    pressure, still reports would_engage, and is surfaced by brake_state() and
+    /health/extended as disarmed rather than simply reading "not engaged".
+    """
+    return os.getenv("DISK_BRAKE_ENABLED", "1").lower() not in ("0", "false", "no")
+
+
 def classify_disk_pressure(used_frac: float, free_bytes: int) -> str:
     """Pure: map (used fraction, absolute free bytes) to ok/warn/critical.
 
@@ -121,8 +139,16 @@ def _sample_disk() -> dict:
         _BRAKE.update(engaged=False, since=None, reason=None)
         LOG.warning("disk pressure cleared, emergency brake RELEASED (%.1f%% used)",
                     result["used_pct"])
-    result["emergency_brake"] = _BRAKE["engaged"]
+    armed = _brake_armed()
+    result["emergency_brake"] = _BRAKE["engaged"] and armed
+    result["brake_would_engage"] = _BRAKE["engaged"]
+    result["brake_armed"] = armed
     result["brake_reason"] = _BRAKE["reason"]
+    if _BRAKE["engaged"] and not armed:
+        result["brake_disarmed_warning"] = (
+            "disk pressure is critical and the brake would engage, but "
+            "DISK_BRAKE_ENABLED is off — ingest is NOT being paused"
+        )
     return result
 
 
@@ -142,17 +168,23 @@ def is_disk_pressure() -> bool:
     """Is the emergency brake engaged? Called by the consumer's ingest path.
 
     Self-sampling with a short TTL, so the brake is live regardless of whether
-    the optional maintenance loop is enabled.
+    the optional maintenance loop is enabled. Returns False when the brake is
+    explicitly disarmed, but pressure is still evaluated and reported so the
+    disarm is visible rather than silent.
     """
     now = time.time()
     if _LAST_SAMPLE["result"] is None or (now - _LAST_SAMPLE["at"]) > DISK_SAMPLE_TTL_SEC:
         _LAST_SAMPLE.update(at=now, result=_sample_disk())
-    return bool(_BRAKE["engaged"])
+    return bool(_BRAKE["engaged"]) and _brake_armed()
 
 
 def brake_state() -> dict:
     """Introspection for /health/extended."""
-    return dict(_BRAKE)
+    st = dict(_BRAKE)
+    st["armed"] = _brake_armed()
+    st["would_engage"] = bool(_BRAKE["engaged"])
+    st["engaged"] = bool(_BRAKE["engaged"]) and st["armed"]
+    return st
 
 
 def _reset_brake_for_test():
