@@ -71,6 +71,13 @@ CHUNK_OVERRUN_TOLERANCE = int(os.getenv("RETENTION_CHUNK_OVERRUN_TOLERANCE", "3"
 # Disk runway thresholds for health surfaces.
 DISK_RUNWAY_DEGRADED_DAYS = float(os.getenv("RETENTION_DISK_RUNWAY_DEGRADED_DAYS", "5"))
 DISK_RUNWAY_CRITICAL_DAYS = float(os.getenv("RETENTION_DISK_RUNWAY_CRITICAL_DAYS", "2"))
+# Absolute free-space floor, evaluated independently of burn rate. A volume at
+# or below this has zero runway by definition, whether or not consumption is
+# still measurable. See estimate_disk_runway_days for why this must not depend
+# on the derivative.
+DISK_RUNWAY_MIN_FREE_BYTES = int(
+    os.getenv("RETENTION_DISK_RUNWAY_MIN_FREE_BYTES", str(2 * 1024 ** 3))
+)
 
 
 class _Pressureable(Protocol):
@@ -332,13 +339,41 @@ class RetentionScheduler:
         self._retention_lag_s = lag_s
 
     def estimate_disk_runway_days(self) -> Optional[float]:
-        """Days until disk hits the 92% emergency-brake threshold, given
-        the EWMA growth rate from disk history. Returns None if we don't
-        have enough samples yet (need at least 2)."""
+        """Days of runway left on the data volume.
+
+        Returns 0.0 for an exhausted volume, a positive estimate when space is
+        measurably draining, and None only when runway genuinely does not apply
+        (no samples yet, or a healthy volume that is not draining).
+
+        2026-08-25 incident repair. This used to be a pure derivative:
+
+            free_delta  = last_free - first_free
+            burn_per_s  = -free_delta / elapsed_s
+            if burn_per_s <= 0: return None
+
+        On a volume that has already hit 0 bytes free, free_delta is 0, so
+        burn_per_s is 0 and the function returned None — and both threshold
+        branches in health_state() were gated on ``is not None``. The alarm was
+        therefore structurally incapable of firing at exactly the moment it
+        existed for: it could warn while the volume was filling, and went silent
+        the instant it was full. That is what happened from 2026-08-12 onward.
+
+        The fix is to evaluate an absolute floor *before* the derivative. A full
+        volume has zero runway whether or not consumption is still measurable.
+        """
+        if not self._disk_history:
+            return None
+
+        last_ts, last_db, last_free = self._disk_history[-1]
+
+        # Absolute floor first — independent of burn rate, so a flat-but-full
+        # volume stays critical instead of disappearing into None.
+        if last_free <= DISK_RUNWAY_MIN_FREE_BYTES:
+            return 0.0
+
         if len(self._disk_history) < 2:
             return None
         first_ts, first_db, first_free = self._disk_history[0]
-        last_ts, last_db, last_free = self._disk_history[-1]
         elapsed_s = last_ts - first_ts
         if elapsed_s <= 0:
             return None
@@ -347,19 +382,11 @@ class RetentionScheduler:
         free_delta = last_free - first_free
         burn_per_s = -free_delta / elapsed_s  # positive = losing space
         if burn_per_s <= 0:
-            # No measurable burn (or net free gain — e.g., after an archive
-            # delete). Returning float('inf') would break JSON serialization
-            # in /health/extended; None means "not currently applicable",
-            # which is the honest answer.
+            # Healthy and not draining (or recovering after an archive delete).
+            # Runway does not apply; float('inf') would break JSON in
+            # /health/extended. The absolute floor above has already handled
+            # the dangerous flat case, so None here is safe.
             return None
-        # Brake threshold is 92% used = 8% free of total. Total = used + free
-        # at last sample. Approximate.
-        # We need the absolute "free at brake" — caller didn't pass it but
-        # 8% of total works. Without total here, fall back to "headroom is
-        # last_free minus a fixed pad of 0 — let caller set pad if needed".
-        # Simpler: caller is presumed to compute brake-threshold elsewhere
-        # and pass headroom. For now, treat last_free as headroom and let
-        # health_state pair this with disk pct.
         return last_free / burn_per_s / 86400.0
 
     # ------------------------------------------------------------------
@@ -385,11 +412,21 @@ class RetentionScheduler:
                 "chunk_overrun_tolerance": CHUNK_OVERRUN_TOLERANCE,
                 "disk_runway_degraded_days": DISK_RUNWAY_DEGRADED_DAYS,
                 "disk_runway_critical_days": DISK_RUNWAY_CRITICAL_DAYS,
+                "disk_runway_min_free_bytes": DISK_RUNWAY_MIN_FREE_BYTES,
             },
             "current_pressure": snap,
         }
+        last_free = self._disk_history[-1][2] if self._disk_history else None
+        out["disk_free_bytes"] = last_free
         # Lightweight derived health-state for /health/extended.
-        if runway_days is not None and runway_days < DISK_RUNWAY_CRITICAL_DAYS:
+        if last_free is not None and last_free <= DISK_RUNWAY_MIN_FREE_BYTES:
+            # Absolute exhaustion outranks every other signal, and is reported
+            # distinctly so "full" is never confused with "draining fast".
+            out["state"] = "critical"
+            out["state_reason"] = (
+                f"disk_exhausted:free_bytes={last_free}<=min={DISK_RUNWAY_MIN_FREE_BYTES}"
+            )
+        elif runway_days is not None and runway_days < DISK_RUNWAY_CRITICAL_DAYS:
             out["state"] = "critical"
             out["state_reason"] = f"disk_runway_days={runway_days:.1f}<critical={DISK_RUNWAY_CRITICAL_DAYS}"
         elif runway_days is not None and runway_days < DISK_RUNWAY_DEGRADED_DAYS:
