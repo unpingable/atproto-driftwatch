@@ -712,20 +712,16 @@ def _delete_archived_day_chunk(conn, retention_col, day_start, day_end, batch):
 
 
 def _incremental_vacuum_chunk(conn):
-    """Run PRAGMA incremental_vacuum if mode 2. Returns stats dict."""
-    mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
-    if mode == 2:
-        freelist_before = conn.execute("PRAGMA freelist_count").fetchone()[0]
-        conn.execute("PRAGMA incremental_vacuum(1000)")
-        freelist_after = conn.execute("PRAGMA freelist_count").fetchone()[0]
-        conn.commit()
-        return {
-            "mode": 2,
-            "freelist_before": freelist_before,
-            "freelist_after": freelist_after,
-            "reclaimed_pages": freelist_before - freelist_after,
-        }
-    return {"mode": mode, "skipped": True}
+    """Reclaim freelist pages. Delegates to the shared, correct implementation.
+
+    See maintenance.incremental_vacuum_chunk: ``conn.execute("PRAGMA
+    incremental_vacuum(N)")`` reclaims exactly one page regardless of N, which
+    is what this function used to do.
+    """
+    from .maintenance import incremental_vacuum_chunk
+    result = incremental_vacuum_chunk(conn, pages=1000)
+    conn.commit()
+    return result
 
 
 def _adaptive_sleep(get_backlog) -> float:
@@ -1209,32 +1205,22 @@ def run_retention_once(conn=None):
     # mutation paths must converge through the writer thread.
 
     # 6b. Incremental vacuum: reclaim freelist pages without needing temp space.
-    # Only has effect if the DB was created/last-vacuumed with
-    # auto_vacuum=INCREMENTAL (mode 2). On a mode-0 DB, this is a silent
-    # no-op — safe to run unconditionally. After a future VACUUM INTO flips
-    # the DB to mode 2, this starts eating away at the freelist each pass
-    # and prevents the "trapped dead pages" problem from re-accumulating.
+    # Only effective when the DB is auto_vacuum=INCREMENTAL (mode 2). On a
+    # mode-0 DB nothing can be reclaimed in place — that is now reported as
+    # status "mode_incompatible" rather than a bare {"skipped": true}, because
+    # a database that structurally cannot reclaim space is a fault, not an
+    # idle pass. /health/extended surfaces it under "reclaim".
     try:
-        mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
-        if mode == 2:  # INCREMENTAL
-            freelist_before = conn.execute("PRAGMA freelist_count").fetchone()[0]
-            conn.execute("PRAGMA incremental_vacuum(1000)")
-            freelist_after = conn.execute("PRAGMA freelist_count").fetchone()[0]
-            reclaimed_pages = freelist_before - freelist_after
-            stats["incremental_vacuum"] = {
-                "freelist_before": freelist_before,
-                "freelist_after": freelist_after,
-                "reclaimed_pages": reclaimed_pages,
-            }
-            if reclaimed_pages > 0:
-                LOG.info(
-                    "incremental_vacuum: reclaimed %d pages (freelist %d -> %d)",
-                    reclaimed_pages, freelist_before, freelist_after,
-                )
-        else:
-            stats["incremental_vacuum"] = {"mode": mode, "skipped": True}
+        from .maintenance import incremental_vacuum_chunk
+        stats["incremental_vacuum"] = incremental_vacuum_chunk(conn, pages=1000)
+        if stats["incremental_vacuum"].get("status") == "mode_incompatible":
+            LOG.warning(
+                "incremental_vacuum: %s",
+                stats["incremental_vacuum"].get("detail", "mode incompatible"),
+            )
     except Exception:
         LOG.exception("incremental_vacuum failed")
+        stats["incremental_vacuum"] = {"status": "failed"}
 
     # 7. DB geometry snapshot (for VACUUM planning and growth monitoring)
     try:
@@ -1395,21 +1381,12 @@ def run_retention_once_with_sched(scheduler, conn=None) -> dict:
     # Incremental vacuum — single SQL call, no chunk loop. Skip if aborted.
     if not aborted:
         try:
-            mode = conn.execute("PRAGMA auto_vacuum").fetchone()[0]
-            if mode == 2:
-                fb = conn.execute("PRAGMA freelist_count").fetchone()[0]
-                conn.execute("PRAGMA incremental_vacuum(1000)")
-                fa = conn.execute("PRAGMA freelist_count").fetchone()[0]
-                conn.commit()
-                stats["incremental_vacuum"] = {
-                    "freelist_before": fb,
-                    "freelist_after": fa,
-                    "reclaimed_pages": fb - fa,
-                }
-            else:
-                stats["incremental_vacuum"] = {"mode": mode, "skipped": True}
+            from .maintenance import incremental_vacuum_chunk
+            stats["incremental_vacuum"] = incremental_vacuum_chunk(conn, pages=1000)
+            conn.commit()
         except Exception:
             LOG.exception("incremental_vacuum failed")
+            stats["incremental_vacuum"] = {"status": "failed"}
 
     # DB geometry + retention lag + disk sample for scheduler health.
     try:
@@ -1438,20 +1415,35 @@ def run_retention_once_with_sched(scheduler, conn=None) -> dict:
             scheduler.record_disk_sample(db_size_b, free_b)
         except Exception:
             pass
-        # Retention lag: oldest events.ctime vs (now - retention window).
+        # Retention lag: oldest *believable* events.ctime vs the retention
+        # window. ctime comes from the record's own createdAt and is fully
+        # caller-controlled: production held a 2002-04-01 row that drove
+        # retention_lag_s to ~11.8 years. Rows below the plausibility floor are
+        # excluded from the metric and counted separately so the garbage stays
+        # visible instead of silently distorting the gauge. Both queries use
+        # idx_events_ctime.
         try:
-            row = conn.execute("SELECT MIN(ctime) FROM events").fetchone()
-            if row and row[0]:
-                from datetime import datetime, timezone
-                oldest = datetime.fromisoformat(
-                    row[0].replace("Z", "+00:00")
-                )
-                now = datetime.now(timezone.utc)
-                age_s = (now - oldest).total_seconds()
-                # Lag = how far past the retention cutoff the oldest row is.
-                # 0 or negative = retention is at-or-below window.
-                lag_s = age_s - EVENTS_RETENTION_SEC
+            from .maintenance import CTIME_PLAUSIBLE_FLOOR, compute_retention_lag
+            row = conn.execute(
+                "SELECT MIN(ctime) FROM events WHERE ctime >= ?",
+                (CTIME_PLAUSIBLE_FLOOR,),
+            ).fetchone()
+            lag_s = compute_retention_lag(
+                row[0] if row else None, EVENTS_RETENTION_SEC
+            )
+            if lag_s is not None:
                 scheduler.record_retention_lag(lag_s)
+                stats["retention_lag_s"] = round(lag_s, 1)
+            suspect = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE ctime < ?",
+                (CTIME_PLAUSIBLE_FLOOR,),
+            ).fetchone()
+            if suspect and suspect[0]:
+                stats["ctime_suspect_rows"] = suspect[0]
+                LOG.warning(
+                    "%d events rows have ctime before %s — excluded from "
+                    "retention lag", suspect[0], CTIME_PLAUSIBLE_FLOOR,
+                )
         except Exception:
             LOG.debug("retention lag read failed", exc_info=True)
     except Exception:
