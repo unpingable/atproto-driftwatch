@@ -124,10 +124,17 @@ Key environment variables (full list in source):
 | `GET /health/preflight` | — | Startup checks: disk, DB, tables, WAL (503 on fail) |
 | `GET /health/bake` | — | Baseline trustworthiness: consumer, retention, DB growth |
 | `GET /metrics` | — | Prometheus metrics |
-| `GET /strain/top` | — | Top authors by event count |
-| `GET /labels/{uri}` | — | Labels for a post URI |
+| `GET /exposure/{did}` | admin | Incoming edge count for one DID |
+| `GET /strain/top` | admin | Top authors by event count |
+| `GET /labels/{uri}` | admin | Labels for a post URI |
 | `GET /recent-decisions` | admin | Recent label decisions (filterable by rule_id) |
 | `GET /quarantine/recent` | admin | Recent quarantined emits |
+
+The three per-DID / per-subject routes are administrative diagnostics, not
+public surfaces: `docs/architecture/PUBLIC_SURFACES.md` classifies per-DID
+surfaces as forbidden to publish, and they are deliberately absent from its
+inventory. `admin_auth` is a no-op unless `ADMIN_API_TOKEN` is set, so setting
+it is a deployment prerequisite rather than an optional hardening step.
 
 ## Architecture
 
