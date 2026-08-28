@@ -48,6 +48,14 @@ LAG_CLAMP_MAX_S = 600.0  # 10 min — clock jump guard
 # Absolute lag threshold during warmup
 WARMUP_LAG_ABSOLUTE_S = float(os.getenv("HEALTH_WARMUP_LAG_ABSOLUTE_S", "120"))
 
+# Number of *admissible* windows (see _window_admissible) required before the
+# baseline has standing: before that it is not a denominator anyone may reason
+# from. Defaults to the same window count the state machine already uses to
+# decide it has an opinion at all.
+BASELINE_ESTABLISH_WINDOWS = int(
+    os.getenv("HEALTH_BASELINE_ESTABLISH_WINDOWS", str(WARMUP_WINDOWS))
+)
+
 # Epsilon for baseline division
 _EPS = 1e-6
 
@@ -55,6 +63,19 @@ _EPS = 1e-6
 WARMING_UP = "warming_up"
 OK = "ok"
 DEGRADED = "degraded"
+
+# Baseline standing — provenance of the denominator, independent of health state.
+#
+# UNESTABLISHED: no admissible window has ever contributed. There is no
+#     denominator; coverage is meaningless and platform_low_eps must not fire.
+# PROVISIONAL:   learning from admissible windows, but not yet enough of them
+#     to carry standing. Still not freeze-eligible.
+# ESTABLISHED:   built from >= BASELINE_ESTABLISH_WINDOWS admissible windows.
+#     Only an established baseline may gate platform_low_eps, and only an
+#     established baseline is frozen while DEGRADED.
+BASELINE_UNESTABLISHED = "unestablished"
+BASELINE_PROVISIONAL = "provisional"
+BASELINE_ESTABLISHED = "established"
 
 
 class PlatformHealth:
@@ -73,6 +94,11 @@ class PlatformHealth:
         # EWMA baseline
         self._baseline_eps = 0.0
         self._current_eps = 0.0
+
+        # Baseline provenance
+        self._baseline_standing = BASELINE_UNESTABLISHED
+        self._admissible_windows = 0
+        self._last_window_admissible = False
 
         # Lag tracking
         self._stream_lag_s = 0.0
@@ -145,33 +171,41 @@ class PlatformHealth:
         with self._lock:
             return self._record_window_locked(events_in, window_secs, backlog, dropped)
 
+    def _window_admissible_locked(self, dropped: int, backlog_growing: bool) -> bool:
+        """Is this window a representative steady-state observation?
+
+        Derived from facts the pipeline already reports, using the thresholds
+        the state machine already trusts — no new tuning surface:
+
+        * ``dropped == 0`` — any shedding means the queue hit capacity, so
+          events_in was bounded by our drain rate, not by the source. This is
+          the single strongest signal and it alone disqualifies the window.
+        * ``stream_lag_s < LAG_RECOVER_THRESHOLD_S`` — the same bar the
+          recovery check already uses for "lag is fine". Elevated lag means
+          cursor replay / catch-up: we are draining history as fast as we can,
+          which is a throughput measurement, not an arrival-rate measurement.
+        * ``not backlog_growing`` — the queue is filling faster than the writer
+          drains it, i.e. the pipeline is becoming capacity-bound.
+        """
+        if dropped > 0:
+            return False
+        if self._stream_lag_s >= LAG_RECOVER_THRESHOLD_S:
+            return False
+        if backlog_growing:
+            return False
+        return True
+
     def _record_window_locked(self, events_in: int, window_secs: float, backlog: int,
                               dropped: int = 0) -> dict:
         self._windows_seen += 1
         window_secs = max(window_secs, 1.0)  # avoid div-by-zero
         self._current_eps = events_in / window_secs
 
-        # --- EWMA baseline (frozen during DEGRADED) ---
-        if self._state != DEGRADED:
-            if self._baseline_eps == 0.0:
-                self._baseline_eps = self._current_eps
-            else:
-                self._baseline_eps = (
-                    EWMA_ALPHA * self._current_eps
-                    + (1 - EWMA_ALPHA) * self._baseline_eps
-                )
-
         # --- Drop fraction ---
         total_received = events_in + dropped
         self._drop_frac = dropped / max(total_received, 1)
 
-        # --- Coverage ---
-        coverage = min(
-            self._current_eps / max(self._baseline_eps, _EPS),
-            1.0,
-        )
-
-        # --- Backlog direction ---
+        # --- Backlog direction (needed before admissibility) ---
         backlog_growing = False
         backlog_stable = False
         if self._prev_backlog is not None:
@@ -182,11 +216,84 @@ class PlatformHealth:
                 backlog_stable = True
         self._prev_backlog = backlog
 
+        # --- Admissibility: may this window teach us the baseline? ---
+        #
+        # A baseline is a claim about how many events the source *offers* in
+        # steady state. A window only measures that when the pipeline was not
+        # capacity-bound and not catching up. During cursor replay the consumer
+        # commits at its drain ceiling while shedding the rest, so events_in
+        # measures *our own throughput limit*, not the source. Those windows
+        # must never teach the baseline.
+        admissible = self._window_admissible_locked(dropped, backlog_growing)
+
+        # --- EWMA baseline ---
+        #
+        # Learn only from admissible windows, and freeze an ESTABLISHED
+        # baseline while DEGRADED (so a real outage cannot quietly redefine
+        # "normal" downward and self-declare healthy). A baseline that has not
+        # yet earned standing is NOT freeze-eligible — otherwise a cold start
+        # inside a replay storm latches a fictitious denominator forever.
+        frozen = (
+            self._state == DEGRADED
+            and self._baseline_standing == BASELINE_ESTABLISHED
+        )
+        learn = admissible and not frozen
+
+        # An established baseline is only revised by windows that look normal
+        # *against it*. A window far below the established denominator is
+        # evidence of a problem, not a new definition of normal — without this,
+        # the ~3 windows a degradation takes to latch would drag the baseline
+        # down with them, which is precisely the self-healing denial the freeze
+        # exists to prevent.
+        #
+        # This guard deliberately applies only once the baseline has standing.
+        # Applying it earlier would be circular: a baseline that is too high
+        # makes every real window look anomalous, which would block the very
+        # relearning that fixes it — reintroducing the latch by another route.
+        if learn and self._baseline_standing == BASELINE_ESTABLISHED:
+            coverage_vs_established = min(
+                self._current_eps / max(self._baseline_eps, _EPS), 1.0
+            )
+            if coverage_vs_established < COVERAGE_LOW_THRESHOLD:
+                learn = False
+
+        self._last_window_admissible = learn
+
+        if learn:
+            if self._baseline_eps == 0.0:
+                self._baseline_eps = self._current_eps
+            else:
+                self._baseline_eps = (
+                    EWMA_ALPHA * self._current_eps
+                    + (1 - EWMA_ALPHA) * self._baseline_eps
+                )
+            self._admissible_windows += 1
+            if self._admissible_windows >= BASELINE_ESTABLISH_WINDOWS:
+                if self._baseline_standing != BASELINE_ESTABLISHED:
+                    LOG.info(
+                        "platform health: baseline established at %.1f eps "
+                        "from %d admissible windows",
+                        self._baseline_eps, self._admissible_windows,
+                    )
+                self._baseline_standing = BASELINE_ESTABLISHED
+            else:
+                self._baseline_standing = BASELINE_PROVISIONAL
+
+        # --- Coverage ---
+        coverage = min(
+            self._current_eps / max(self._baseline_eps, _EPS),
+            1.0,
+        )
+        baseline_has_standing = self._baseline_standing == BASELINE_ESTABLISHED
+
         # --- Degradation triggers (OR logic, independent counters) ---
         new_reasons = []
 
-        # Trigger 1: low coverage
-        if coverage < COVERAGE_LOW_THRESHOLD:
+        # Trigger 1: low coverage.
+        # Only meaningful against a baseline that has earned standing. Without
+        # one there is no denominator, so this trigger stays silent rather than
+        # reporting a ratio against a number nothing justifies.
+        if baseline_has_standing and coverage < COVERAGE_LOW_THRESHOLD:
             self._low_coverage_streak += 1
         else:
             self._low_coverage_streak = 0
@@ -255,9 +362,19 @@ class PlatformHealth:
                 self._pending_detection = "platform_degraded"
                 self._degraded_heartbeat_counter = 0
 
-            # Recovery check: all triggers must be clear
-            recovery_ok = (
+            # Recovery check: all triggers must be clear.
+            #
+            # The coverage arm only applies against a baseline with standing.
+            # Without one there is no ratio to satisfy, and holding the service
+            # DEGRADED on an unearned denominator is exactly the latch this
+            # repair exists to prevent.
+            coverage_ok = (
                 coverage > COVERAGE_RECOVER_THRESHOLD
+                if baseline_has_standing
+                else True
+            )
+            recovery_ok = (
+                coverage_ok
                 and self._stream_lag_s < LAG_RECOVER_THRESHOLD_S
                 and backlog_stable
             )
@@ -347,6 +464,8 @@ class PlatformHealth:
             "gate_reasons": snap["gate_reasons"],
             "baseline_kind": "ewma",
             "baseline_windows_seen": snap["windows_seen"],
+            "baseline_standing": snap["baseline_standing"],
+            "baseline_admissible_windows": snap["admissible_windows"],
         }
 
         return build_envelope(
@@ -379,20 +498,32 @@ class PlatformHealth:
             "windows_seen": self._windows_seen,
             "recalibration_remaining": self._recalibration_remaining,
             "baseline_restored": self._baseline_restored,
+            "baseline_standing": self._baseline_standing,
+            "admissible_windows": self._admissible_windows,
+            "last_window_admissible": self._last_window_admissible,
         }
 
     # --- Baseline persistence ---
 
-    CHECKPOINT_VERSION = 1
+    # v2 adds baseline provenance (standing + admissible window count).
+    #
+    # v1 files are deliberately NOT accepted. A v1 checkpoint records a
+    # baseline_eps with no evidence of how it was learned, so it cannot prove
+    # it was built from admissible windows — and the 2026-08-28 incident is a
+    # standing example of a v1 file carrying a denominator (168.1 eps) that had
+    # never been attainable. Faced with a checkpoint that cannot prove its own
+    # validity, the safe direction is to relearn under admissible conditions,
+    # not to treat arbitrary historical state as authoritative.
+    CHECKPOINT_VERSION = 2
     CHECKPOINT_INTERVAL_WINDOWS = 5  # checkpoint every ~5 minutes
     MAX_CHECKPOINT_AGE_S = 3600  # 1 hour — older than this, cold start
 
     def checkpoint(self) -> dict:
         """Serialize baseline state for persistence.
 
-        Only the sufficient statistics needed to avoid cold start.
-        Not the full runtime state — streaks, gates, and pending
-        detections are ephemeral and should re-derive.
+        Only the sufficient statistics needed to avoid cold start, plus the
+        provenance needed to decide on restore whether this baseline has
+        standing. Streaks, gates, and pending detections stay ephemeral.
         """
         with self._lock:
             return {
@@ -402,20 +533,28 @@ class PlatformHealth:
                 "stream_lag_s": self._stream_lag_s,
                 "windows_seen": self._windows_seen,
                 "state": self._state,
+                "baseline_standing": self._baseline_standing,
+                "admissible_windows": self._admissible_windows,
                 "checkpoint_at": time.time(),
             }
 
     def restore(self, data: dict) -> bool:
         """Restore baseline state from a checkpoint.
 
-        Returns True if restored, False if checkpoint was rejected
-        (incompatible version, too stale, or invalid).
+        Returns True only when the checkpoint proves an established baseline
+        that is still fresh. Every other case returns False and leaves the
+        instance cold, so the baseline is relearned from admissible windows.
         """
         if not data:
             return False
 
-        if data.get("version") != self.CHECKPOINT_VERSION:
-            LOG.info("baseline checkpoint version mismatch, cold start")
+        version = data.get("version")
+        if version != self.CHECKPOINT_VERSION:
+            LOG.info(
+                "baseline checkpoint version %r is not v%d (no provenance), "
+                "cold start — baseline will be relearned from admissible windows",
+                version, self.CHECKPOINT_VERSION,
+            )
             return False
 
         age = time.time() - data.get("checkpoint_at", 0)
@@ -428,11 +567,24 @@ class PlatformHealth:
             LOG.info("baseline checkpoint has no baseline_eps, cold start")
             return False
 
+        standing = data.get("baseline_standing")
+        if standing != BASELINE_ESTABLISHED:
+            LOG.info(
+                "baseline checkpoint standing=%r has not earned standing, "
+                "cold start — baseline will be relearned from admissible windows",
+                standing,
+            )
+            return False
+
         with self._lock:
             self._baseline_eps = baseline_eps
             self._current_eps = data.get("current_eps", baseline_eps)
             self._stream_lag_s = data.get("stream_lag_s", 0)
             self._windows_seen = data.get("windows_seen", WARMUP_WINDOWS)
+            self._baseline_standing = BASELINE_ESTABLISHED
+            self._admissible_windows = data.get(
+                "admissible_windows", BASELINE_ESTABLISH_WINDOWS
+            )
             # Start in OK regardless of prior state — let the state machine
             # re-derive DEGRADED if conditions warrant it. This avoids
             # restoring into a stale degraded state.
@@ -440,8 +592,9 @@ class PlatformHealth:
                 self._state = OK
             self._baseline_restored = True
             LOG.info(
-                "baseline restored: eps=%.1f windows=%d age=%.0fs",
-                self._baseline_eps, self._windows_seen, age,
+                "baseline restored: eps=%.1f windows=%d admissible=%d age=%.0fs",
+                self._baseline_eps, self._windows_seen,
+                self._admissible_windows, age,
             )
             return True
 

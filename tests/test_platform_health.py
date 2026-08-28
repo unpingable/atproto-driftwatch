@@ -258,6 +258,9 @@ class TestSnapshot:
             "windows_seen",
             "recalibration_remaining",
             "baseline_restored",
+            "baseline_standing",
+            "admissible_windows",
+            "last_window_admissible",
         }
         assert set(snap.keys()) == expected
 
