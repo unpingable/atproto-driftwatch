@@ -361,7 +361,11 @@ async def admin_cooldowns(auth=Depends(admin_auth)):
 
 
 @app.get("/exposure/{did}")
-async def exposure(did: str):
+async def exposure(did: str, auth=Depends(admin_auth)):
+    # Per-DID surface. PUBLIC_SURFACES.md classifies per-DID as forbidden as a
+    # *public* surface, so this stays behind the administrative boundary and is
+    # absent from the published inventory. See docs/architecture/
+    # PUBLIC_SURFACES.md and the 2026-07-17 codex audit finding #4.
     # naive exposure: count edges where dst_did == did
     conn = get_conn()
     rows = conn.execute("SELECT count(*) FROM edges WHERE dst_did = ?", (did,)).fetchall()
@@ -370,7 +374,10 @@ async def exposure(did: str):
 
 
 @app.get("/strain/top")
-async def strain_top(limit: int = 10):
+async def strain_top(limit: int = 10, auth=Depends(admin_auth)):
+    # Per-DID rollup: raw author identifiers ordered by volume. This is the
+    # dossier shape PUBLIC_SURFACES.md forbids as a public surface; it remains
+    # available as an administrative diagnostic only.
     # placeholder: return top authors by event count (proxy metric)
     conn = get_conn()
     rows = conn.execute("SELECT author, COUNT(*) as cnt FROM events GROUP BY author ORDER BY cnt DESC LIMIT ?", (limit,)).fetchall()
@@ -378,7 +385,10 @@ async def strain_top(limit: int = 10):
 
 
 @app.get("/labels/{subject_uri}")
-async def labels_for_subject(subject_uri: str):
+async def labels_for_subject(subject_uri: str, auth=Depends(admin_auth)):
+    # Per-subject lookup keyed by an at:// URI, which carries the author DID.
+    # Same data class as /recent-decisions, which was already administrative;
+    # the two are now consistent.
     from .db import get_labels_for_subject
     labels = get_labels_for_subject(subject_uri)
     if not labels:
