@@ -40,18 +40,29 @@ def test_admin_endpoints_require_token(monkeypatch, caplog):
     assert r.status_code == 200
 
 
-def test_admin_endpoints_unprotected_when_no_token(monkeypatch):
-    # ensure env var not set
+def test_admin_endpoints_refuse_when_no_token(monkeypatch):
+    """Unset ADMIN_API_TOKEN must refuse, not admit.
+
+    Previously this asserted the opposite: with no token configured the admin
+    surface returned data. That contract is what made the publicly proxied
+    deployment readable by anyone. The mapping fixture stays wired up so the
+    test proves the handler never ran, not merely that the store was empty.
+    """
     monkeypatch.delenv("ADMIN_API_TOKEN", raising=False)
 
     fake = {"labeler.example": ["did:lab:1"]}
+    called = False
 
     async def fake_get_all_mappings():
+        nonlocal called
+        called = True
         return fake
 
     monkeypatch.setattr("labeler.cooldown.get_all_mappings", fake_get_all_mappings)
 
     client = TestClient(app)
     r = client.get("/admin/mappings")
-    assert r.status_code == 200
-    assert r.json() == {"mappings": fake}
+    assert r.status_code == 503
+    assert "not configured" in r.json().get("detail", "")
+    assert not called, "handler executed despite unconfigured auth"
+    assert "labeler.example" not in r.text

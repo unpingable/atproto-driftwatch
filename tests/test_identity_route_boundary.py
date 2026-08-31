@@ -127,16 +127,28 @@ def test_at_uri_subject_does_not_route(token):
     assert "did:plc:" not in r.text
 
 
-def test_admin_auth_is_a_noop_without_a_configured_token(monkeypatch):
-    """Documented limit, asserted rather than assumed.
+def test_admin_auth_fails_closed_without_a_configured_token(monkeypatch):
+    """An absent token is not an authorization.
 
-    This is the pre-existing semantics of the shared `admin_auth` dependency —
-    `/admin/*` and `/recent-decisions` have always behaved this way. It is
-    pinned here so the deployment prerequisite (set ADMIN_API_TOKEN) stays
-    visible, and so that a future change to `admin_auth` has to come past this
-    test deliberately.
+    This inverts the prior semantics. `admin_auth` used to return True when
+    ADMIN_API_TOKEN was unset, which meant every protected route was open on
+    any deployment that had not set it — including the public one. Refusing
+    with 503 distinguishes "this boundary is unconfigured" from "you presented
+    the wrong credential" (401) without disclosing anything about the route.
     """
     monkeypatch.delenv("ADMIN_API_TOKEN", raising=False)
     client = TestClient(app)
-    r = client.get("/strain/top")
-    assert r.status_code != 401
+    for route in IDENTITY_ROUTES:
+        r = client.get(route)
+        assert r.status_code == 503, f"{route} did not fail closed: {r.status_code}"
+        assert "not configured" in r.json().get("detail", "")
+
+
+def test_unconfigured_refusal_leaks_no_data(monkeypatch):
+    """The 503 must carry no observational content."""
+    monkeypatch.delenv("ADMIN_API_TOKEN", raising=False)
+    client = TestClient(app)
+    for route in IDENTITY_ROUTES:
+        body = client.get(route).text.lower()
+        for forbidden in ("did:", "at://", "subject", "strain", "exposure_score"):
+            assert forbidden not in body, f"{route} leaked {forbidden!r} in refusal"

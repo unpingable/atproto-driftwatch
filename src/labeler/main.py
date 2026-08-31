@@ -1,4 +1,5 @@
 import asyncio
+import hmac
 import json
 import logging
 import os
@@ -21,6 +22,15 @@ _label_ingest_task = None
 async def startup_event():
     import logging
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    # Announce the state of the admin boundary at startup. Protected routes
+    # fail closed without a token, so this is a loud operator signal rather
+    # than a silent default — the previous behaviour logged at DEBUG and
+    # admitted everyone.
+    if not os.getenv("ADMIN_API_TOKEN"):
+        logging.getLogger("labeler.admin").critical(
+            "ADMIN_API_TOKEN is not set: all protected routes will refuse with 503. "
+            "Set it in the deployment environment to enable admin access."
+        )
     init_db()
     # Optionally start the consumer in background when env var is set
     if os.getenv("FIREHOSE_AUTO_START") == "1":
@@ -303,18 +313,30 @@ async def health_bake():
 
 
 async def admin_auth(authorization: str = Header(None), x_admin_token: str = Header(None, alias="X-Admin-Token")):
-    """Require ADMIN_API_TOKEN if set; accept either Bearer token in Authorization header
-    or the `X-Admin-Token` header. If `ADMIN_API_TOKEN` is not set, authentication is a no-op.
+    """Require ADMIN_API_TOKEN. Accept either a Bearer token in the Authorization
+    header or the `X-Admin-Token` header.
+
+    Fails CLOSED. If `ADMIN_API_TOKEN` is unset the route is refused with 503,
+    because an absent token is an unconfigured boundary, not an authorization.
+    This inverts the original behaviour, which returned True when no token was
+    configured; that default was written for a lab assumed to be unreachable
+    and became a public hole the moment the app was proxied.
     """
     log = logging.getLogger("labeler.admin")
     token = os.getenv("ADMIN_API_TOKEN")
     if not token:
-        # no admin token configured → open endpoint (warning for operators)
-        log.debug("admin auth: no ADMIN_API_TOKEN configured; allowing open access")
-        return True
+        # Absence of configuration is not permission. Refuse, and say why
+        # without disclosing anything about the route behind it.
+        log.error(
+            "admin auth: ADMIN_API_TOKEN is not configured; refusing protected route"
+        )
+        raise HTTPException(
+            status_code=503, detail="admin authentication is not configured"
+        )
 
-    # Check X-Admin-Token first
-    if x_admin_token and x_admin_token == token:
+    # Constant-time comparison: these are secret equality checks on a
+    # publicly reachable route.
+    if x_admin_token and hmac.compare_digest(x_admin_token, token):
         return True
 
     if not authorization:
@@ -322,7 +344,7 @@ async def admin_auth(authorization: str = Header(None), x_admin_token: str = Hea
         raise HTTPException(status_code=401, detail="missing admin token")
 
     scheme, _, cred = authorization.partition(" ")
-    if scheme.lower() != "bearer" or cred != token:
+    if scheme.lower() != "bearer" or not hmac.compare_digest(cred, token):
         log.warning("admin auth failed: invalid token provided (scheme=%s)", scheme)
         raise HTTPException(status_code=401, detail="invalid admin token")
 

@@ -113,7 +113,7 @@ Key environment variables (full list in source):
 | `MIN_CLAIM_ALPHA_TOKENS` | `3` | Minimum tokens for fingerprint complexity gate |
 | `ENABLE_RETENTION` | `0` | Enable periodic retention loop (prune old data) |
 | `ENABLE_MAINTENANCE` | `0` | Enable maintenance loop (label expiry, disk monitoring) |
-| `ADMIN_API_TOKEN` | — | Protect admin endpoints; open access if unset |
+| `ADMIN_API_TOKEN` | — | **Required.** Protects admin and per-DID routes. Unset means those routes refuse with 503 — never open access. |
 
 ## API
 
@@ -133,8 +133,14 @@ Key environment variables (full list in source):
 The three per-DID / per-subject routes are administrative diagnostics, not
 public surfaces: `docs/architecture/PUBLIC_SURFACES.md` classifies per-DID
 surfaces as forbidden to publish, and they are deliberately absent from its
-inventory. `admin_auth` is a no-op unless `ADMIN_API_TOKEN` is set, so setting
-it is a deployment prerequisite rather than an optional hardening step.
+inventory. `admin_auth` fails closed: if `ADMIN_API_TOKEN` is unset these routes refuse
+with `503 admin authentication is not configured`, and the application logs a
+CRITICAL line at startup saying so. An absent token is an unconfigured
+boundary, never an authorization. Setting it is a deployment prerequisite.
+
+The public vhost additionally restricts which paths are proxied at all, so
+these routes are not externally routed even with a token configured; see
+`docs/findings/` for the 2026-08-31 exposure incident.
 
 ## Architecture
 
