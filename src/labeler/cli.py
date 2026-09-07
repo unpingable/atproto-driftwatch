@@ -80,6 +80,11 @@ def main():
     dwsummary = dwsub.add_parser("summary", help="human-readable summary of current state")
     dwsummary.add_argument("--hours", type=int, default=1, help="lookback window in hours (default: 1 for interactive use)")
     dwsummary.add_argument("--top", type=int, default=10, help="top N clusters")
+    dwstatus = dwsub.add_parser("ops-status", help="show repository-declared local visibility")
+    dwstatus.add_argument("--format", choices=["json", "text"], default="text")
+    dwstatus.add_argument("--db", default=None, help="override labeler.sqlite path")
+    dwstatus.add_argument("--data-dir", default=None, help="override producer-fact/artifact directory")
+    dwstatus.add_argument("--now", default=None, help="RFC3339 evaluation time (test/replay aid)")
     dwfacts = dwsub.add_parser("facts-snapshot", help="build DuckDB-backed facts.sqlite snapshot")
     dwfacts.add_argument("--parquet-root", default=None, help="root containing claim_history/date=*/part-*.parquet")
     dwfacts.add_argument("--identity-db", default=None, help="SQLite DB containing actor_identity_current")
@@ -251,6 +256,19 @@ def main():
         report = cluster_report(conn=conn, top_n=args.top, hours=args.hours)
         conn.close()
         print(format_summary(report))
+    elif args.cmd == "driftwatch" and args.dwcmd == "ops-status":
+        from datetime import datetime, timezone
+        from .db import DATA_DIR
+        from . import ops_status
+        data_dir = pathlib.Path(args.data_dir) if args.data_dir else DATA_DIR
+        db_path = pathlib.Path(args.db) if args.db else data_dir / "labeler.sqlite"
+        observed_now = None
+        if args.now:
+            observed_now = datetime.fromisoformat(args.now.replace("Z", "+00:00"))
+            if observed_now.tzinfo is None:
+                observed_now = observed_now.replace(tzinfo=timezone.utc)
+        status = ops_status.build_status(db_path, data_dir=data_dir, now=observed_now)
+        print(ops_status.dumps(status) if args.format == "json" else ops_status.render_text(status))
     elif args.cmd == "driftwatch" and args.dwcmd == "facts-snapshot":
         from .facts_export_duckdb_snapshot import export_snapshot_once
         manifest = export_snapshot_once(

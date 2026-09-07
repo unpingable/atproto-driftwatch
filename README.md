@@ -18,6 +18,11 @@ analysis.
 **Currently running in sealed-lab mode: detect-only, no labels emitted, no
 labeler registration.**
 
+Operational supervisors can discover the neutral concern manifest at
+`.ops/concerns.toml`; `python -m labeler.cli driftwatch ops-status` renders the
+corresponding machine-readable or human view. See
+[`docs/OPERATIONS_VISIBILITY.md`](docs/OPERATIONS_VISIBILITY.md).
+
 ## What it does
 
 **Jetstream consumer.** Real-time WebSocket connection to the Bluesky Jetstream
@@ -248,3 +253,15 @@ governance transfer proof.
 
 Unless otherwise noted, this repository is licensed under MIT OR Apache-2.0,
 at your option. Contributions are accepted under the same terms.
+
+## Offline demonstration and contract pin
+
+Run `PYTHONPATH=src python3 tools/demo_offline.py` to execute the bounded
+detect-only fixture, assert the expected provenance-laundering result, and
+generate the operations status. It neither connects to Jetstream nor emits a
+label; temporary storage is used unless `--output` is supplied.
+
+The generic operations envelope under `.ops/` is pinned by
+`.ops/contract.lock.json` to local `atproto-ops` release candidate
+`v1.0.0-rc.1`. The binding uses the dependency-light `labeler.ops_status`
+entry point.

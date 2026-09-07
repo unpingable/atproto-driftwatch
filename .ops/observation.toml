@@ -1,0 +1,6 @@
+schema = "project.observation-binding/v1"
+producer = "driftwatch.ops-status"
+output_schema = "project.ops.status/v1"
+kind = "exec/v1"
+argv = ["python3", "-m", "labeler.ops_status", "--format", "json"]
+environment = { PYTHONPATH = "src" }

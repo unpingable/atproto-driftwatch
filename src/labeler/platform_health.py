@@ -18,6 +18,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from pathlib import Path
 
 LOG = logging.getLogger("labeler.platform_health")
@@ -88,6 +89,12 @@ class PlatformHealth:
     def _reset(self):
         """Reset all state (for testing or restart)."""
         self._state = WARMING_UP
+        self._session_id = uuid.uuid4().hex
+        self._session_windows_seen = 0
+        self._connected = False
+        self._last_event_at = 0.0
+        self._last_window_at = 0.0
+        self._parse_failures = 0
         self._baseline_restored = False
         self._windows_seen = 0
 
@@ -145,6 +152,7 @@ class PlatformHealth:
         raw_lag_s = min(raw_lag_s, LAG_CLAMP_MAX_S)
 
         with self._lock:
+            self._last_event_at = time.time()
             if self._stream_lag_s == 0.0:
                 self._stream_lag_s = raw_lag_s
             else:
@@ -161,6 +169,17 @@ class PlatformHealth:
             if self._last_disconnect_ts > 0:
                 self._reconnect_gap_s = now - self._last_disconnect_ts
             self._last_disconnect_ts = now
+
+    def record_connection(self, connected: bool):
+        """Record current transport state without treating it as coverage."""
+        with self._lock:
+            self._connected = bool(connected)
+            if not connected:
+                self._last_disconnect_ts = time.time()
+
+    def record_parse_failure(self):
+        with self._lock:
+            self._parse_failures += 1
 
     def record_window(self, events_in: int, window_secs: float, backlog: int,
                        dropped: int = 0) -> dict:
@@ -198,6 +217,8 @@ class PlatformHealth:
     def _record_window_locked(self, events_in: int, window_secs: float, backlog: int,
                               dropped: int = 0) -> dict:
         self._windows_seen += 1
+        self._session_windows_seen += 1
+        self._last_window_at = time.time()
         window_secs = max(window_secs, 1.0)  # avoid div-by-zero
         self._current_eps = events_in / window_secs
 
@@ -501,6 +522,13 @@ class PlatformHealth:
             "baseline_standing": self._baseline_standing,
             "admissible_windows": self._admissible_windows,
             "last_window_admissible": self._last_window_admissible,
+            "session_id": self._session_id,
+            "session_windows_seen": self._session_windows_seen,
+            "warmup_windows_required": WARMUP_WINDOWS,
+            "connected": self._connected,
+            "last_event_at": self._last_event_at or None,
+            "last_window_at": self._last_window_at or None,
+            "parse_failures": self._parse_failures,
         }
 
     # --- Baseline persistence ---
@@ -647,6 +675,14 @@ def record_event_time(time_us: int):
 
 def record_reconnect():
     _instance.record_reconnect()
+
+
+def record_connection(connected: bool):
+    _instance.record_connection(connected)
+
+
+def record_parse_failure():
+    _instance.record_parse_failure()
 
 
 def record_window(events_in: int, window_secs: float, backlog: int,

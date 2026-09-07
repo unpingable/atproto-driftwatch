@@ -1,0 +1,13 @@
+{
+  "artifacts": {
+    ".ops/concerns.schema.json": "sha256:3e9d496e3d44a4ac2260136a8eeb544a0ca931ad53ce1661eee936f1b28fffd2",
+    ".ops/observation-binding.schema.json": "sha256:e92d50d312042aab1124daaa2fc77dd8f528f520c5274d9fceed23830e9aea7c",
+    ".ops/status.schema.json": "sha256:fad038b31250049b15b6f45a7a4568b73baf2ecd030b020cf676e4f942de09c3"
+  },
+  "contract": {
+    "repository": "atproto-ops",
+    "revision": "c3fd2455a31dbf083f9628ef7c1e0298aacb80a5",
+    "version": "v1.0.0-rc.1"
+  },
+  "schema": "atproto.ops.vendor-lock/v1"
+}

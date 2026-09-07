@@ -1,0 +1,65 @@
+schema = "project.concerns/v1"
+project = "driftwatch"
+
+[[concerns]]
+id = "driftwatch.observation.stream_coverage"
+question = "driftwatch.question.stream_coverage/v1"
+profile = "driftwatch.profile.local_status/v1"
+required = true
+description = "The current Jetstream session has re-established live coverage and reports no known sustained lag, drop, parse-loss, or rollback-loss condition."
+
+[[concerns]]
+id = "driftwatch.observation.cursor_continuity"
+question = "driftwatch.question.cursor_continuity/v1"
+profile = "driftwatch.profile.local_status/v1"
+required = true
+description = "A recent durable consumer cursor supports restart continuity; an old cursor is not made current merely because a process restarted."
+
+[[concerns]]
+id = "driftwatch.evaluation.freshness"
+question = "driftwatch.question.evaluation_freshness/v1"
+profile = "driftwatch.profile.local_status/v1"
+required = true
+description = "The independently enabled longitudinal evaluator completed a recent bounded pass and recorded whether its inputs were adequate."
+
+[[concerns]]
+id = "driftwatch.drift.bounded_current_state"
+question = "driftwatch.question.bounded_drift_state/v1"
+profile = "driftwatch.profile.local_status/v1"
+required = true
+description = "The last current bounded candidate evaluation distinctly reports drift observed, no drift observed under adequate inputs, unknown, failed, or not yet established."
+
+[[concerns]]
+id = "driftwatch.evaluation.execution"
+question = "driftwatch.question.evaluation_execution/v1"
+profile = "driftwatch.profile.local_status/v1"
+required = true
+description = "Eligible candidate evaluation work is executing without recorded per-candidate failures; rolling-hotset depth alone is not treated as a convergence claim."
+
+[[concerns]]
+id = "driftwatch.persistence.sqlite_continuity"
+question = "driftwatch.question.sqlite_continuity/v1"
+profile = "driftwatch.profile.local_status/v1"
+required = true
+description = "The SQLite store used for event, claim, decision, and cursor continuity is locally readable, passes quick_check, and can acquire a write transaction."
+
+[[concerns]]
+id = "driftwatch.persistence.volume_capacity"
+question = "driftwatch.question.volume_capacity/v1"
+profile = "driftwatch.profile.local_status/v1"
+required = true
+description = "The Driftwatch data volume remains below its existing 85 percent warning and 92 percent emergency-brake thresholds."
+
+[[concerns]]
+id = "driftwatch.persistence.sqlite_slack"
+question = "driftwatch.question.sqlite_internal_slack/v1"
+profile = "driftwatch.profile.local_status/v1"
+required = true
+description = "The auto_vacuum=none SQLite store retains at least 5,000,000 freelist pages of internal reuse capacity, the existing production NQ early-warning bound."
+
+[[concerns]]
+id = "driftwatch.output.facts_snapshot_freshness"
+question = "driftwatch.question.facts_snapshot_freshness/v1"
+profile = "driftwatch.profile.local_status/v1"
+required = true
+description = "The observational facts.sqlite sidecar exported for Labelwatch is present and recent; it is an observational artifact, not authoritative identity truth."

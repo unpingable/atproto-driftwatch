@@ -156,6 +156,25 @@ def _decision_inputs_for_post(text: str) -> dict:
     }
 
 
+def _write_evaluation_fact(**facts):
+    """Persist the evaluator's bounded result, including its observation basis."""
+    try:
+        from . import ops_runtime, platform_health
+        basis = platform_health.get_health_snapshot()
+        adequate = (
+            basis.get("health_state") == "ok"
+            and basis.get("connected") is True
+            and int(basis.get("session_windows_seen") or 0) >= platform_health.WARMUP_WINDOWS
+            and int(basis.get("recalibration_remaining") or 0) == 0
+        )
+        ops_runtime.write_fact(
+            "evaluation",
+            {"input_adequate": adequate, "observation_basis": basis, **facts},
+        )
+    except Exception:
+        LOG.debug("evaluation ops fact write failed", exc_info=True)
+
+
 def recheck_once(limit: int = 100) -> int:
     """Process up to `limit` recheck requests and re-evaluate claim fingerprints.
 
@@ -174,6 +193,14 @@ def recheck_once(limit: int = 100) -> int:
 
     if not fingerprints:
         conn.close()
+        _write_evaluation_fact(
+            status="completed",
+            disposition="not_established",
+            processed_fingerprints=0,
+            candidates_loaded=0,
+            matched_labels=0,
+            failed_fingerprints=0,
+        )
         return 0
 
     try:
@@ -187,6 +214,9 @@ def recheck_once(limit: int = 100) -> int:
         pass
 
     processed = 0
+    candidates_loaded = 0
+    matched_labels = 0
+    failed_fingerprints = 0
     emit_mode = get_emit_mode()
     emit_cap = get_emit_limits()
     emit_buffer = []
@@ -198,10 +228,12 @@ def recheck_once(limit: int = 100) -> int:
     for fp in fingerprints:
         try:
             posts = _load_posts_for_fingerprint(conn, fp)
+            candidates_loaded += len(posts)
             # collect labels produced by rules per subject
             labels_by_subject = {}
             for p in posts:
                 labs = apply_all_rules(p, posts)
+                matched_labels += len(labs)
                 labels_by_subject.setdefault(p.uri, []).extend(labs)
                 # if repeat-no-new-evidence fires, enqueue claim-group recheck
                 if claim_recheck_enabled:
@@ -310,6 +342,7 @@ def recheck_once(limit: int = 100) -> int:
                             metrics_module.RECHECK_QUARANTINE_TRIPPED.inc()
 
         except Exception:
+            failed_fingerprints += 1
             LOG.exception("recheck failed for fingerprint %s", fp)
         finally:
             # remove the processed fingerprint from the queue
@@ -338,9 +371,11 @@ def recheck_once(limit: int = 100) -> int:
         for authorDid, fp in claim_items:
             try:
                 posts = _load_posts_for_claim_group(conn, authorDid, fp)
+                candidates_loaded += len(posts)
                 posts = sorted(posts, key=lambda x: x.createdAt)
                 for p in posts:
                     labs = apply_all_rules(p, posts)
+                    matched_labels += len(labs)
                     for l in labs:
                         label_obj = {
                             "label": l.label,
@@ -412,6 +447,7 @@ def recheck_once(limit: int = 100) -> int:
                             except Exception:
                                 pass
             except Exception:
+                failed_fingerprints += 1
                 LOG.exception("claim-group recheck failed for %s/%s", authorDid, fp)
 
     if emit_buffer:
@@ -435,6 +471,35 @@ def recheck_once(limit: int = 100) -> int:
             pass
 
     conn.close()
+    try:
+        from . import platform_health
+        basis = platform_health.get_health_snapshot()
+        adequate = (
+            basis.get("health_state") == "ok"
+            and basis.get("connected") is True
+            and int(basis.get("session_windows_seen") or 0) >= platform_health.WARMUP_WINDOWS
+            and int(basis.get("recalibration_remaining") or 0) == 0
+        )
+    except Exception:
+        adequate = False
+    if failed_fingerprints:
+        disposition = "failed"
+    elif not adequate:
+        disposition = "unknown"
+    elif candidates_loaded == 0:
+        disposition = "not_established"
+    elif matched_labels:
+        disposition = "drift_observed"
+    else:
+        disposition = "no_drift_observed"
+    _write_evaluation_fact(
+        status="failed" if failed_fingerprints else "completed",
+        disposition=disposition,
+        processed_fingerprints=processed,
+        candidates_loaded=candidates_loaded,
+        matched_labels=matched_labels,
+        failed_fingerprints=failed_fingerprints,
+    )
     return processed
 
 
@@ -451,6 +516,14 @@ async def run_periodic(stop_event=None, interval: int = None):
             await loop.run_in_executor(None, recheck_once, batch)
         except Exception:
             LOG.exception("error during recheck loop")
+            _write_evaluation_fact(
+                status="failed",
+                disposition="failed",
+                processed_fingerprints=0,
+                candidates_loaded=0,
+                matched_labels=0,
+                failed_fingerprints=1,
+            )
         try:
             await asyncio.wait_for(stop_event.wait(), timeout=interval)
         except asyncio.TimeoutError:

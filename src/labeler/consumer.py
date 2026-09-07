@@ -198,6 +198,23 @@ class ATProtoConsumer:
         self._rollback_lost_total = 0
         self._events_dropped_total = 0
 
+    def _write_ops_snapshot(self):
+        """Publish current producer facts without classifying attention."""
+        try:
+            from . import ops_runtime, platform_health
+            snap = platform_health.get_health_snapshot()
+            snap.update({
+                "intake_queue_depth": self._event_queue.qsize(),
+                "intake_queue_capacity": self._event_queue.maxsize,
+                "events_committed_total": self._event_count,
+                "events_dropped_total": self._events_dropped_total,
+                "rollback_lost_total": self._rollback_lost_total,
+                "last_cursor": self._last_cursor,
+            })
+            ops_runtime.write_fact("consumer", snap)
+        except Exception:
+            LOG.debug("consumer ops fact write failed", exc_info=True)
+
     @staticmethod
     def _get_queue_depth() -> int:
         conn = get_conn()
@@ -499,6 +516,7 @@ class ATProtoConsumer:
                     snap["events_in"], snap["window_secs"], backlog,
                     dropped=total_lost,
                 )
+                self._write_ops_snapshot()
                 health_state = health_snap["health_state"]
                 coverage_str = (
                     "n/a" if health_state == "warming_up"
@@ -583,6 +601,12 @@ class ATProtoConsumer:
             js = json.loads(raw)
         except Exception:
             LOG.warning("failed to parse JSON message, skipping")
+            try:
+                from . import platform_health
+                platform_health.record_parse_failure()
+            except Exception:
+                pass
+            self._write_ops_snapshot()
             return
 
         # Track cursor for resume and lag
@@ -629,8 +653,10 @@ class ATProtoConsumer:
         try:
             from . import platform_health
             platform_health.restore_baseline()
+            platform_health.record_connection(False)
         except Exception:
             LOG.debug("baseline restore skipped (no checkpoint or error)")
+        self._write_ops_snapshot()
 
         saved_cursor = get_cursor(CONSUMER_NAME)
         ws_url = _build_ws_url(self.ws_url, cursor=saved_cursor)
@@ -653,8 +679,10 @@ class ATProtoConsumer:
                     try:
                         from . import platform_health
                         platform_health.record_reconnect()
+                        platform_health.record_connection(True)
                     except Exception:
                         pass
+                    self._write_ops_snapshot()
                     async for msg in ws:
                         await self._handle_message(msg)
             except asyncio.CancelledError:
@@ -662,6 +690,13 @@ class ATProtoConsumer:
             except Exception:
                 LOG.exception("Jetstream connection error, reconnecting in 5s")
                 await asyncio.sleep(5)
+            finally:
+                try:
+                    from . import platform_health
+                    platform_health.record_connection(False)
+                except Exception:
+                    pass
+                self._write_ops_snapshot()
 
         # Graceful shutdown: cancel drain, then close the writer thread.
         try:
@@ -697,6 +732,7 @@ class ATProtoConsumer:
             LOG.info("baseline checkpoint saved on shutdown")
         except Exception:
             pass
+        self._write_ops_snapshot()
 
     def stop(self):
         self._stop = True

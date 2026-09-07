@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "project.ops.status/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema", "project", "generated_at", "manifest", "producer", "authority", "concerns"],
+  "properties": {
+    "schema": {"const": "project.ops.status/v1"},
+    "project": {"type": "string", "minLength": 1},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema", "path"],
+      "properties": {
+        "schema": {"const": "project.concerns/v1"},
+        "path": {"const": ".ops/concerns.toml"}
+      }
+    },
+    "producer": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id"],
+      "properties": {
+        "id": {"type": "string", "minLength": 1},
+        "session_id": {"type": "string", "minLength": 1},
+        "version": {"type": "string", "minLength": 1}
+      }
+    },
+    "authority": {"type": "object"},
+    "extensions": {"type": "object"},
+    "concerns": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "question", "profile", "required", "description", "observation"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "question": {"type": "string", "minLength": 1},
+          "profile": {"type": "string", "minLength": 1},
+          "required": {"type": "boolean"},
+          "description": {"type": "string", "minLength": 1},
+          "observation": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["observation_present", "local_state", "domain_state", "observed_at", "valid_for_seconds", "reason", "facts"],
+            "properties": {
+              "observation_present": {"type": "boolean"},
+              "local_state": {"type": "string", "minLength": 1},
+              "domain_state": {"type": ["string", "null"]},
+              "observed_at": {"type": ["string", "null"], "format": "date-time"},
+              "valid_for_seconds": {"type": ["integer", "null"], "minimum": 0},
+              "reason": {"type": "string", "minLength": 1},
+              "facts": {"type": "object"}
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -261,6 +261,13 @@ class TestSnapshot:
             "baseline_standing",
             "admissible_windows",
             "last_window_admissible",
+            "session_id",
+            "session_windows_seen",
+            "warmup_windows_required",
+            "connected",
+            "last_event_at",
+            "last_window_at",
+            "parse_failures",
         }
         assert set(snap.keys()) == expected
 
