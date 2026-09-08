@@ -3,7 +3,7 @@ ARG SOURCE_DATE_EPOCH=0
 WORKDIR /app
 
 ARG GIT_SHA=unknown
-ARG RELEASE_VERSION=0.1.0rc3
+ARG RELEASE_VERSION=0.1.0rc4
 ENV GIT_SHA=${GIT_SHA}
 LABEL org.opencontainers.image.revision=${GIT_SHA} \
       org.opencontainers.image.version=${RELEASE_VERSION} \
