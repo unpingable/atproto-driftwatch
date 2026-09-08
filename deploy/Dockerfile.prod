@@ -17,7 +17,7 @@ RUN --mount=type=bind,source=deploy/requirements.prod.txt,target=/tmp/requiremen
     python -m venv /opt/driftwatch-venv \
     && /opt/driftwatch-venv/bin/pip install --no-cache-dir -r /tmp/requirements.prod.txt \
     && find /opt/driftwatch-venv -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} + \
-    && touch -h -d "@${SOURCE_DATE_EPOCH}" /tmp
+    && touch -h -d "@${SOURCE_DATE_EPOCH}" /etc /opt /tmp
 
 COPY src/ ./
 
