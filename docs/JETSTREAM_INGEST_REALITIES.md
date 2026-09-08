@@ -153,6 +153,10 @@ These follow from the case but are not specific to it.
 
 ## Pointers
 
+- September follow-up: [completed-prefix recovery after queue saturation](findings/2026-09-08-completed-prefix-recovery.md).
+  The received-cursor checkpoint defect survived the earlier batching repair;
+  this dated account preserves the new accounting regression and replay limits.
+
 - Fix commit: `2879058` (`consumer: batched writer thread + persistent SQLite conn`)
 - Closed incident record + recovery receipts: `project_driftwatch_degraded_sampling_2026_04.md` (auto-memory, not in repo)
 - Durable lesson extracted from this incident: `lesson_self_shedding_queue_boundary.md` (auto-memory)

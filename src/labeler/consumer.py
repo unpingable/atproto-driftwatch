@@ -8,6 +8,7 @@ Jetstream docs: https://docs.bsky.app/blog/jetstream
 
 import os
 import json
+import hashlib
 import time
 import asyncio
 import logging
@@ -37,6 +38,8 @@ CURSOR_SAVE_INTERVAL = int(os.getenv("CURSOR_SAVE_INTERVAL", "500"))
 # most M seconds for the batch to fill. One commit per batch.
 BATCH_MAX_EVENTS = int(os.getenv("BATCH_MAX_EVENTS", "100"))
 BATCH_MAX_WAIT_S = float(os.getenv("BATCH_MAX_WAIT_S", "0.25"))
+REPLAY_REWIND_US = 5_000_000
+REPLAY_RECEIPT_LIMIT = 100_000
 
 # Writer-owned WAL truncate. Rate-limited so per-batch overhead is bounded.
 WAL_TRUNCATE_INTERVAL_S = float(os.getenv("WAL_TRUNCATE_INTERVAL_S", "30"))
@@ -197,6 +200,16 @@ class ATProtoConsumer:
         # means the scheduler is too aggressive and the pass must abort.
         self._rollback_lost_total = 0
         self._events_dropped_total = 0
+        self._received_total = 0
+        self._admitted_total = 0
+        self._queue_waits_total = 0
+        self._source_committed_total = 0
+        self._replayed_total = 0
+        self._resume_cursor = None
+        self._batch_failures_total = 0
+        self._batch_retry_pending = False
+        self._admission_pending = False
+        self._unadmitted_interrupted_total = 0
 
     def _write_ops_snapshot(self):
         """Publish current producer facts without classifying attention."""
@@ -210,6 +223,19 @@ class ATProtoConsumer:
                 "events_dropped_total": self._events_dropped_total,
                 "rollback_lost_total": self._rollback_lost_total,
                 "last_cursor": self._last_cursor,
+                "durable_resume_cursor": self._resume_cursor,
+                "source_received_total": self._received_total,
+                "source_admitted_total": self._admitted_total,
+                "source_completed_total": self._source_committed_total,
+                "replay_duplicates_total": self._replayed_total,
+                "queue_waits_total": self._queue_waits_total,
+                "unresolved_admitted": self._admitted_total - self._source_committed_total,
+                "batch_failures_total": self._batch_failures_total,
+                "batch_retry_pending": self._batch_retry_pending,
+                "admission_pending": self._admission_pending,
+                "unadmitted_interrupted_total": self._unadmitted_interrupted_total,
+                "unresolved_received": self._received_total - self._source_committed_total - self._unadmitted_interrupted_total,
+                "unadmitted_pending": self._received_total - self._admitted_total - self._unadmitted_interrupted_total,
             })
             ops_runtime.write_fact("consumer", snap)
         except Exception:
@@ -229,33 +255,91 @@ class ATProtoConsumer:
         """
         if self._writer_conn is None:
             self._writer_conn = get_conn()
+            self._writer_conn.execute("CREATE TABLE IF NOT EXISTS ingest_receipts (source TEXT NOT NULL, time_us INTEGER NOT NULL, digest TEXT NOT NULL, PRIMARY KEY(source,time_us,digest))")
+            self._writer_conn.execute("CREATE TABLE IF NOT EXISTS ingest_source (consumer TEXT PRIMARY KEY, source TEXT NOT NULL)")
+            self._writer_conn.execute("INSERT OR IGNORE INTO ingest_source VALUES (?,?)", (CONSUMER_NAME, self.ws_url))
+            source = self._writer_conn.execute("SELECT source FROM ingest_source WHERE consumer=?", (CONSUMER_NAME,)).fetchone()[0]
+            if source != self.ws_url:
+                self._writer_conn.rollback()
+                self._writer_conn.close()
+                self._writer_conn = None
+                raise ValueError("source change requires explicit replay custody reconciliation")
+            self._writer_conn.commit()
         return self._writer_conn
 
     def _process_batch(self, batch):
         """Synchronous DB work for a batch of events. Runs in the writer thread.
 
-        One transaction, one commit per batch. On any exception, rolls back
-        the entire batch — we'd rather lose a batch than half-write it.
+        One transaction covers source receipts, required processing and resume
+        state. The drain retains failed batches and retries without advancing.
 
-        Returns (written, lost_to_rollback). lost_to_rollback is non-zero
-        only when the batch failed; it must count against intake health so
-        the platform_health gate sees lock-conflict shedding.
+        Returns (written, unresolved_batch_size). Failure is replay debt,
+        not evidence of irreversible loss.
         """
         if not batch:
             return (0, 0)
         conn = self._get_writer_conn()
         try:
-            for ev in batch:
+            written = duplicates = completed = 0
+            row = conn.execute("SELECT cursor FROM cursors WHERE consumer=?", (CONSUMER_NAME,)).fetchone()
+            checkpoint = row[0] if row else None
+            frontier = int(checkpoint) + REPLAY_REWIND_US if checkpoint else 0
+            for item in batch:
+                if "_source" in item:
+                    js = item["_source"]
+                    if js.get("kind") not in ("commit", "identity", "account"):
+                        raise ValueError("unsupported source event kind")
+                    timestamp = js["time_us"]
+                    digest = hashlib.sha256(json.dumps(js, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                    # Receipt expiry is safe only because older input is refused,
+                    # never silently reprocessed or counted as successful replay.
+                    if checkpoint and timestamp < int(checkpoint):
+                        raise ValueError("source event precedes durable replay boundary")
+                    exists = conn.execute("SELECT 1 FROM ingest_receipts WHERE source=? AND time_us=? AND digest=?", (self.ws_url, timestamp, digest)).fetchone()
+                    completed += 1
+                    if exists:
+                        duplicates += 1
+                        continue
+                    if js.get("kind") in ("identity", "account"):
+                        from .identity import parse_identity_event, apply_identity_event
+                        delta = parse_identity_event(js)
+                        if delta is None:
+                            raise ValueError("invalid identity/account event")
+                        apply_identity_event(delta, connection=conn)
+                        ev = None
+                    else:
+                        ev = _jetstream_to_event(js)
+                    conn.execute("INSERT INTO ingest_receipts VALUES (?,?,?)", (self.ws_url, timestamp, digest))
+                    frontier = max(frontier, timestamp)
+                else:
+                    ev = item  # Existing offline callers have no stream cursor.
+                if ev is None:
+                    continue
                 event_uri = ev["uri"]
                 author = ev["authorDid"]
                 ctime = ev["createdAt"]
-                insert_event_txn(conn, event_uri, ctime, author, ev)
-                edges = extract_edges_from_event(ev)
-                insert_edges_txn(conn, edges)
+                inserted, updated = insert_event_txn(conn, event_uri, ctime, author, ev, strict=True)
+                if inserted or updated:
+                    edges = extract_edges_from_event(ev)
+                    insert_edges_txn(conn, edges)
+                written += 1
+            if completed:
+                resume = str(max(0, frontier - REPLAY_REWIND_US))
+                conn.execute("INSERT INTO cursors VALUES (?,?,?) ON CONFLICT(consumer) DO UPDATE SET cursor=excluded.cursor, updated_at=excluded.updated_at", (CONSUMER_NAME, resume, timeutil.now_utc().isoformat()))
+                conn.execute("DELETE FROM ingest_receipts WHERE source=? AND time_us<?", (self.ws_url, int(resume)))
+                if conn.execute("SELECT count(*) FROM ingest_receipts WHERE source=?", (self.ws_url,)).fetchone()[0] > REPLAY_RECEIPT_LIMIT:
+                    raise ValueError("replay receipt capacity exceeded; checkpoint held")
             conn.commit()
+            self._batch_retry_pending = False
+            if completed:
+                self._resume_cursor = resume
+                self._source_committed_total += completed
+                self._replayed_total += duplicates
             self._maybe_wal_truncate(conn)
-            return (len(batch), 0)
+            return (written, 0)
         except Exception:
+            self._batch_failures_total += 1
+            self._batch_retry_pending = True
             try:
                 conn.rollback()
             except Exception:
@@ -446,12 +530,24 @@ class ATProtoConsumer:
                             break
 
                 try:
-                    written, lost = await loop.run_in_executor(
-                        self._writer_executor, self._process_batch, batch
-                    )
+                    while not self._stop:
+                        written, lost = await loop.run_in_executor(
+                            self._writer_executor, self._process_batch, batch
+                        )
+                        if not lost:
+                            for _ in batch:
+                                self._event_queue.task_done()
+                            break
+                        # Retain this exact batch; no later work may checkpoint
+                        # around a failed transaction. Backpressure reaches WS.
+                        self._write_ops_snapshot()
+                        await asyncio.sleep(1)
+                    else:
+                        break
                 except Exception:
                     LOG.exception("failed to process batch")
-                    written, lost = 0, 0
+                    self._stop = True
+                    break  # unresolved work remains behind the durable cursor
 
                 if lost:
                     # Database-locked rollbacks are intake loss; platform_health
@@ -467,9 +563,7 @@ class ATProtoConsumer:
                     # Save cursor after a successful commit, every
                     # CURSOR_SAVE_INTERVAL events. last_cursor is the
                     # high-watermark from the WS read loop.
-                    if events_since_cursor_save >= CURSOR_SAVE_INTERVAL and self._last_cursor:
-                        await loop.run_in_executor(None, upsert_cursor, CONSUMER_NAME, self._last_cursor)
-                        events_since_cursor_save = 0
+                    events_since_cursor_save = 0  # atomic checkpoint per source batch
 
             # Per-minute stats line (fires even when idle)
             now_mono = loop.time()
@@ -607,10 +701,13 @@ class ATProtoConsumer:
             except Exception:
                 pass
             self._write_ops_snapshot()
-            return
+            raise ValueError("unparseable source event prevents checkpoint progress")
 
         # Track cursor for resume and lag
         time_us = js.get("time_us")
+        if not isinstance(time_us, int) or isinstance(time_us, bool) or time_us <= 0:
+            raise ValueError("source event requires positive integer time_us")
+        self._received_total += 1
         if time_us:
             self._last_cursor = str(time_us)
             try:
@@ -619,31 +716,30 @@ class ATProtoConsumer:
             except Exception:
                 pass
 
-        # Identity/account events: capture and reduce
-        kind = js.get("kind")
-        if kind in ("identity", "account"):
-            try:
-                from .identity import parse_identity_event, apply_identity_event
-                delta = parse_identity_event(js)
-                if delta is not None:
-                    loop = asyncio.get_event_loop()
-                    await loop.run_in_executor(None, apply_identity_event, delta)
-            except Exception:
-                LOG.debug("identity event processing failed", exc_info=True)
-            return
-
-        # Transform to canonical event
-        ev = _jetstream_to_event(js)
-        if ev is None:
-            return
-
-        # Non-blocking put — drop events when queue is full rather than
-        # blocking the event loop (which kills WS pings → reconnect churn)
+        # All source kinds share one ordered writer. Awaiting capacity yields
+        # the event loop, including ping tasks; cancellation leaves the durable
+        # checkpoint behind the unadmitted message for reconnect replay.
+        ev = {"_source": js}
         try:
             self._event_queue.put_nowait(ev)
         except asyncio.QueueFull:
-            self._events_dropped += 1
-            self._events_dropped_total += 1
+            self._queue_waits_total += 1
+            self._admission_pending = True
+            try:
+                while not self._stop:
+                    try:
+                        await asyncio.wait_for(self._event_queue.put(ev), timeout=1)
+                        break
+                    except asyncio.TimeoutError:
+                        self._write_ops_snapshot()
+                else:
+                    raise asyncio.CancelledError
+            except asyncio.CancelledError:
+                self._unadmitted_interrupted_total += 1
+                raise
+            finally:
+                self._admission_pending = False
+        self._admitted_total += 1
 
     async def run(self):
         """Connect to Jetstream and process messages with reconnect resilience."""
@@ -667,7 +763,19 @@ class ATProtoConsumer:
 
         while not self._stop:
             try:
-                url = _build_ws_url(self.ws_url, cursor=self._last_cursor or saved_cursor)
+                # Finish already-admitted work before choosing a reconnect
+                # boundary; do not interleave old replay with newer queue work.
+                while not self._stop:
+                    try:
+                        await asyncio.wait_for(self._event_queue.join(), timeout=1)
+                        break
+                    except asyncio.TimeoutError:
+                        pass
+                if self._stop:
+                    break
+                # Only committed work defines resume, including after a socket
+                # failure while queued work or a batch remains outstanding.
+                url = _build_ws_url(self.ws_url, cursor=get_cursor(CONSUMER_NAME))
                 async with websockets.connect(
                     url,
                     max_size=10 * 1024 * 1024,
@@ -723,9 +831,7 @@ class ATProtoConsumer:
 
         # Cleanup
         drain_task.cancel()
-        if self._last_cursor:
-            upsert_cursor(CONSUMER_NAME, self._last_cursor)
-            LOG.info("saved cursor on shutdown: %s", self._last_cursor)
+        LOG.info("shutdown retains atomic durable cursor: %s", get_cursor(CONSUMER_NAME))
         try:
             from . import platform_health
             platform_health.force_checkpoint()

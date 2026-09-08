@@ -105,6 +105,15 @@ def test_connected_but_dropping_is_degraded(tmp_path):
     assert observed["facts"]["events_dropped_total"] == 7
 
 
+def test_unresolved_batch_or_admission_is_degraded_without_claiming_loss(tmp_path):
+    path = _db(tmp_path, cursor_at=NOW.isoformat())
+    for state in ({"batch_retry_pending": True}, {"admission_pending": True}):
+        _consumer(tmp_path, **state)
+        observed = _items(ops_status.build_status(path, data_dir=tmp_path, now=NOW))["driftwatch.observation.stream_coverage"]
+        assert observed["local_state"] == "DEGRADED"
+        assert observed["facts"]["events_dropped_total"] == 0
+
+
 def test_connected_but_parse_or_rollback_loss_is_degraded(tmp_path):
     path = _db(tmp_path, NOW.isoformat())
     _consumer(tmp_path, parse_failures=1, rollback_lost_total=2)

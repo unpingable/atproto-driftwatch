@@ -97,6 +97,8 @@ def _consumer(fact: dict[str, Any] | None, now: datetime) -> dict[str, Any]:
         return _obs("UNKNOWN", observed_at, CONSUMER_MAX_AGE_S, "the restarted consumer has not re-established a bounded coverage basis", fact)
     impaired = (
         fact.get("health_state") != "ok"
+        or bool(fact.get("batch_retry_pending"))
+        or bool(fact.get("admission_pending"))
         or float(fact.get("drop_frac") or 0) > 0
         or int(fact.get("events_dropped_total") or 0) > 0
         or int(fact.get("rollback_lost_total") or 0) > 0

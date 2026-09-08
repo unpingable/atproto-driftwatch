@@ -355,7 +355,7 @@ def init_db():
     conn.close()
 
 
-def insert_event_txn(conn, event_uri: str, ctime: Union[str, int, float, datetime.datetime], author: str, raw: dict):
+def insert_event_txn(conn, event_uri: str, ctime: Union[str, int, float, datetime.datetime], author: str, raw: dict, *, strict=False):
     """Transaction-scoped insert/update of an event. Uses passed conn, does not commit.
 
     See insert_event() for behavior. Caller is responsible for transaction control.
@@ -389,7 +389,8 @@ def insert_event_txn(conn, event_uri: str, ctime: Union[str, int, float, datetim
                 else:
                     queue_stats.inc("enqueue_gated")
         except Exception:
-            pass
+            if strict:
+                raise
         return (True, False)
 
     existing_raw = cur[0][0]
@@ -423,7 +424,8 @@ def insert_event_txn(conn, event_uri: str, ctime: Union[str, int, float, datetim
                 else:
                     queue_stats.inc("enqueue_gated")
         except Exception:
-            pass
+            if strict:
+                raise
         return (False, True)
 
     return (False, False)

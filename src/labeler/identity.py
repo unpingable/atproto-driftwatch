@@ -105,12 +105,12 @@ def _event_is_newer(delta_time_us: int, existing_time_us: Optional[int]) -> bool
     return delta_time_us >= existing_time_us
 
 
-def apply_identity_event(delta: IdentityDelta) -> None:
+def apply_identity_event(delta: IdentityDelta, *, connection=None) -> None:
     """Append raw event, then reduce to current state.
 
     Opens and closes its own connection (matches db.py pattern).
     """
-    conn = get_conn()
+    conn = connection if connection is not None else get_conn()
     try:
         # Step 1: append to identity_events (always, unconditionally)
         conn.execute(
@@ -199,6 +199,8 @@ def apply_identity_event(delta: IdentityDelta) -> None:
                     (first_seen, last_seen, delta.did),
                 )
 
-        conn.commit()
+        if connection is None:
+            conn.commit()
     finally:
-        conn.close()
+        if connection is None:
+            conn.close()
