@@ -63,7 +63,8 @@ def docker_run(image: str, mounts: list[tuple[Path, str, str]], command: list[st
     argv = ["docker", "run"]
     argv += ["-d", "--name", detached_name] if detached_name else ["--rm"]
     for source, target, mode in mounts:
-        argv += ["--mount", f"type=bind,source={source},target={target},{mode}"]
+        readonly = ",readonly" if mode == "readonly" else ""
+        argv += ["--mount", f"type=bind,source={source},target={target}{readonly}"]
     return run([*argv, image, *command], capture=capture or bool(detached_name))
 
 
