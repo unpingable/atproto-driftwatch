@@ -6,8 +6,8 @@
   },
   "contract": {
     "repository": "atproto-ops",
-    "revision": "c3fd2455a31dbf083f9628ef7c1e0298aacb80a5",
-    "version": "v1.0.0-rc.1"
+    "revision": "a2e68b3499d538fd7ed2e23c14343d242621f473",
+    "version": "v1.0.0-rc.2"
   },
   "schema": "atproto.ops.vendor-lock/v1"
 }
