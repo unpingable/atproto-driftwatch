@@ -37,3 +37,27 @@ This is separate from the queue/checkpoint repair described in the campaign's
 ingestion history. Both baseline and rc.5 exhibited operational trouble; these
 observations alone do not attribute a regression to rc.5. A new release must
 demonstrate its actual facts publication cadence before acceptance.
+
+## Production follow-through
+
+Candidate `v0.1.0-rc.6` (`9ec9da593b6a435de273396626ecaca3755268e7`)
+completed one production export at 2026-09-08 21:32:50 UTC. Function-only samples
+had identified retention pruning at 19:21, deletion of prior bounds at 20:18,
+and `VACUUM INTO` at 20:47. The last phase demonstrates that the repaired bounds
+query completed, rather than merely that the process stayed alive.
+
+Aggregate-only completion logs measured 9,973.9 seconds total: batch 1,719.9,
+prune 1,238.8, identity 459.6, hourly 1,224.8, bounds 1,704.4, and snapshot copy
+3,106.9 seconds. These are one run's phases, not isolated before/after benchmark
+measurements. Bounds deletion and recomputation share one phase timer.
+
+The original two-hour acceptance window ended before publication and remains
+incomplete on that gate. A finite followup and separate closeout established
+the new 15,532,933,120-byte snapshot and one indexed fingerprint aggregate match.
+The exported source watermark was still 18:46:36, approximately 2h50m old when
+validated at 21:36:38. New publication therefore does not establish current
+source coverage, sustainable export cadence, or eliminated capacity pressure.
+The next bounded maintenance task is export catch-up/cost qualification using
+these phase receipts, without restarting the safe ingest path merely to repeat
+already completed work. See the [ingestion outcome](findings/2026-09-08-completed-prefix-recovery.md)
+for accounting, recovery, and remaining status-policy limitations.

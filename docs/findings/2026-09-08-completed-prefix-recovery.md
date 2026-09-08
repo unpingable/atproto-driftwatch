@@ -109,3 +109,59 @@ The separate [facts-export scan incident](../INCIDENT-2026-09-08-facts-export-sc
 records the observed capacity contributor and bounded exporter repair. Local
 correctness, upstream replay availability, production throughput, and production
 facts freshness remain distinct claims until observed.
+
+## Release and observed outcome (2026-09-08 UTC)
+
+The repair shipped as immutable `v0.1.0-rc.6`, source
+`9ec9da593b6a435de273396626ecaca3755268e7`. Two isolated clean Linux/amd64
+builds using the pinned Python 3.11 base and dependency inputs produced identical
+complete image/config identity
+`sha256:70c60bb3403c5f2d57c5f9b789306d5933ec3dc751b837c9bde9830d3c88d80a`
+and identical complete Docker-save archives
+`sha256:d463e8d31ed00e4f3c059eaf20f55acd16f466f4d6349f05e4e01eef400a19ef`.
+No differing archive component was excluded. This is bounded runtime-artifact
+reproducibility, not a claim that every third-party dependency was rebuilt.
+
+The release passed 59 focused tests and the nine-finding synthetic demonstration.
+Network-disabled artifact recovery exercised SQLite backup/restore, startup,
+cursor continuity, replay, duplicates, updates, identity changes, and meaningful
+findings. The exact captured baseline also read and started against synthetic
+candidate-written state without a database rewind. Separately, an offline Git
+bundle reconstruction recovered the exact source/tree in a clean worktree.
+Source reconstruction, synthetic application recovery, and live operation are
+different receipts; none reconstructs the historical missing-event interval.
+
+The deployed candidate was observed from 18:46:34 through 20:46:34 without a
+container restart or OOM. At the final accounting sample, 741,655 source envelopes
+were received/admitted, 741,650 completed, and five remained explicitly queued.
+There were 211 queue waits and 4,177 replay duplicates, with zero reported queue
+loss, rollback loss, or batch failures. A saturated queue plus one pending
+envelope at the one-hour checkpoint recovered within ten minutes; the degraded
+status remained visible during that episode. All outstanding work was accounted.
+These observations support the repaired admission/checkpoint invariant under
+this load, not comprehensive upstream coverage or recovery of earlier loss.
+
+The original two-hour gate remained **14/15**, because the new facts snapshot
+had not yet published. A separate, finite followup ending at 21:35 preserved
+that result. Its final scheduled sample was still copying; its terminal correctly
+said no publication had been observed. A subsequent one-off closeout and retained
+completion log established that atomic publication actually completed at
+21:32:50. The new snapshot was 15,532,933,120 bytes. One indexed fingerprint's
+stored minimum/maximum/count matched recomputation; this is representative
+validation, not a full-table audit.
+
+Publication time is not input freshness: the snapshot's export watermark was
+18:46:36, checkpoint rowid 88,332,365. At the 21:36:38 validation, the source was
+at rowid 88,673,083, a 340,718-rowid gap and approximately 2h50m export age.
+Rowid distance is not a missing-event count. Export elapsed 9,973.9 seconds;
+the [exporter incident history](../INCIDENT-2026-09-08-facts-export-scan.md)
+records its measured phases. Timely catch-up remains maintenance work even
+though snapshot generation now completed without restarting ingestion.
+
+Additional limitations remain explicit: evaluator observations were absent,
+and the inherited internal-slack policy assumes `auto_vacuum=none` while the
+actual SQLite store reports `auto_vacuum=2`. Its five-million-page floor was
+not changed in this campaign. That applicability question is separate from
+measured filesystem headroom and ingestion correctness. Producer operation,
+bounded live status acquisition, downstream fixture qualification, and authority
+to act on observations remain separate claims.
