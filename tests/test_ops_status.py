@@ -16,6 +16,9 @@ def _db(tmp_path, cursor_at=None):
         """
         CREATE TABLE IF NOT EXISTS cursors (consumer TEXT PRIMARY KEY, cursor TEXT, updated_at TEXT);
         CREATE TABLE IF NOT EXISTS recheck_queue (claim_fingerprint TEXT PRIMARY KEY, scheduled_at TEXT);
+        CREATE TABLE IF NOT EXISTS events (event_uri TEXT PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS claim_history (id INTEGER PRIMARY KEY);
+        CREATE TABLE IF NOT EXISTS label_decisions (id INTEGER PRIMARY KEY);
         """
     )
     if cursor_at:
@@ -191,6 +194,65 @@ def test_resource_concerns_remain_separate(tmp_path, monkeypatch):
     assert items["driftwatch.persistence.sqlite_continuity"]["local_state"] == "PRESENT"
     assert items["driftwatch.persistence.volume_capacity"]["local_state"] == "DEGRADED"
     assert items["driftwatch.persistence.sqlite_slack"]["local_state"] == "DEGRADED"
+
+
+def test_sqlite_continuity_v2_is_bounded_and_does_not_claim_integrity(tmp_path):
+    path = _db(tmp_path, NOW.isoformat())
+    observed = _items(ops_status.build_status(path, data_dir=tmp_path, now=NOW))[
+        "driftwatch.persistence.sqlite_continuity"
+    ]
+    facts = observed["facts"]
+    assert observed["local_state"] == "PRESENT"
+    assert facts["integrity_check_performed"] is False
+    assert facts["integrity_evidence_scope"] == "separate_backup_restore_receipt"
+    assert facts["read_probe_succeeded"] is True
+    assert facts["write_transaction_acquired"] is True
+    assert facts["required_tables_missing"] == []
+    assert facts["required_tables_present"] == sorted(ops_status.SQLITE_CONTINUITY_REQUIRED_TABLES)
+    assert isinstance(facts["schema_version"], int)
+    assert isinstance(facts["user_version"], int)
+    assert isinstance(facts["page_size"], int)
+    assert isinstance(facts["page_count"], int)
+    assert isinstance(facts["freelist_count"], int)
+    assert "quick_check" not in facts
+
+
+def test_sqlite_continuity_v2_executes_no_integrity_pragma(tmp_path, monkeypatch):
+    path = _db(tmp_path, NOW.isoformat())
+    statements = []
+    connect = sqlite3.connect
+
+    def traced_connect(*args, **kwargs):
+        connection = connect(*args, **kwargs)
+        connection.set_trace_callback(statements.append)
+        return connection
+
+    monkeypatch.setattr(ops_status.sqlite3, "connect", traced_connect)
+    ops_status.build_status(path, data_dir=tmp_path, now=NOW)
+    normalized = "\n".join(statements).lower()
+    assert "quick_check" not in normalized
+    assert "integrity_check" not in normalized
+
+
+def test_sqlite_continuity_v2_missing_structure_is_degraded_not_healthy(tmp_path):
+    path = _db(tmp_path, NOW.isoformat())
+    with sqlite3.connect(path) as connection:
+        connection.execute("DROP TABLE label_decisions")
+    observed = _items(ops_status.build_status(path, data_dir=tmp_path, now=NOW))[
+        "driftwatch.persistence.sqlite_continuity"
+    ]
+    assert observed["local_state"] == "DEGRADED"
+    assert observed["facts"]["required_tables_missing"] == ["label_decisions"]
+    assert observed["facts"]["integrity_check_performed"] is False
+
+
+def test_sqlite_continuity_declaration_is_v2(tmp_path):
+    manifest = ops_status.load_manifest()
+    concern = next(
+        item for item in manifest["concerns"]
+        if item["id"] == "driftwatch.persistence.sqlite_continuity"
+    )
+    assert concern["question"] == "driftwatch.question.sqlite_continuity/v2"
 
 
 def test_old_facts_snapshot_is_stale_observational_output(tmp_path):

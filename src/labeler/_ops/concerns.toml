@@ -38,10 +38,10 @@ description = "Eligible candidate evaluation work is executing without recorded 
 
 [[concerns]]
 id = "driftwatch.persistence.sqlite_continuity"
-question = "driftwatch.question.sqlite_continuity/v1"
+question = "driftwatch.question.sqlite_continuity/v2"
 profile = "driftwatch.profile.local_status/v1"
 required = true
-description = "The SQLite store used for event, claim, decision, and cursor continuity is locally readable, passes quick_check, and can acquire a write transaction."
+description = "The SQLite store used for event, claim, decision, and cursor continuity passes bounded read, required-table, metadata, and write-intent probes. Full integrity is separate backup/restore evidence."
 
 [[concerns]]
 id = "driftwatch.persistence.volume_capacity"
