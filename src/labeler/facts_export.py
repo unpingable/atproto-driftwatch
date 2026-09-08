@@ -147,12 +147,18 @@ def _recompute_hourly(source_conn, sidecar, overlap_start, now):
 
 
 def _recompute_bounds(sidecar):
-    """Full recompute from sidecar (small table, bounded by retention)."""
+    """Recompute from a sequential table scan with SQLite's GROUP BY sorter.
+
+    The fingerprint-only index is not covering: reading timestamps through it
+    performs a table lookup per entry in fingerprint order. On the deployed
+    multi-gigabyte sidecar this kept a snapshot unfinished for hours. A table
+    scan preserves the aggregate while allowing the sorter to spill to disk.
+    """
     sidecar.execute("DELETE FROM fingerprint_bounds")
     sidecar.execute("""
         INSERT INTO fingerprint_bounds (fingerprint, first_seen_epoch, last_seen_epoch, total_claims)
         SELECT fingerprint, MIN(created_epoch), MAX(created_epoch), COUNT(*)
-        FROM uri_fingerprint
+        FROM uri_fingerprint NOT INDEXED
         GROUP BY fingerprint
     """)
 
