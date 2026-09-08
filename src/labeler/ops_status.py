@@ -19,7 +19,9 @@ from . import ops_runtime
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-MANIFEST_PATH = REPO_ROOT / ".ops" / "concerns.toml"
+REPO_MANIFEST_PATH = REPO_ROOT / ".ops" / "concerns.toml"
+MANIFEST_PATH = (REPO_MANIFEST_PATH if REPO_MANIFEST_PATH.is_file()
+                 else Path(__file__).resolve().parent / "_ops" / "concerns.toml")
 STATUS_SCHEMA = "project.ops.status/v1"
 CONSUMER_MAX_AGE_S = 120
 CURSOR_MAX_AGE_S = 15 * 60
