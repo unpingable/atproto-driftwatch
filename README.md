@@ -261,7 +261,23 @@ detect-only fixture, assert the expected provenance-laundering result, and
 generate the operations status. It neither connects to Jetstream nor emits a
 label; temporary storage is used unless `--output` is supplied.
 
+To rehearse application/data recovery from a saved release image, choose a new
+output directory and run:
+
+```bash
+python3 tools/recover_release.py \
+  --image-archive /path/to/driftwatch-release.docker.tar \
+  --output /tmp/driftwatch-recovery-rehearsal
+```
+
+The script refuses existing destinations, repository data paths, and paths
+below a `.driftwatch-live` marker. It makes a SQLite online backup, restores
+state and output, starts the restored service, checks cursor continuity and
+status generation, and replays the fixed detect-only fixture. Its
+`result.json` claims synthetic application recovery only; it does not claim
+source-worktree reconstruction or production rollback readiness.
+
 The generic operations envelope under `.ops/` is pinned by
 `.ops/contract.lock.json` to local `atproto-ops` release candidate
-`v1.0.0-rc.1`. The binding uses the dependency-light `labeler.ops_status`
+`v1.0.0-rc.2`. The binding uses the dependency-light `labeler.ops_status`
 entry point.

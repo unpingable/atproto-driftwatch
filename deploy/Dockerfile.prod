@@ -3,15 +3,21 @@ ARG SOURCE_DATE_EPOCH=0
 WORKDIR /app
 
 ARG GIT_SHA=unknown
-ARG RELEASE_VERSION=0.1.0rc1
+ARG RELEASE_VERSION=0.1.0rc2
 ENV GIT_SHA=${GIT_SHA}
 LABEL org.opencontainers.image.revision=${GIT_SHA} \
       org.opencontainers.image.version=${RELEASE_VERSION} \
       org.opencontainers.image.source="https://github.com/unpingable/atproto-driftwatch"
 ENV PYTHONDONTWRITEBYTECODE=1
+ENV PATH="/opt/driftwatch-venv/bin:${PATH}"
 
-COPY deploy/requirements.prod.txt requirements.txt
-RUN pip install --no-cache-dir -r requirements.txt
+# The bind-mounted lock does not create a timestamp-bearing COPY layer. Install
+# into one isolated tree, then normalize metadata that pip/venv set to wall time.
+RUN --mount=type=bind,source=deploy/requirements.prod.txt,target=/tmp/requirements.prod.txt,readonly \
+    python -m venv /opt/driftwatch-venv \
+    && /opt/driftwatch-venv/bin/pip install --no-cache-dir -r /tmp/requirements.prod.txt \
+    && find /opt/driftwatch-venv -exec touch -h -d "@${SOURCE_DATE_EPOCH}" {} + \
+    && touch -h -d "@${SOURCE_DATE_EPOCH}" /tmp
 
 COPY src/ ./
 
