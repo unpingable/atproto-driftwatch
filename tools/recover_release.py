@@ -105,7 +105,8 @@ def main() -> int:
                                       "--input", "/fixture/posts.jsonl",
                                       "--out", "/app/out/labels.jsonl"])
     backup_code = (
-        "import sqlite3; a=sqlite3.connect('/app/data/labeler.sqlite'); "
+        "import sqlite3; a=sqlite3.connect("
+        "'file:/app/data/labeler.sqlite?mode=ro',uri=True); "
         "b=sqlite3.connect('/backup/labeler.sqlite'); a.backup(b); "
         "b.close(); a.close()"
     )
