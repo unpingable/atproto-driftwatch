@@ -110,7 +110,10 @@ def main() -> int:
         "b=sqlite3.connect('/backup/labeler.sqlite'); a.backup(b); "
         "b.close(); a.close()"
     )
-    docker_run(image, [(source_data, "/app/data", "readonly"),
+    # WAL-mode SQLite needs directory access for its shared-memory sidecar even
+    # when the database connection itself is read-only. This is synthetic state
+    # created above; the tool never accepts an external/live database path.
+    docker_run(image, [(source_data, "/app/data", "rw"),
                        (backup, "/backup", "rw")], ["python", "-c", backup_code])
     shutil.copy2(source_out / "labels.jsonl", backup / "labels.jsonl")
     shutil.copy2(backup / "labeler.sqlite", restored_data / "labeler.sqlite")
