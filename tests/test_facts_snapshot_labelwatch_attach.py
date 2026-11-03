@@ -240,3 +240,51 @@ def test_labelwatch_identity_query_shapes_against_writer_snapshot(tmp_path):
     assert row == ("author.test", "pds1.example", "ok")
     conn.execute("DETACH DATABASE drift")
     conn.close()
+
+
+def test_labelwatch_consumes_lineage_rebuilt_legacy_sidecar(tmp_path):
+    """The real reader sees the replacement source, including below the old rowid."""
+    from labeler import db as drift_db, facts_export
+
+    now = int(time.time())
+    post_epoch, label_epoch = now - 7200, now - 3600
+    old_uri = "at://did:plc:author/app.bsky.feed.post/prior-store"
+    facts_path, work_path = tmp_path / "facts.sqlite", tmp_path / "facts_work.sqlite"
+
+    def insert_claim(uri, fingerprint):
+        conn = drift_db.get_conn()
+        conn.execute(
+            "INSERT INTO claim_history(authorDid, claim_fingerprint, createdAt, post_uri) VALUES (?, ?, ?, ?)",
+            ("did:plc:author", fingerprint, _iso_z(post_epoch), uri),
+        )
+        conn.commit()
+        conn.close()
+
+    insert_claim(old_uri, "fp-old")
+    facts_export.export_once(drift_db.get_conn, str(facts_path), str(work_path), force_snapshot=True)
+    generation = drift_db.get_store_lineage()["generation_id"]
+    for name in ("labeler.sqlite", "labeler.sqlite-wal", "labeler.sqlite-shm"):
+        (tmp_path / name).unlink(missing_ok=True)
+    drift_db.init_db()
+    insert_claim(GOOD_URI, "fp-new")
+    facts_export.export_once(drift_db.get_conn, str(facts_path), str(work_path), force_snapshot=True)
+    facts = sqlite3.connect(facts_path)
+    meta = dict(facts.execute("SELECT key, value FROM meta"))
+    assert meta["source_generation"] == drift_db.get_store_lineage()["generation_id"] != generation
+    assert facts.execute("SELECT post_uri FROM uri_fingerprint").fetchall() == [(GOOD_URI,)]
+    facts.close()
+
+    conn = lw_db.connect(str(tmp_path / "labelwatch.db"))
+    lw_db.init_db(conn)
+    _insert_label_event(conn, GOOD_URI, _iso_z(label_epoch), "spam")
+    _insert_label_event(conn, old_uri, _iso_z(label_epoch), "spam")
+    _sync_driftwatch_facts(conn, LwConfig(driftwatch_facts_path=str(facts_path)))
+    rows = [tuple(r) for r in conn.execute(
+        "SELECT uri, claim_fingerprint, lag_sec_claimed FROM derived_label_fp"
+    )]
+    assert rows == [(GOOD_URI, "fp-new", label_epoch - post_epoch)]
+    assert not {"tmp_drift_fp", "tmp_candidate_uris"} & {
+        r[0] for r in conn.execute("SELECT name FROM sqlite_temp_master")
+    }
+    assert "drift" not in {r[1] for r in conn.execute("PRAGMA database_list")}
+    conn.close()

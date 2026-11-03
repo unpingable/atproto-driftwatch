@@ -10,12 +10,14 @@ from fastapi import FastAPI, HTTPException, Response, Depends, Header
 
 from .db import init_db, get_conn, DATA_DIR
 from .consumer import ATProtoConsumer
+from .startup_policy import resolve_startup_policy
 
 app = FastAPI(title="Bluesky Labeler MVP")
 
 _consumer_task = None
 _consumer_instance = None
 _label_ingest_task = None
+_background_tasks = []
 
 
 @app.on_event("startup")
@@ -31,40 +33,51 @@ async def startup_event():
             "ADMIN_API_TOKEN is not set: all protected routes will refuse with 503. "
             "Set it in the deployment environment to enable admin access."
         )
+    # Resolve the aggregate operator boundary before initialization or task
+    # creation. Paused mode records contradictory overlays but suppresses
+    # their writers, leaving the HTTP/read surface available.
+    policy = resolve_startup_policy(os.environ)
+    app.state.startup_policy = policy
+    app.state.retention_scheduler = None
+    logging.getLogger("labeler.startup").info(
+        "startup policy: %s", json.dumps(policy.public_record(), sort_keys=True)
+    )
     init_db()
+    effective = policy.effective
+    loop = asyncio.get_running_loop()
+
+    def spawn(coro):
+        task = loop.create_task(coro)
+        _background_tasks.append(task)
+        return task
     # Optionally start the consumer in background when env var is set
-    if os.getenv("FIREHOSE_AUTO_START") == "1":
-        loop = asyncio.get_event_loop()
+    if effective["FIREHOSE_AUTO_START"]:
         consumer = ATProtoConsumer()
         global _consumer_task, _consumer_instance
         _consumer_instance = consumer
-        _consumer_task = loop.create_task(consumer.run())
+        _consumer_task = spawn(consumer.run())
 
     # Optionally start periodic label ingestion when env var is set
-    if os.getenv("FIREHOSE_LABEL_INGEST") == "1":
+    if effective["FIREHOSE_LABEL_INGEST"]:
         from .ingest import run_periodic
-        loop = asyncio.get_event_loop()
         global _label_ingest_task
-        _label_ingest_task = loop.create_task(run_periodic())
+        _label_ingest_task = spawn(run_periodic())
 
     # Optionally start longitudinal recheck loop when env var is set
-    if os.getenv("ENABLE_LONGITUDINAL_RECHECK") == "1":
+    if effective["ENABLE_LONGITUDINAL_RECHECK"]:
         from .longitudinal import run_periodic as _lr
         global _label_recheck_task
-        loop = asyncio.get_event_loop()
-        _label_recheck_task = loop.create_task(_lr())
+        _label_recheck_task = spawn(_lr())
 
     # Optionally start facts sidecar export for labelwatch
-    if os.environ.get("ENABLE_FACTS_EXPORT", "").lower() in ("1", "true"):
+    if effective["ENABLE_FACTS_EXPORT"]:
         from .facts_export import run_periodic as _fe
-        loop = asyncio.get_event_loop()
-        loop.create_task(_fe())
+        spawn(_fe())
 
     # Periodic maintenance (label expiry, disk monitoring, growth stats)
-    if os.environ.get("ENABLE_MAINTENANCE", "").lower() in ("1", "true"):
+    if effective["ENABLE_MAINTENANCE"]:
         from .maintenance import run_periodic as _maint
-        loop = asyncio.get_event_loop()
-        loop.create_task(_maint())
+        spawn(_maint())
 
     # Retention loop (strip raw JSON, prune old rows). Retention runs on
     # its own SQLite write connection — pressure-aware scheduler in
@@ -72,7 +85,7 @@ async def startup_event():
     # uses rollback_lost as a tripwire. The 5850d01 attempt to route
     # retention through the writer thread failed acceptance under load
     # and is preserved as a documented scar in the gap-spec footer.
-    if os.environ.get("ENABLE_RETENTION", "").lower() in ("1", "true"):
+    if effective["ENABLE_RETENTION"]:
         from .retention import run_periodic as _ret, BATCH_SLEEP_SEC
         from .retention_scheduler import RetentionScheduler, NullScheduler
         if _consumer_instance is not None:
@@ -83,18 +96,21 @@ async def startup_event():
         else:
             sched = NullScheduler(sleep_between_s=BATCH_SLEEP_SEC)
         app.state.retention_scheduler = sched
-        loop = asyncio.get_event_loop()
-        loop.create_task(_ret(consumer=_consumer_instance, scheduler=sched))
+        spawn(_ret(consumer=_consumer_instance, scheduler=sched))
 
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    global _consumer_task
-    if _consumer_task:
-        _consumer_task.cancel()
-    global _label_ingest_task
-    if _label_ingest_task:
-        _label_ingest_task.cancel()
+    global _consumer_task, _consumer_instance, _label_ingest_task
+    tasks = list(_background_tasks)
+    for task in tasks:
+        task.cancel()
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+    _background_tasks.clear()
+    _consumer_task = None
+    _consumer_instance = None
+    _label_ingest_task = None
 
 
 @app.get("/health")
@@ -267,6 +283,9 @@ async def health_extended():
         "drop_frac": health_snap.get("drop_frac"),
         "gate_reasons": health_snap.get("gate_reasons", []),
     }
+    startup_policy = getattr(app.state, "startup_policy", None)
+    if startup_policy is not None:
+        result["startup_policy"] = startup_policy.public_record()
     if wal_info:
         result["wal"] = wal_info
     if resolver_info:

@@ -2,8 +2,16 @@
 import asyncio
 import json
 
-from labeler import consumer, db
+from labeler import consumer, db, platform_health
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def isolate_source_health():
+    """Ancient replay fixtures must not gate a later test's fresh store."""
+    platform_health._reset()
+    yield
+    platform_health._reset()
 
 
 def message(t, key, text="first"):
@@ -53,6 +61,38 @@ def test_saturated_checkpoint_reconnect(tmp_path, monkeypatch):
         conn.close()
         replay._writer_conn.close()
         replay._writer_executor.shutdown()
+    try:
+        asyncio.run(exercise())
+    finally:
+        c._writer_executor.shutdown()
+
+
+def test_working_set_guard_holds_unadmitted_message_behind_cursor(tmp_path, monkeypatch):
+    monkeypatch.setattr(db, "DATA_DIR", tmp_path)
+    db.init_db()
+    c = consumer.ATProtoConsumer()
+
+    class ClosedGuard:
+        def pressure(self):
+            return True
+
+        def state(self):
+            return {"configured": True, "admitted": False, "reasons": ["live_cap_reached"]}
+
+    c._working_set_guard = ClosedGuard()
+
+    async def exercise():
+        pending = asyncio.create_task(c._handle_message(message(10_000_000, "held")))
+        await asyncio.sleep(0.02)
+        assert c._received_total == 1
+        assert c._admitted_total == 0
+        assert c._admission_pending is True
+        assert db.get_cursor(consumer.CONSUMER_NAME) is None
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        assert c._unadmitted_interrupted_total == 1
+        assert c._admission_pending is False
+
     try:
         asyncio.run(exercise())
     finally:

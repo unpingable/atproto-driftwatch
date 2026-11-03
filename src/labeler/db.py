@@ -71,6 +71,16 @@ def init_db():
         except Exception:
             pass
 
+    # Was this store already populated before this init? Decides whether the
+    # lineage record below describes a freshly created store or one that
+    # predates lineage tracking (whose real creation time is unknown).
+    try:
+        preexisting = conn.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'events'"
+        ).fetchone()[0] > 0
+    except Exception:
+        preexisting = False
+
     # events table: append-only store of raw events (store JSON as TEXT for compatibility)
     conn.execute(
         """
@@ -118,6 +128,50 @@ def init_db():
             consumer TEXT PRIMARY KEY,
             cursor TEXT,
             updated_at TIMESTAMP
+        )
+        """
+    )
+
+    # Store lineage. A generation id is minted once, when this physical store
+    # is first initialized. A recreated or replaced store gets a new id, so
+    # state derived from an earlier store (export watermarks, health
+    # baselines) can be recognised as belonging to a different lineage.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS store_lineage (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        )
+        """
+    )
+    if conn.execute("SELECT 1 FROM store_lineage WHERE key = 'generation_id'").fetchone() is None:
+        conn.executemany(
+            "INSERT OR IGNORE INTO store_lineage (key, value) VALUES (?, ?)",
+            [
+                ("generation_id", uuid.uuid4().hex),
+                ("created_at", timeutil.now_utc().isoformat()),
+                # 'created': this init created the store. 'adopted': the store
+                # already held data when lineage was first recorded, so its
+                # history before created_at is not described by this lineage.
+                ("origin", "adopted" if preexisting else "created"),
+            ],
+        )
+
+    # Observation coverage starts. One row per consumer start. A start with no
+    # durable cursor is 'unbounded': nothing before its first observed event
+    # is covered, and continuity with any earlier observation is not
+    # substantiated. first_time_us is the substantiated lower bound.
+    conn.execute(
+        """
+        CREATE TABLE IF NOT EXISTS coverage_starts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            generation_id TEXT NOT NULL,
+            consumer TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            start_kind TEXT NOT NULL,
+            resume_cursor TEXT,
+            first_time_us INTEGER,
+            first_observed_at TEXT
         )
         """
     )
@@ -603,6 +657,80 @@ def upsert_cursor(consumer: str, cursor: Optional[str]):
         )
     conn.commit()
     conn.close()
+
+
+def get_store_lineage(conn=None) -> Optional[dict]:
+    """Return {generation_id, created_at, origin} for the store, or None."""
+    own = conn is None
+    if own:
+        conn = get_conn()
+    try:
+        rows = conn.execute("SELECT key, value FROM store_lineage").fetchall()
+    except Exception:
+        return None
+    finally:
+        if own:
+            conn.close()
+    lineage = {k: v for k, v in rows}
+    return lineage if lineage.get("generation_id") else None
+
+
+# start_kind values for coverage_starts
+COVERAGE_UNBOUNDED = "unbounded"            # no durable cursor: fresh start, gap before it
+COVERAGE_CURSOR_RESUME = "cursor_resume"    # resumed from this store's durable cursor
+COVERAGE_OPERATOR_CURSOR = "operator_cursor"  # operator explicitly supplied a cursor
+
+
+def record_coverage_start(consumer: str, start_kind: str, resume_cursor: Optional[str] = None) -> Optional[int]:
+    conn = get_conn()
+    try:
+        lineage = get_store_lineage(conn)
+        if lineage is None:
+            return None
+        cur = conn.execute(
+            "INSERT INTO coverage_starts (generation_id, consumer, started_at, start_kind, resume_cursor) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (lineage["generation_id"], consumer, timeutil.now_utc().isoformat(), start_kind, resume_cursor),
+        )
+        conn.commit()
+        return cur.lastrowid
+    finally:
+        conn.close()
+
+
+def record_coverage_floor(start_id: int, time_us: int) -> None:
+    """Record the first observed event time for a coverage start (first write wins)."""
+    conn = get_conn()
+    try:
+        conn.execute(
+            "UPDATE coverage_starts SET first_time_us = ?, first_observed_at = ? "
+            "WHERE id = ? AND first_time_us IS NULL",
+            (int(time_us), timeutil.to_utc_iso(int(time_us) / 1_000_000), start_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_coverage_floor_epoch(conn, generation_id: str) -> Optional[int]:
+    """Earliest substantiated observation (epoch seconds) for this lineage.
+
+    Coverage of a lineage begins at its most recent unbounded or
+    operator-cursor start: anything before that start is not continuous with
+    what follows. Returns None if no such start has observed an event.
+    """
+    try:
+        row = conn.execute(
+            "SELECT first_time_us FROM coverage_starts "
+            "WHERE generation_id = ? AND start_kind != ? "
+            "ORDER BY id DESC LIMIT 1",
+            (generation_id, COVERAGE_CURSOR_RESUME),
+        ).fetchone()
+    except Exception:
+        return None
+    if not row or row[0] is None:
+        return None
+    return int(row[0]) // 1_000_000
 
 
 def get_cursor(consumer: str) -> Optional[str]:

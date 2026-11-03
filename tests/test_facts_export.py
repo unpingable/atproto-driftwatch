@@ -1,8 +1,10 @@
 """Tests for labeler.facts_export — driftwatch sidecar exporter."""
 
+import hashlib
 import os
 import sqlite3
 import time
+from collections import namedtuple
 
 import pytest
 
@@ -10,15 +12,27 @@ from labeler.facts_export import (
     BATCH_LIMIT,
     OVERLAP_HOURS,
     RETENTION_DAYS,
+    _checkpoint_snapshot_wal,
     _ensure_tables,
     _get_meta_int,
     _recompute_bounds,
     _recompute_hourly,
     _refresh_identity_facts,
     _set_meta,
+    _snapshot,
+    _snapshot_preflight,
+    _snapshot_space_plan,
     _upsert_uri_fingerprints,
     export_once,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_snapshot_capacity_from_host(monkeypatch):
+    """Tiny fixtures must not inherit the developer host's production reserve."""
+    monkeypatch.setenv("DISK_RELEASE_THRESHOLD", "0.99")
+    monkeypatch.setenv("DISK_MIN_FREE_BYTES", "0")
+    monkeypatch.setenv("FACTS_SNAPSHOT_MIN_FREE_AFTER_BYTES", "0")
 
 
 def _make_source(rows=None, identity_rows=None):
@@ -417,6 +431,104 @@ class TestSnapshotInterval:
         # Snapshot file should not have been updated
         mtime_2 = os.path.getmtime(facts_path)
         assert mtime_2 == mtime_1
+        source.close()
+
+
+class TestSnapshotWorkspaceAdmission:
+    def test_plan_preserves_brake_release_headroom(self, monkeypatch):
+        monkeypatch.delenv("DISK_RELEASE_THRESHOLD", raising=False)
+        monkeypatch.delenv("DISK_MIN_FREE_BYTES", raising=False)
+        monkeypatch.delenv("FACTS_SNAPSHOT_MIN_FREE_AFTER_BYTES", raising=False)
+
+        plan = _snapshot_space_plan(
+            total_bytes=210_241_560_576,
+            free_bytes=24_252_596_096,
+            work_size=17_908_682_752,
+        )
+
+        assert plan["admitted"] is False
+        assert plan["output_budget_bytes"] == 17_908_682_752
+        assert plan["reserve_bytes"] == 31_536_234_087
+        assert plan["required_free_bytes"] == 49_444_916_839
+
+    def test_checkpoint_releases_wal_before_snapshot_overlap(self, tmp_path):
+        db_path = tmp_path / "work.sqlite"
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("CREATE TABLE t (value BLOB)")
+        conn.executemany("INSERT INTO t VALUES (?)", [(b"x" * 4096,)] * 512)
+        conn.commit()
+
+        wal_path = tmp_path / "work.sqlite-wal"
+        assert wal_path.stat().st_size > 0
+        assert _checkpoint_snapshot_wal(conn) is True
+        assert wal_path.stat().st_size == 0
+        assert conn.execute("SELECT COUNT(*) FROM t").fetchone()[0] == 512
+        conn.close()
+
+    def test_checkpointed_source_geometry_bounds_vacuum_output(self, tmp_path):
+        db_path = tmp_path / "work.sqlite"
+        out_path = tmp_path / "facts.sqlite"
+        conn = sqlite3.connect(db_path)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("CREATE TABLE t (value BLOB)")
+        conn.executemany("INSERT INTO t VALUES (?)", [(b"x" * 4096,)] * 1024)
+        conn.commit()
+        conn.execute("DELETE FROM t WHERE rowid % 2 = 0")
+        conn.commit()
+        assert _checkpoint_snapshot_wal(conn) is True
+
+        plan = _snapshot_preflight(conn, str(out_path))
+        assert _snapshot(conn, str(out_path)) is True
+        assert out_path.stat().st_size <= plan["output_budget_bytes"]
+        conn.close()
+
+    def test_stale_workspace_removed_before_refusal_and_snapshot_preserved(
+        self, tmp_path, monkeypatch,
+    ):
+        import labeler.facts_export as fe
+
+        source = _make_source()
+        facts_path = str(tmp_path / "facts.sqlite")
+        work_path = str(tmp_path / "facts_work.sqlite")
+        export_once(source, facts_path, work_path, force_snapshot=True)
+        with open(facts_path, "rb") as fh:
+            before = hashlib.sha256(fh.read()).hexdigest()
+        work = sqlite3.connect(work_path)
+        last_snapshot_before = _get_meta_int(work, "last_snapshot_epoch")
+        work.close()
+
+        stale = facts_path + ".tmp"
+        with open(stale, "wb") as fh:
+            fh.write(b"unpublished workspace")
+
+        DiskUsage = namedtuple("DiskUsage", "total used free")
+        monkeypatch.setattr(
+            fe.shutil,
+            "disk_usage",
+            lambda _path: DiskUsage(total=100_000, used=99_999, free=1),
+        )
+        monkeypatch.setattr(
+            fe,
+            "_recompute_hourly",
+            lambda *_args: pytest.fail("hourly work ran after capacity refusal"),
+        )
+        monkeypatch.setattr(
+            fe,
+            "_recompute_bounds",
+            lambda *_args: pytest.fail("bounds work ran after capacity refusal"),
+        )
+
+        export_once(source, facts_path, work_path, force_snapshot=True)
+
+        assert not os.path.exists(stale)
+        with open(facts_path, "rb") as fh:
+            after = hashlib.sha256(fh.read()).hexdigest()
+        assert after == before
+        work = sqlite3.connect(work_path)
+        assert _get_meta_int(work, "last_snapshot_epoch") == last_snapshot_before
+        work.close()
         source.close()
 
 

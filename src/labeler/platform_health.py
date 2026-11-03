@@ -84,7 +84,15 @@ class PlatformHealth:
 
     def __init__(self):
         self._lock = threading.Lock()
+        # Generation id of the store this process observes into. A baseline
+        # checkpoint is only restored when it was written under the same
+        # generation; a replaced store gets a cold start.
+        self._store_generation = None
         self._reset()
+
+    def set_store_generation(self, generation_id):
+        with self._lock:
+            self._store_generation = generation_id
 
     def _reset(self):
         """Reset all state (for testing or restart)."""
@@ -563,6 +571,7 @@ class PlatformHealth:
                 "state": self._state,
                 "baseline_standing": self._baseline_standing,
                 "admissible_windows": self._admissible_windows,
+                "store_generation": self._store_generation,
                 "checkpoint_at": time.time(),
             }
 
@@ -583,6 +592,11 @@ class PlatformHealth:
                 "cold start — baseline will be relearned from admissible windows",
                 version, self.CHECKPOINT_VERSION,
             )
+            return False
+
+        if data.get("store_generation") != self._store_generation:
+            LOG.info("baseline checkpoint belongs to store generation %s, not %s; cold start",
+                     data.get("store_generation"), self._store_generation)
             return False
 
         age = time.time() - data.get("checkpoint_at", 0)
@@ -706,6 +720,10 @@ def get_detection(ts_start: str = "", ts_end: str = "", window: str = "1m"):
     return _instance.get_detection(ts_start, ts_end, window)
 
 
+def set_store_generation(generation_id) -> None:
+    _instance.set_store_generation(generation_id)
+
+
 def restore_baseline(path: Path | None = None) -> bool:
     """Restore baseline from checkpoint file. Call once at startup."""
     path = path or CHECKPOINT_PATH
@@ -733,3 +751,4 @@ def force_checkpoint(path: Path | None = None) -> bool:
 def _reset():
     """Reset singleton state (for testing)."""
     _instance._reset()
+    _instance.set_store_generation(None)

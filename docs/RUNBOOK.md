@@ -3,6 +3,10 @@
 Quick reference for diagnosing common failure modes.
 Check `/health/extended` first, then use this guide.
 
+For store loss, the recovery boundary is [the data contract](../DATA-CONTRACT.md).
+For the owned source integration and the remaining sustained-operation gate,
+see [the November source reconciliation](findings/2026-11-03-owned-source-recovery.md).
+
 ---
 
 ## Consumer crash-loop
@@ -130,6 +134,52 @@ the root fs). On the 7.8 GB VM use `1500MB` + a spill dir on zonestorage.
 ```cron
 17 4 * * * flock -n /run/lock/driftwatch-facts-snapshot.lock docker exec -e DRIFTWATCH_FACTS_DUCKDB_MEMORY_LIMIT=1500MB -e DRIFTWATCH_FACTS_DUCKDB_THREADS=2 -e DRIFTWATCH_FACTS_DUCKDB_TEMP_DIR=/app/data/duckdb-spill driftwatch python -m labeler.cli driftwatch facts-snapshot --parquet-root /app/data/parquet --identity-db /app/data/labeler.sqlite --out /app/data/facts.sqlite >> /var/log/driftwatch-facts-snapshot.log 2>&1
 ```
+
+### Contained legacy SQLite exporter
+
+The incident-era `labeler.facts_export` path must be invoked through
+`labeler.facts_export_runner`. The runner acquires the single-exporter lock,
+verifies an exact non-NFS mount, creates one private attempt directory, sets
+`SQLITE_TMPDIR` before importing SQLite, and removes only that attempt's
+scratch. Direct `python -m labeler.facts_export` is not a qualified production
+invocation.
+
+Example for the current `/app/data` block-storage mount:
+
+```bash
+docker exec \
+  -e FACTS_EXPORT_TEMP_ROOT=/app/data/facts-export-tmp \
+  -e FACTS_EXPORT_TEMP_MOUNT=/app/data \
+  -e FACTS_EXPORT_TEMP_FSTYPE=ext4 \
+  -e FACTS_EXPORT_LOCK_PATH=/app/data/.facts-export.lock \
+  -e FACTS_EXPORT_ROOT_RESERVE_PATH=/ \
+  -e FACTS_EXPORT_ROOT_MIN_FREE_BYTES=16106127360 \
+  -e FACTS_EXPORT_SCRATCH_BUDGET_BYTES=4294967296 \
+  -e FACTS_EXPORT_AGGREGATE_WAL_BUDGET_BYTES=7516192768 \
+  -e FACTS_EXPORT_CONCURRENT_GROWTH_ALLOWANCE_BYTES=536870912 \
+  -e FACTS_EXPORT_MAX_RUNTIME_SECONDS=7200 \
+  driftwatch python -m labeler.facts_export_runner /app/data/facts.sqlite
+```
+
+The 4 GiB scratch ceiling is the next whole-GiB boundary above both the
+3,071,115,264-byte production root dip and the subsequent explicit-scratch
+rehearsal peak of 2,786,615,296 deleted-open bytes. The 7 GiB WAL ceiling rounds
+above the measured
+6,843,880,352-byte production-scale update/aggregate WAL peak; a stopped
+rehearsal also demonstrated that WAL can exceed 3 GiB before the aggregate-only
+phase begins. The 512 MiB per-filesystem concurrent
+allowance exceeds the measured non-export residual and ordinary Labelwatch
+WAL/open-file allocation during the contained run. These are absolute measured
+bounds, not percentages.
+
+Admission groups paths by filesystem identity. Scratch plus aggregate WAL are
+simultaneous; compact output is a later mutually exclusive phase. Each
+filesystem must retain its applicable reserve and concurrent-growth allowance
+through both phases. A missing/wrong/unwritable mount, NFS scratch, busy
+checkpoint, lock owner, initial shortfall, mid-run floor threat, budget overrun,
+or two-hour runtime overrun refuses the export. The previous publication stays
+authoritative and only the current attempt's scratch/output workspace is
+eligible for cleanup.
 
 **Deploy checklist (first cutover):**
 1. **Declare the disturbance first** (declaration precedes effect; NQ rejects
@@ -399,3 +449,65 @@ dk = d.get("disk", {})
 if dk: print(f"  disk={dk.get(\"pct_used\",\"?\")}%")
 '
 ```
+## Bounded ingestion and private archive qualification
+
+`scripts/bounded_ingestion_experiment.py` is an operator-driven, one-shot
+qualification tool. It refuses unless the expected completed-prefix cursor,
+image identity, and unique run ID are explicit. During intake and drain it
+atomically replaces a mode-0600 receipt under
+`data/experiment-receipts/`. The receipt includes received, admitted and
+durably completed counts; queue state; physical DB/WAL allocation; live SQLite
+page consumption; filesystem minima; and shutdown standing. A source
+disconnect closes intake and uses the same bounded drain path as an ordinary
+cap instead of bypassing result serialization.
+
+The consumer cursor is intentionally five seconds behind its completed source
+frontier. Each successful transaction stores
+`max_completed_time_us - 5_000_000`; replay receipts make that overlap
+idempotent. The cursor is therefore the safe reconnect boundary, while the
+frontier is the greatest source timestamp established as completed. They are
+different custody claims and must be reported separately.
+
+Run diagnostics through `scripts/run_deadlined_command.sh` with an explicit
+deadline and receipt path. The wrapper creates a dedicated process group,
+applies TERM/KILL bounds, verifies group cleanup, and records selected lifecycle
+facts without retaining the command, environment, headers, or output. Remote
+container diagnostics additionally require an exact post-run container/process
+check; a local timeout alone does not prove remote cleanup.
+
+`scripts/capture_jetstream_archive.py` creates a bounded private raw-event
+archive independently of the live SQLite writer. It requires the exact archive
+mount source, filesystem type, and `rw` state; scratch must be on another
+filesystem. It writes locally, enforces time/event/raw-byte caps, copies to a
+hidden destination, verifies SHA-256 and decompression count, then atomically
+publishes the archive and manifest. It does not delete or compact online data,
+and the SQLite writer must never use NFS.
+
+Run the capture as the intended archive custodian and pass that UID through
+`--expected-owner-uid`. Root-squashed NFS can otherwise turn a mode-0600 file
+into an artifact owned by `nobody` that the operator cannot read. The capture
+refuses and removes its partial file if the finalized NFS mapping does not
+match the declared owner. Reaching `--max-seconds` is a normal bounded stop;
+producing fewer than `--min-events` is not a qualified capture.
+# Operator-paused startup boundary
+
+Set `DRIFTWATCH_OPERATOR_PAUSED=1` when the service must provide its HTTP/read
+surface without starting any background application writer. Startup resolves
+this aggregate boundary before it creates the firehose, label-ingest,
+longitudinal/claim-recheck, facts-export, maintenance, or retention tasks.
+Lower-precedence settings that still enable one of those tasks are reported as
+`suppressed` in `/health/extended`; they cannot override paused mode.
+
+Use paused mode for incident containment and cutover preflight. It is not a
+substitute for correcting stale deployment overlays: remove contradictory
+values before deliberately clearing the pause. Unsupported boolean values
+refuse startup instead of being guessed. Logs and health expose only the
+selected boolean controls, never the surrounding environment.
+
+The legacy host cron mirror is outside the container. Install
+`deploy/run-parquet-mirror-gated.sh` as its exact cron command and create
+`/opt/driftwatch/deploy/.operator-paused` whenever paused mode is selected.
+The sentinel check occurs before the converter creates directories or rewrites
+its summary receipt. Clearing the sentinel is a separate operator action and
+must happen only after the container pause and every underlying writer flag
+have been reviewed together.

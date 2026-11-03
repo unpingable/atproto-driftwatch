@@ -110,18 +110,76 @@ def _consumer(fact: dict[str, Any] | None, now: datetime) -> dict[str, Any]:
     return _obs("PRESENT", observed_at, CONSUMER_MAX_AGE_S, "the current session has a live bounded coverage basis without known loss", fact)
 
 
+def _lineage(conn: sqlite3.Connection, consumer: str | None) -> tuple[dict[str, Any] | None, dict[str, Any] | None]:
+    """Return (store lineage, latest coverage start for this generation)."""
+    try:
+        lineage = dict(conn.execute("SELECT key, value FROM store_lineage").fetchall())
+    except sqlite3.Error:
+        return None, None
+    if not lineage.get("generation_id"):
+        return None, None
+    query = ("SELECT start_kind, started_at, resume_cursor, first_time_us, first_observed_at "
+             "FROM coverage_starts WHERE generation_id = ?")
+    params: list[Any] = [lineage["generation_id"]]
+    if consumer:
+        query += " AND consumer = ?"
+        params.append(consumer)
+    try:
+        start = conn.execute(query + " ORDER BY id DESC LIMIT 1", params).fetchone()
+        floor = conn.execute(
+            "SELECT first_observed_at FROM coverage_starts WHERE generation_id = ? AND start_kind != 'cursor_resume' "
+            "ORDER BY id DESC LIMIT 1", (lineage["generation_id"],)).fetchone()
+    except sqlite3.Error:
+        return lineage, None
+    lineage["coverage_floor_at"] = floor[0] if floor else None
+    if not start:
+        return lineage, None
+    return lineage, {"start_kind": start[0], "started_at": start[1], "resume_cursor": start[2],
+                     "first_time_us": start[3], "first_observed_at": start[4]}
+
+
 def _cursor(db_path: Path, consumer_fact: dict[str, Any] | None, now: datetime) -> dict[str, Any]:
     if not db_path.exists():
         return _obs("ABSENT", None, CURSOR_MAX_AGE_S, "the configured SQLite store does not exist", {"path": str(db_path)})
     try:
         conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True)
         row = conn.execute("SELECT consumer, cursor, updated_at FROM cursors ORDER BY updated_at DESC LIMIT 1").fetchone()
+        lineage, start = _lineage(conn, row[0] if row else None)
         conn.close()
     except sqlite3.Error as exc:
         return _obs("UNKNOWN", None, CURSOR_MAX_AGE_S, "the durable cursor is unreadable", {"error": str(exc)})
+    lineage_facts: dict[str, Any] = {}
+    if lineage is not None:
+        lineage_facts = {
+            "store_generation": lineage.get("generation_id"),
+            "store_created_at": lineage.get("created_at"),
+            "store_origin": lineage.get("origin"),
+            "coverage_floor_at": lineage.get("coverage_floor_at"),
+            "coverage_start": start,
+        }
     if not row:
-        return _obs("ABSENT", None, CURSOR_MAX_AGE_S, "no durable consumer cursor has been produced")
-    facts = {"consumer": row[0], "durable_cursor": row[1], "durable_updated_at": row[2]}
+        return _obs("ABSENT", None, CURSOR_MAX_AGE_S, "no durable consumer cursor has been produced", lineage_facts)
+    observed = _cursor_age_state(row, consumer_fact, now, lineage_facts)
+    if lineage is None or observed["local_state"] != "PRESENT":
+        return observed
+    # A recent cursor only shows the current session is saving restart
+    # points. It does not show continuity with anything observed before the
+    # session started; that depends on how the session started.
+    if start is None:
+        return _obs("UNKNOWN", row[2], CURSOR_MAX_AGE_S, "no coverage start is recorded for this store generation, so continuity before the current cursor is unsubstantiated", observed["facts"])
+    if start["start_kind"] == "unbounded":
+        floor = start.get("first_observed_at") or "the first observed event"
+        return _obs("UNKNOWN", row[2], CURSOR_MAX_AGE_S, f"the current session started without a durable cursor at {start['started_at']}; coverage begins at {floor} and nothing before it is covered or continuous", observed["facts"])
+    if start["start_kind"] != "cursor_resume":
+        return _obs("UNKNOWN", row[2], CURSOR_MAX_AGE_S, f"the current session started from an operator-supplied cursor ({start.get('resume_cursor')}); continuity with earlier observation is unsubstantiated", observed["facts"])
+    floor = lineage.get("coverage_floor_at")
+    reason = "a recent durable restart cursor is present; the current session resumed from it"
+    reason += f"; substantiated coverage in this store generation begins at {floor}" if floor else "; the start of substantiated coverage in this store generation is not recorded"
+    return _obs("PRESENT", row[2], CURSOR_MAX_AGE_S, reason, observed["facts"])
+
+
+def _cursor_age_state(row: tuple, consumer_fact: dict[str, Any] | None, now: datetime, extra: dict[str, Any]) -> dict[str, Any]:
+    facts = {"consumer": row[0], "durable_cursor": row[1], "durable_updated_at": row[2], **extra}
     if consumer_fact:
         facts["session_cursor"] = consumer_fact.get("last_cursor")
         facts["session_last_event_at"] = consumer_fact.get("last_event_at")

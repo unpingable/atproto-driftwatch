@@ -151,6 +151,42 @@ These follow from the case but are not specific to it.
 - **Recovery is parole, not exoneration.** A green recovery signal is invalid if any known shedding path lacks an instrumented bucket. When a fix changes throughput characteristics, audit for bucket migration — the loss may have moved, not stopped. Coverage and `drop_frac` are conditional admissions about observed buckets; the bucket vocabulary itself must be on the parole list.
 - **WAL growth is operational, not cosmetic.** A bloated WAL costs restart-recovery time linear in WAL size. Letting it grow defers cost to your next deploy or crash, when you can least afford it.
 
+## Bounded receive backpressure
+
+The consumer intentionally stops reading the WebSocket when its 5,000-event
+application queue is full. With `websockets==11.0.3`, a client protocol
+keepalive is incompatible with that boundary: the library's own bounded
+message queue fills, its protocol reader stops before reaching the Pong frame,
+and a healthy source is closed after `ping_interval + ping_timeout`.
+
+The consumer therefore uses `ping_interval=None` and applies
+`JETSTREAM_RECEIVE_IDLE_TIMEOUT_SECONDS` only while awaiting `recv()`. Time
+spent admitting a message to the application queue is not source-idle time.
+The server can still close a failed connection, and a genuinely idle source is
+reconnected after the receive deadline. Do not re-enable client pings without
+qualifying them under a saturated application queue.
+
+## Explicit online working-set cap
+
+`WORKING_SET_MAX_LIVE_BYTES` enables a fail-closed intake guard. Enabling it
+also requires all three operator decisions; there are deliberately no guessed
+filesystem defaults:
+
+- `WORKING_SET_FILESYSTEM_RESERVE_BYTES`
+- `WORKING_SET_SHUTDOWN_GROWTH_BYTES`
+- `WORKING_SET_WAL_ALLOWANCE_BYTES`
+
+The guard counts live SQLite pages separately from already allocated freelist,
+and counts only the unallocated remainder of the WAL allowance against current
+filesystem free space. When the cap can no longer preserve bounded shutdown,
+the currently received message remains unadmitted, the durable completed-prefix
+cursor does not advance around it, and source backpressure is allowed to reach
+the WebSocket. A measurement failure refuses intake when the guard is enabled.
+
+This cap does not delete data and does not choose a retention horizon. Use
+`scripts/working_set_plan.py` to emit the accounting and explicit review-only
+retention choices. Production retention/removal remains a separate approval.
+
 ## Pointers
 
 - September follow-up: [completed-prefix recovery after queue saturation](findings/2026-09-08-completed-prefix-recovery.md).

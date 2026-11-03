@@ -18,6 +18,9 @@ analysis.
 **Currently running in sealed-lab mode: detect-only, no labels emitted, no
 labeler registration.**
 
+Driftwatch may lose history and does not claim coverage it cannot
+substantiate; see [`DATA-CONTRACT.md`](DATA-CONTRACT.md).
+
 Operational supervisors can discover the neutral concern manifest at
 `.ops/concerns.toml`; `python -m labeler.cli driftwatch ops-status` renders the
 corresponding machine-readable or human view. See
@@ -233,6 +236,7 @@ Same family, different instruments.
 
 ## Project docs
 
+- [DATA-CONTRACT](DATA-CONTRACT.md) — what survives loss, and what Driftwatch never claims
 - [SCOPE](docs/driftwatch/SCOPE.md)
 - [DESIGN_NOTES](DESIGN_NOTES.md)
 - [THEORY_TO_CODE](THEORY_TO_CODE.md)
