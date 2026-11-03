@@ -4,6 +4,23 @@ This is source integration for [issue 1](https://github.com/unpingable/atproto-d
 and Driftwatch's part of [issue 2](https://github.com/unpingable/atproto-driftwatch/issues/2).
 It does not select a production replacement or establish sustained operation.
 
+## Current consumer correction — 2026-11-03
+
+This record preserves the earlier source integration and its tests. The
+historical facts-snapshot and live Labelwatch-reader requirements below are
+superseded by the [current operating boundary](../RUNBOOK.md). No current
+Labelwatch or Facts API consumer uses that bridge. The current named Driftwatch
+consumer is the private native cluster report and summary; its dated query,
+source coverage and resource limits require actual evidence.
+
+The later finite ingestion occurrence failed its connection and drain limits,
+and the private native report reached its query deadline. Those outcomes remain
+failed. They do not close issue 1 or establish fresh or sustained operation.
+Current acceptance must name the selected source/image, completed prefix,
+truthful gaps, enabled workload, capacity and recovery boundary. An unconsumed
+exporter or retired compatibility reader is not a prerequisite for ordinary
+delivery or current consumer acceptance.
+
 ## The source boundary
 
 The live GitHub breakwater branch was still

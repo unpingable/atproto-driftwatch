@@ -2,6 +2,7 @@
 
 import datetime
 import json
+import sqlite3
 import pytest
 from labeler.db import init_db, get_conn
 from labeler.timeutil import now_utc
@@ -15,6 +16,7 @@ from labeler.driftmetrics import (
     _jsd,
     _entropy,
     cluster_report,
+    _query_fp_kind_map,
 )
 
 
@@ -31,6 +33,113 @@ def _insert_decision(conn, decision_id, created_at, label, rule_id="rule_a", sta
         "INSERT INTO label_decisions VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (decision_id, created_at, "uri:1", "root:1", label, rule_id, "v1", "{}", "[]", "", "", status),
     )
+
+
+# The previous query is a negative control for the historical-index scan.
+_ORIGINAL_FP_KIND_QUERY = (
+    "SELECT claim_fingerprint, fp_kind, COUNT(*) as cnt "
+    "FROM claim_history WHERE createdAt >= ? AND fp_kind IS NOT NULL "
+    "GROUP BY claim_fingerprint, fp_kind ORDER BY claim_fingerprint, cnt DESC"
+)
+_KIND_SINCE = "2026-11-02T00:00:00+00:00"
+
+
+@pytest.fixture
+def fp_kind_window():
+    conn = get_conn()
+    # Use the real rowid table and both production indexes. Old claims must
+    # not dominate the work for a report containing only a few recent claims.
+    conn.executemany(
+        "INSERT INTO claim_history (claim_fingerprint, fp_kind, createdAt) VALUES (?, ?, ?)",
+        ((f"old_{i % 1000}", "entity", "2020-01-01T00:00:00+00:00") for i in range(20000)),
+    )
+    recent = [
+        ("mode", "text"), ("mode", "text"), ("mode", "span"),
+        ("mode", None), ("mode", None), ("mode", None),
+        ("tie", "entity"), ("tie", "text"),
+        ("tie", "entity"), ("tie", "text"),
+        ("empty", ""), ("empty", ""), ("empty", "span"),
+        ("null_only", None), ("null_only", None),
+        (None, "domain"), (None, "domain"), (None, "text"),
+    ]
+    conn.executemany(
+        "INSERT INTO claim_history (claim_fingerprint, fp_kind, createdAt) VALUES (?, ?, ?)",
+        [(fp, kind, _KIND_SINCE) for fp, kind in recent] + [
+            ("mode", "entity", "2026-11-01T23:59:59+00:00"),
+            ("before_only", "entity", "2026-11-01T23:59:59+00:00"),
+            ("future", "quantity", "2026-11-04T00:00:00+00:00"),
+            ("no_timestamp", "entity", None),
+        ],
+    )
+    conn.commit()
+    conn.execute("PRAGMA query_only = ON")
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+class TestFingerprintKindMap:
+    def test_window_mode_and_null_semantics_match_original(self, fp_kind_window):
+        # Cutoff is inclusive, future claims remain included, NULL kinds are
+        # excluded, and an empty winning kind becomes "unknown". The previous
+        # query chooses text for this count tie on the supported SQLite runtime.
+        expected = {
+            None: "domain", "empty": "unknown", "future": "quantity",
+            "mode": "text", "tie": "text",
+        }
+        original = {}
+        for fp, kind, _count in fp_kind_window.execute(_ORIGINAL_FP_KIND_QUERY, (_KIND_SINCE,)):
+            original.setdefault(fp, kind or "unknown")
+        assert original == expected
+        assert _query_fp_kind_map(fp_kind_window, _KIND_SINCE) == expected
+        assert _query_fp_kind_map(fp_kind_window, "2027-01-01T00:00:00+00:00") == {}
+
+    def test_recent_window_uses_bounded_range_query(self, fp_kind_window):
+        # Reintroducing the original GROUP BY against claim_history exceeds
+        # this VM instruction budget regardless of machine speed or cache state.
+        statements = []
+        progress_calls = 0
+
+        def progress():
+            nonlocal progress_calls
+            progress_calls += 1
+            return int(progress_calls >= 100)
+
+        fp_kind_window.set_trace_callback(statements.append)
+        fp_kind_window.set_progress_handler(progress, 100)
+        try:
+            actual = _query_fp_kind_map(fp_kind_window, _KIND_SINCE)
+        except sqlite3.OperationalError as exc:
+            pytest.fail(f"Recent-window kind lookup exceeded 10,000 SQLite VM steps: {exc}")
+        finally:
+            fp_kind_window.set_progress_handler(None, 0)
+            fp_kind_window.set_trace_callback(None)
+
+        assert actual == {
+            None: "domain", "empty": "unknown", "future": "quantity",
+            "mode": "text", "tie": "text",
+        }
+        # Inspect the statement actually executed by the production helper.
+        plan = [row[3] for row in fp_kind_window.execute("EXPLAIN QUERY PLAN " + statements[-1])]
+        assert any("SEARCH claim_history USING INDEX idx_claim_history_created" in detail for detail in plan), plan
+        assert not any("SCAN claim_history" in detail for detail in plan), plan
+
+    def test_original_query_exceeds_same_vm_budget(self, fp_kind_window):
+        progress_calls = 0
+
+        def progress():
+            nonlocal progress_calls
+            progress_calls += 1
+            return int(progress_calls >= 100)
+
+        fp_kind_window.set_progress_handler(progress, 100)
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="interrupted"):
+                fp_kind_window.execute(_ORIGINAL_FP_KIND_QUERY, (_KIND_SINCE,)).fetchall()
+        finally:
+            fp_kind_window.set_progress_handler(None, 0)
+        assert progress_calls == 100
 
 
 # ---------------------------------------------------------------------------

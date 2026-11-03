@@ -18,6 +18,11 @@ analysis.
 **Currently running in sealed-lab mode: detect-only, no labels emitted, no
 labeler registration.**
 
+The operating service remains paused during recovery. A source release does
+not establish fresh data or sustained ingestion. Current operating procedures
+and the status of historical integrations belong to
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md).
+
 Driftwatch may lose history and does not claim coverage it cannot
 substantiate; see [`DATA-CONTRACT.md`](DATA-CONTRACT.md).
 
@@ -28,8 +33,10 @@ corresponding machine-readable or human view. See
 
 ## What it does
 
-**Jetstream consumer.** Real-time WebSocket connection to the Bluesky Jetstream
-firehose, ingesting posts and reposts (~500 events/sec steady state).
+**Jetstream consumer.** WebSocket ingestion of posts and reposts through a
+bounded queue. Transactions checkpoint the completed source prefix; replay
+overlap and explicit gaps do not establish complete historical coverage.
+Sustained throughput remains an operating acceptance condition.
 
 **Claim fingerprinting.** Posts are hashed into canonical fingerprints with kind
 tracking — entity, quantity, domain, span, or text — using a precedence-based
@@ -57,14 +64,15 @@ decision trace. Labels are not just applied — they are receipted.
 
 **Identity enrichment.** Captures Jetstream identity/account events into an
 append-only log with a fieldwise reducer producing converged current state.
-Async DID resolver extracts PDS endpoints from DID documents (did:plc via PLC
-directory, did:web via .well-known). Provenance tracked: `live` (observed via
+Automatic DID document resolution is not scheduled by ingestion. Existing
+resolution helpers are unscheduled; a future enrichment consumer needs its own
+bounded lifecycle. Provenance tracked: `live` (observed via
 Jetstream), `labelwatch_seed` (seeded from labeled-target population), `both`.
 
-**Facts export.** SQLite sidecar export for [Labelwatch](https://github.com/unpingable/atproto-labelwatch)
-consumption — URI→fingerprint mappings, hourly aggregates, fingerprint bounds,
-and actor identity facts (DID→PDS host mapping with resolver status).
-Atomic snapshot via `VACUUM INTO` + `os.replace()`.
+**Historical facts export.** Retained helpers describe an earlier SQLite
+sidecar integration. Current Labelwatch and Facts API operation does not
+consume that bridge. Its export and snapshot instructions are historical,
+not an active recovery requirement; see the canonical runbook.
 
 ## Quickstart
 
@@ -174,16 +182,10 @@ Jetstream (WebSocket)
         |— identity/account → identity_events (append-only log)
                 |
              fieldwise reducer → actor_identity_current
-                |
-             async DID resolver → pds_endpoint, pds_host
-                |
-             facts_export → facts.sqlite → labelwatch
-                (uri_fingerprint + fingerprint_hourly +
-                 fingerprint_bounds + actor_identity_facts)
 
-  enrichment:
-      seed_targets — import labeled-target DIDs from labelwatch
-                     for resolver pickup (provenance: live/seed/both)
+  unscheduled historical helpers:
+      DID resolution / seed import / facts export
+      (no automatic enrichment or current Labelwatch bridge)
 
   operational:
       preflight checks → startup validation

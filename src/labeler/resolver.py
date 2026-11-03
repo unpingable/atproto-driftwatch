@@ -1,11 +1,11 @@
-"""Async DID document resolver sidecar.
+"""Unscheduled DID document resolution helpers.
 
 Resolves DID documents to extract PDS endpoints and handles,
 writing results back to actor_identity_current.
 
-Runs as a background task in the consumer — never blocks ingest.
-Conservative rate limiting: bounded concurrency, per-host backoff,
-explicit timeouts.
+Ingestion does not invoke these helpers or provide automatic PDS enrichment.
+A future consumer must define its own bounded lifecycle; canceling an await
+does not stop a synchronous network call running in an executor.
 """
 
 import logging

@@ -7,6 +7,29 @@ For store loss, the recovery boundary is [the data contract](../DATA-CONTRACT.md
 For the owned source integration and the remaining sustained-operation gate,
 see [the November source reconciliation](findings/2026-11-03-owned-source-recovery.md).
 
+## Current operating boundary (2026-11-03)
+
+The service is operator-paused. The latest finite ingestion slice failed;
+the source gap remains unresolved and sustained recovery is unearned. The
+current named Driftwatch consumer is the operator's private native cluster
+report. FactsAPI currently reads Labelwatch and Weatherwatch, and no live
+Labelwatch bridge consumer or facts-snapshot cron consumes Driftwatch's export.
+
+The [facts-export](#facts-export-not-updating),
+[facts-snapshot](#facts-snapshot-writer-phase-3-duckdb-backed--deploy--operate),
+and [manual retention](#manual-retention-pressure-relief) commands below are
+historical procedures, not active recovery instructions. Do not activate them,
+run retention or vacuum, or reset the source cursor as a recovery shortcut.
+Any new ingestion occurrence must use its separately admitted finite contract;
+neither this runbook nor the offline report-query fix authorizes a retry.
+
+Ordinary ingestion captures identity/account events and updates current identity
+state, but does not automatically fetch DID documents or enrich PDS/handle
+mappings. Resolver counters may remain pending; declining backlog is not an
+ingest acceptance condition. Existing resolver helpers are unscheduled. A future
+named enrichment consumer requires an explicit bounded lifecycle and shutdown
+contract.
+
 ---
 
 ## Consumer crash-loop
@@ -58,9 +81,27 @@ kill the pinned reader. The checkpoint will catch up automatically.
 - Facts export uses phase-release (already implemented)
 - Close connections promptly after read operations
 
+### Cluster report fingerprint-kind lookup
+
+The native cluster report filters its time window in a materialized CTE before
+grouping fingerprint kinds. This avoids a full scan of historical claims through
+`idx_claim_history_fp`. The existing `idx_claim_history_created` index supplies
+the time range; no index migration is required. The grouping and temporary
+storage still scale with the claims inside the requested window.
+
+`AS MATERIALIZED` requires SQLite 3.35.0 or later ([SQLite documentation](https://www.sqlite.org/lang_with.html#materialization_hints)).
+Check the SQLite library linked to the report's Python runtime when changing the
+runtime image. To diagnose this lookup, use `EXPLAIN QUERY PLAN` with its actual
+cutoff: expect a `SEARCH claim_history` using `idx_claim_history_created` for
+`createdAt`, followed by grouping of `window_claims`. A `SCAN claim_history`
+through the fingerprint index indicates the historical scan has returned.
+
 ---
 
 ## Facts export not updating
+
+Historical, currently unconsumed path; see the
+[current operating boundary](#current-operating-boundary-2026-11-03).
 
 **Symptoms:** `facts_export.snapshot_age_s` growing past 7200 (2 hours).
 Hosting locus card shows stale data.
@@ -93,6 +134,9 @@ If disk, free space. If corrupt working DB, delete and restart.
 ---
 
 ## Facts snapshot writer (Phase 3, DuckDB-backed) — deploy + operate
+
+Historical, currently unconsumed path; see the
+[current operating boundary](#current-operating-boundary-2026-11-03).
 
 > Parquet is authoritative past. DuckDB is the question engine.
 > `facts.sqlite` is a compatibility projection/cache, not the source of custody.
@@ -288,6 +332,10 @@ ls -lh /opt/driftwatch/deploy/data/*.sqlite*
 ---
 
 ## Manual retention pressure relief
+
+Historical procedure; see the
+[current operating boundary](#current-operating-boundary-2026-11-03) before
+interpreting any commands or recovery claims in this section.
 
 Use this **only while `ENABLE_RETENTION=0` is in effect** and disk runway is shrinking faster than the retention scheduler work can land. The playbook is parole, not a long-term operating mode.
 

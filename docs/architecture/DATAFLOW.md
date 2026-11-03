@@ -1,7 +1,13 @@
 # driftwatch — Dataflow
 
-**Status**: v0 starter.
-**Last updated**: 2026-04-28
+**Status**: historical starter architecture, originally recorded 2026-04-28.
+
+The diagrams below retain historical component context. Current operator
+procedures are in [`../RUNBOOK.md`](../RUNBOOK.md), and current coverage and
+recovery claims are defined in [`../../DATA-CONTRACT.md`](../../DATA-CONTRACT.md).
+Background features depend on explicit activation; this document is not a
+record that they are running or accepted. The old Labelwatch facts bridge is
+unconsumed, and ingestion does not schedule DID document resolution.
 
 ## The job
 
@@ -25,9 +31,9 @@ For concept-to-code mapping, see `../../THEORY_TO_CODE.md`. For component detail
 
 **Job**: receive ATProto post and repost events.
 
-**`consumer.py`** opens a WebSocket to `wss://jetstream2.us-east.bsky.network/subscribe` filtered to `app.bsky.feed.post` and `app.bsky.feed.repost` collections. Cursor persistence enables gapless restart.
+**`consumer.py`** opens a WebSocket to `wss://jetstream2.us-east.bsky.network/subscribe` filtered to `app.bsky.feed.post` and `app.bsky.feed.repost` collections. Its cursor checkpoints the completed source prefix with replay overlap. A source may no longer retain the requested history; restart does not prove continuous coverage.
 
-**Queue architecture**: receive loop only parses JSON and updates cursor; processing happens in a worker task off the event loop. Queue is bounded; if processing falls behind, events are dropped (drop-aware).
+**Queue architecture**: reception admits events to a bounded queue. Durable processing advances the completed prefix transactionally. Backpressure, unresolved work and a failed drain must remain visible; queue capacity is not permission to silently discard received events.
 
 **Drop-awareness**: drop count and `drop_frac` tracked. Reports condition outputs on observed loss — *outputs are not ground truth, they are loss-conditioned views*. See `FAILURE_MODES.md` (degraded sampling, 2026-04-23..).
 
@@ -123,17 +129,17 @@ Archive keys on `COALESCE(observed_at, createdAt)` — trusted timestamp, not fi
 
 ## Stage 6 — Identity resolution + facts export
 
-**Job**: resolve DIDs to handles + PDS hosts; expose to labelwatch.
+**Historical job**: resolve DIDs to handles and PDS hosts for an earlier Labelwatch bridge. No current bridge consumer or automatic resolver is scheduled by ingestion.
 
-**Resolver** (`resolver.py`): async DID resolution via PLC directory + did:web. Batch processing, backoff, rate-limited. Seed queue from labelwatch's labeled targets (`seed_targets.py`).
+**Resolver helpers** (`resolver.py`) are unscheduled. They must not block the queue drainer. A future named enrichment consumer requires an explicit bounded lifecycle and shutdown contract; cancellation of an asyncio await does not stop a synchronous executor callable.
 
 **`actor_identity_current`**: fieldwise reducer from `identity_events` (append-only journal). MISSING sentinel distinguishes "absent" from "explicitly cleared." Newer events never erase prior known fields. Each row tracks `identity_source`: `live`, `labelwatch_seed`, or `both`.
 
-**Facts export** (`facts_export.py`): SQLite sidecar at `facts.sqlite` with whitelisted schema. 72h overlap window, 30d retention, 500k batch. Labelwatch ATTACHes read-only. **Unidirectional.** See `PUBLIC_SURFACES.md` for the contract.
+**Historical facts export** (`facts_export.py`) retains the earlier SQLite sidecar implementation. Current Labelwatch does not consume it. Its presence does not establish an active export, retention obligation or accepted recovery path.
 
 ## Stage 7 — Reports + bridge
 
-**Cluster reports**: HTML + JSON output via CLI (`driftwatch report`, `driftwatch summary`). 24h cluster report ~7min on live data; 1h instant. Use 1h for interactive, 24h for scheduled.
+**Cluster reports**: native report and summary functions filter an authored-time window. They require an admitted resource budget and truthful source coverage. A short requested window alone does not prove an instant query or current source data. See the canonical runbook for the time-range query requirement and private report limitations.
 
 **Drift findings**: rules-fired-this-window summaries, surfaced as report cards. Decisions land in `label_decisions` ledger regardless of emit mode (sealed-lab posture).
 

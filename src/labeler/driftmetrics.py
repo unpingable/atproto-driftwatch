@@ -374,9 +374,13 @@ def _query_fp_kind_map(conn, since: str) -> Dict[str, str]:
 
     Uses the most common fp_kind per fingerprint (MODE).
     """
+    # Filter before grouping: otherwise SQLite can scan the entire fingerprint
+    # index to satisfy GROUP BY, even when the report window is small.
     rows = conn.execute(
-        "SELECT claim_fingerprint, fp_kind, COUNT(*) as cnt "
+        "WITH window_claims AS MATERIALIZED ("
+        "SELECT claim_fingerprint, fp_kind "
         "FROM claim_history WHERE createdAt >= ? AND fp_kind IS NOT NULL "
+        ") SELECT claim_fingerprint, fp_kind, COUNT(*) as cnt FROM window_claims "
         "GROUP BY claim_fingerprint, fp_kind ORDER BY claim_fingerprint, cnt DESC",
         (since,),
     ).fetchall()
