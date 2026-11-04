@@ -30,6 +30,23 @@ ingest acceptance condition. Existing resolver helpers are unscheduled. A future
 named enrichment consumer requires an explicit bounded lifecycle and shutdown
 contract.
 
+### Normal consumer shutdown
+
+Application shutdown first signals the consumer to stop intake, then cancels
+the receive task. The consumer drains already admitted batches with the existing
+writer and retry behavior before closing its SQLite connection and executor,
+writing the generation-bound baseline checkpoint and final producer fact.
+Cancellation during reconnect backoff follows the same cleanup path; repeated
+cancellation of the consumer task does not abandon its drain.
+
+A terminated drainer with outstanding admitted work fails shutdown explicitly.
+Its durable cursor remains behind unresolved work for replay. A blocked or
+persistently retrying writer can still require the external supervisor's process
+deadline; forced termination is incomplete shutdown, not proof of a drained
+queue. Keep enough storage headroom and shutdown time for the bounded queue.
+These lifecycle guarantees do not establish source continuity, currentness or
+successful sustained recovery, and do not change any prior failed finite run.
+
 ### Current concern declaration
 
 The local status producer declares eight required stream, cursor, evaluation

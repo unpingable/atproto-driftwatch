@@ -102,6 +102,9 @@ async def startup_event():
 @app.on_event("shutdown")
 async def shutdown_event():
     global _consumer_task, _consumer_instance, _label_ingest_task
+    consumer_task = _consumer_task
+    if _consumer_instance is not None:
+        _consumer_instance.stop()
     tasks = list(_background_tasks)
     for task in tasks:
         task.cancel()
@@ -111,6 +114,12 @@ async def shutdown_event():
     _consumer_task = None
     _consumer_instance = None
     _label_ingest_task = None
+    # Other optional tasks retain their existing shutdown behavior. A failed
+    # consumer drain must reach the operator as an unsuccessful app shutdown.
+    if consumer_task is not None and not consumer_task.cancelled():
+        error = consumer_task.exception()
+        if error is not None:
+            raise error
 
 
 @app.get("/health")

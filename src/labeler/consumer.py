@@ -211,6 +211,7 @@ class ATProtoConsumer:
     def __init__(self, ws_url: Optional[str] = None):
         self.ws_url = ws_url or JETSTREAM_WS
         self._stop = False
+        self._draining = False
         self._event_count = 0
         self._last_cursor: Optional[str] = None
         # coverage_starts row for this run; its floor is set from the first
@@ -529,7 +530,7 @@ class ATProtoConsumer:
         _disk_brake_logged = False
         events_since_cursor_save = 0
 
-        while not self._stop:
+        while not self._stop or self._draining:
             # Emergency brake: pause ingest when disk is critical
             try:
                 from .maintenance import is_disk_pressure
@@ -579,7 +580,7 @@ class ATProtoConsumer:
                             break
 
                 try:
-                    while not self._stop:
+                    while not self._stop or self._draining:
                         written, lost = await loop.run_in_executor(
                             self._writer_executor, self._process_batch, batch
                         )
@@ -747,27 +748,27 @@ class ATProtoConsumer:
         if not isinstance(time_us, int) or isinstance(time_us, bool) or time_us <= 0:
             raise ValueError("source event requires positive integer time_us")
         self._received_total += 1
-        if time_us:
-            self._last_cursor = str(time_us)
-            if self._coverage_floor_pending:
-                self._coverage_floor_pending = False
-                try:
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, store_db.record_coverage_floor, self._coverage_start_id, int(time_us))
-                except Exception:
-                    LOG.warning("failed to record coverage floor", exc_info=True)
-                    self._coverage_floor_pending = True
-            try:
-                from . import platform_health
-                platform_health.record_event_time(time_us)
-            except Exception:
-                pass
-
-        # All source kinds share one ordered writer. Awaiting capacity yields
-        # the event loop, including ping tasks; cancellation leaves the durable
-        # checkpoint behind the unadmitted message for reconnect replay.
-        ev = {"_source": js}
+        # Cancellation anywhere after receipt, including the first coverage
+        # write, leaves this message explicitly unadmitted for cursor replay.
         try:
+            if time_us:
+                self._last_cursor = str(time_us)
+                if self._coverage_floor_pending:
+                    self._coverage_floor_pending = False
+                    try:
+                        await asyncio.get_event_loop().run_in_executor(
+                            None, store_db.record_coverage_floor, self._coverage_start_id, int(time_us))
+                    except Exception:
+                        LOG.warning("failed to record coverage floor", exc_info=True)
+                        self._coverage_floor_pending = True
+                try:
+                    from . import platform_health
+                    platform_health.record_event_time(time_us)
+                except Exception:
+                    pass
+
+            # All source kinds share the same bounded, ordered writer.
+            ev = {"_source": js}
             # Once configured logical/physical headroom can no longer preserve
             # bounded shutdown, stop source admission while the writer drains
             # the already-bounded queue. The current source message remains
@@ -852,97 +853,122 @@ class ATProtoConsumer:
 
         loop_monitor_task = asyncio.ensure_future(monitor_event_loop())
 
-        while not self._stop:
-            ws = None
-            try:
-                # Finish already-admitted work before choosing a reconnect
-                # boundary; do not interleave old replay with newer queue work.
-                while not self._stop:
-                    try:
-                        await asyncio.wait_for(self._event_queue.join(), timeout=1)
+        try:
+            while not self._stop:
+                ws = None
+                try:
+                    # Finish already-admitted work before choosing a reconnect
+                    # boundary; do not interleave old replay with newer queue work.
+                    while not self._stop:
+                        try:
+                            await asyncio.wait_for(self._event_queue.join(), timeout=1)
+                            break
+                        except asyncio.TimeoutError:
+                            pass
+                    if self._stop:
                         break
-                    except asyncio.TimeoutError:
-                        pass
-                if self._stop:
+                    # Only committed work defines resume, including after a socket
+                    # failure while queued work or a batch remains outstanding.
+                    url = _build_ws_url(self.ws_url, cursor=get_cursor(CONSUMER_NAME) or saved_cursor)
+                    async with websockets.connect(
+                        url,
+                        max_size=10 * 1024 * 1024,
+                        # Application-level backpressure may intentionally stop
+                        # socket reads for longer than a protocol ping timeout.
+                        ping_interval=None,
+                        close_timeout=10,
+                    ) as ws:
+                        self._connection_started_mono = time.monotonic()
+                        LOG.info("connected to Jetstream")
+                        try:
+                            from . import platform_health
+                            platform_health.record_reconnect()
+                            platform_health.record_connection(True)
+                        except Exception:
+                            pass
+                        self._write_ops_snapshot()
+                        while not self._stop:
+                            receive_started = time.monotonic()
+                            msg = await _receive_source_message(ws)
+                            self._receive_wait_last_s = time.monotonic() - receive_started
+                            self._receive_wait_max_s = max(
+                                self._receive_wait_max_s, self._receive_wait_last_s
+                            )
+                            processing_started = time.monotonic()
+                            await self._handle_message(msg)
+                            self._processing_last_s = time.monotonic() - processing_started
+                            self._processing_max_s = max(
+                                self._processing_max_s, self._processing_last_s
+                            )
+                            self._last_message_mono = time.monotonic()
+                except asyncio.CancelledError:
                     break
-                # Only committed work defines resume, including after a socket
-                # failure while queued work or a batch remains outstanding.
-                url = _build_ws_url(self.ws_url, cursor=get_cursor(CONSUMER_NAME) or saved_cursor)
-                async with websockets.connect(
-                    url,
-                    max_size=10 * 1024 * 1024,
-                    # Application-level backpressure may intentionally stop
-                    # socket reads for longer than a protocol ping timeout.
-                    ping_interval=None,
-                    close_timeout=10,
-                ) as ws:
-                    self._connection_started_mono = time.monotonic()
-                    LOG.info("connected to Jetstream")
+                except Exception as exc:
+                    now = time.monotonic()
+                    record = connection_failure_record(
+                        exc,
+                        ws,
+                        connection_elapsed_seconds=(
+                            round(now - self._connection_started_mono, 6)
+                            if self._connection_started_mono is not None else None
+                        ),
+                        seconds_since_last_message=(
+                            round(now - self._last_message_mono, 6)
+                            if self._last_message_mono is not None else None
+                        ),
+                        receive_wait_last_seconds=round(self._receive_wait_last_s, 6),
+                        receive_wait_max_seconds=round(self._receive_wait_max_s, 6),
+                        processing_last_seconds=round(self._processing_last_s, 6),
+                        processing_max_seconds=round(self._processing_max_s, 6),
+                        event_loop_stall_max_seconds=round(self._event_loop_stall_max_s, 6),
+                        queue_depth=self._event_queue.qsize(),
+                        queue_capacity=self._event_queue.maxsize,
+                        queue_waits_total=self._queue_waits_total,
+                        source_received_total=self._received_total,
+                        source_completed_total=self._source_committed_total,
+                        shutdown_outcome="reconnect_pending",
+                    )
+                    LOG.error("Jetstream connection ended: %s", json.dumps(record, sort_keys=True))
+                    await asyncio.sleep(5)
+                finally:
                     try:
                         from . import platform_health
-                        platform_health.record_reconnect()
-                        platform_health.record_connection(True)
+                        platform_health.record_connection(False)
                     except Exception:
                         pass
                     self._write_ops_snapshot()
-                    while not self._stop:
-                        receive_started = time.monotonic()
-                        msg = await _receive_source_message(ws)
-                        self._receive_wait_last_s = time.monotonic() - receive_started
-                        self._receive_wait_max_s = max(
-                            self._receive_wait_max_s, self._receive_wait_last_s
-                        )
-                        processing_started = time.monotonic()
-                        await self._handle_message(msg)
-                        self._processing_last_s = time.monotonic() - processing_started
-                        self._processing_max_s = max(
-                            self._processing_max_s, self._processing_last_s
-                        )
-                        self._last_message_mono = time.monotonic()
-            except asyncio.CancelledError:
-                break
-            except Exception as exc:
-                now = time.monotonic()
-                record = connection_failure_record(
-                    exc,
-                    ws,
-                    connection_elapsed_seconds=(
-                        round(now - self._connection_started_mono, 6)
-                        if self._connection_started_mono is not None else None
-                    ),
-                    seconds_since_last_message=(
-                        round(now - self._last_message_mono, 6)
-                        if self._last_message_mono is not None else None
-                    ),
-                    receive_wait_last_seconds=round(self._receive_wait_last_s, 6),
-                    receive_wait_max_seconds=round(self._receive_wait_max_s, 6),
-                    processing_last_seconds=round(self._processing_last_s, 6),
-                    processing_max_seconds=round(self._processing_max_s, 6),
-                    event_loop_stall_max_seconds=round(self._event_loop_stall_max_s, 6),
-                    queue_depth=self._event_queue.qsize(),
-                    queue_capacity=self._event_queue.maxsize,
-                    queue_waits_total=self._queue_waits_total,
-                    source_received_total=self._received_total,
-                    source_completed_total=self._source_committed_total,
-                    shutdown_outcome="reconnect_pending",
-                )
-                LOG.error("Jetstream connection ended: %s", json.dumps(record, sort_keys=True))
-                await asyncio.sleep(5)
-            finally:
+
+        finally:
+            # Closing the receive task must not cancel custody of admitted work.
+            # A separate task also protects cleanup from repeated cancellation
+            # (for example, shutdown while reconnect backoff is sleeping).
+            self.stop()
+            cleanup = asyncio.create_task(self._shutdown(drain_task, loop_monitor_task))
+            while not cleanup.done():
                 try:
-                    from . import platform_health
-                    platform_health.record_connection(False)
-                except Exception:
-                    pass
-                self._write_ops_snapshot()
+                    await asyncio.shield(cleanup)
+                except asyncio.CancelledError:
+                    continue
+            cleanup.result()
 
-        # Graceful shutdown: stop both asynchronous readers before closing the
-        # writer connection.  Awaiting cancellation is part of the lifecycle
-        # boundary; no diagnostic/monitor task may outlive run().
-        drain_task.cancel()
-        loop_monitor_task.cancel()
-        await asyncio.gather(drain_task, loop_monitor_task, return_exceptions=True)
+    async def _shutdown(self, drain_task, loop_monitor_task):
+        joined = asyncio.create_task(self._event_queue.join())
+        try:
+            # A dead writer cannot discharge the queue. Preserve the replay debt
+            # and expose incomplete shutdown instead of waiting forever or
+            # claiming that cancelling the drainer completed its work.
+            await asyncio.wait({joined, drain_task}, return_when=asyncio.FIRST_COMPLETED)
+            if not joined.done():
+                raise RuntimeError("consumer shutdown left admitted work unresolved: drainer ended")
+        finally:
+            self._draining = False
+            joined.cancel()
+            drain_task.cancel()
+            loop_monitor_task.cancel()
+            await asyncio.gather(joined, drain_task, loop_monitor_task, return_exceptions=True)
+            await self._close_writer()
 
+    async def _close_writer(self):
         def _close_writer():
             if self._writer_conn is not None:
                 try:
@@ -971,6 +997,8 @@ class ATProtoConsumer:
         self._write_ops_snapshot()
 
     def stop(self):
+        """Close intake while allowing the sole writer to finish admitted work."""
+        self._draining = True
         self._stop = True
 
 
