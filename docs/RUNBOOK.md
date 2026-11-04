@@ -30,6 +30,26 @@ ingest acceptance condition. Existing resolver helpers are unscheduled. A future
 named enrichment consumer requires an explicit bounded lifecycle and shutdown
 contract.
 
+### Current concern declaration
+
+The local status producer declares eight required stream, cursor, evaluation
+and storage concerns. It does not inspect or require the retired `facts.sqlite`
+export. The presence or age of retained export bytes cannot establish or impair
+the current consumer's health. Keep those historical bytes under their existing
+custody; removing the monitoring obligation does not delete them or restart an
+exporter.
+
+The repository and packaged concern manifests must match. The SQLite continuity
+question is v2: bounded reads, required-table and metadata checks, and a rolled
+back write-intent probe. This is separate from full backup/restore integrity
+evidence. At deployment, align the installed host contract and its estate digest
+with the selected producer's manifest in the same scoped change. Preserve all
+other estate fields and active concerns; do not rotate NQ profiles to repair a
+product declaration.
+The internal-slack concern measures the existing 5,000,000-page freelist
+threshold. It reports the observed vacuum mode as metadata, without assuming
+that mode is `none` or changing it.
+
 ---
 
 ## Consumer crash-loop

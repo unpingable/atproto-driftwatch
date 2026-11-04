@@ -264,12 +264,23 @@ def test_sqlite_continuity_declaration_is_v2(tmp_path):
     assert concern["question"] == "driftwatch.question.sqlite_continuity/v2"
 
 
-def test_old_facts_snapshot_is_stale_observational_output(tmp_path):
+def test_retired_export_cannot_change_current_required_status(tmp_path):
     path = _db(tmp_path, NOW.isoformat())
-    facts = tmp_path / "facts.sqlite"
-    facts.write_bytes(b"fixture")
-    old = (NOW - timedelta(hours=3)).timestamp()
-    os.utime(facts, (old, old))
-    observed = _items(ops_status.build_status(path, data_dir=tmp_path, now=NOW))["driftwatch.output.facts_snapshot_freshness"]
-    assert observed["local_state"] == "STALE"
-    assert observed["facts"]["artifact_authority"] == "observational"
+    _consumer(tmp_path)
+    _evaluation(tmp_path)
+
+    def required_states():
+        status = ops_status.build_status(path, data_dir=tmp_path, now=NOW)
+        return {
+            item["id"]: item["observation"]["local_state"]
+            for item in status["concerns"] if item["required"]
+        }
+
+    without_export = required_states()
+    assert without_export["driftwatch.observation.stream_coverage"] == "PRESENT"
+    assert without_export["driftwatch.persistence.sqlite_continuity"] == "PRESENT"
+    artifact = tmp_path / "facts.sqlite"
+    artifact.write_bytes(b"retained historical export")
+    for timestamp in ((NOW - timedelta(hours=3)).timestamp(), NOW.timestamp()):
+        os.utime(artifact, (timestamp, timestamp))
+        assert required_states() == without_export

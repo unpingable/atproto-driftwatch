@@ -26,7 +26,6 @@ STATUS_SCHEMA = "project.ops.status/v1"
 CONSUMER_MAX_AGE_S = 120
 CURSOR_MAX_AGE_S = 15 * 60
 EVALUATION_MAX_AGE_S = 180
-FACTS_MAX_AGE_S = 2 * 60 * 60
 SLACK_PAGE_FLOOR = 5_000_000
 SQLITE_CONTINUITY_REQUIRED_TABLES = (
     "claim_history",
@@ -335,18 +334,6 @@ def _volume(data_dir: Path, now: datetime) -> dict[str, Any]:
     return _obs(state, now.isoformat(), None, "the data volume is below the warning bound" if state == "PRESENT" else "the data volume crossed an existing pressure bound", facts, domain)
 
 
-def _facts_snapshot(data_dir: Path, now: datetime) -> dict[str, Any]:
-    path = data_dir / "facts.sqlite"
-    if not path.exists():
-        return _obs("ABSENT", None, FACTS_MAX_AGE_S, "the facts snapshot has not been produced", {"path": str(path)})
-    observed_at = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
-    age = _age(now, observed_at) or 0
-    facts = {"path": str(path), "size_bytes": path.stat().st_size, "age_seconds": round(age, 3), "artifact_authority": "observational"}
-    if age > FACTS_MAX_AGE_S:
-        return _obs("STALE", observed_at, FACTS_MAX_AGE_S, "the facts snapshot is stale", facts)
-    return _obs("PRESENT", observed_at, FACTS_MAX_AGE_S, "a recent observational facts snapshot is present", facts)
-
-
 def build_status(db_path: str | os.PathLike[str], *, data_dir: str | os.PathLike[str] | None = None,
                  now: datetime | None = None, manifest_path: Path = MANIFEST_PATH) -> dict[str, Any]:
     now = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
@@ -365,7 +352,6 @@ def build_status(db_path: str | os.PathLike[str], *, data_dir: str | os.PathLike
         "driftwatch.persistence.sqlite_continuity": continuity,
         "driftwatch.persistence.volume_capacity": _volume(data_path, now),
         "driftwatch.persistence.sqlite_slack": slack,
-        "driftwatch.output.facts_snapshot_freshness": _facts_snapshot(data_path, now),
     }
     concerns = []
     for declared in manifest["concerns"]:
